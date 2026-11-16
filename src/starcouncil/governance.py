@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-License-Identifier: MIT
 """Council routing, anti-fake-council verifier, pitfalls/fixes ledgers, review Andon cord, doctor & sanitize-lint."""
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import hmac
+import io
 import json
 import os
 import pathlib
 import re
+import tarfile
 from typing import Any
 
 from .blackboard import (
@@ -610,3 +615,83 @@ def format_plain_3line(result: str, reason: str, user_action: str = "无") -> st
 def lint_plain_summary(text: str) -> dict[str, Any]:
     warnings = [f"命中机器腔模式 `{pat}`：建议{advice}" for pat, advice in ROBOTIC_JARGON_PATTERNS if re.search(pat, text)]
     return {"ok": len(warnings) == 0, "warning_count": len(warnings), "warnings": warnings}
+
+
+def build_reproducible_tarball_bytes(repo_root: pathlib.Path, prefix: str = "starcouncil") -> tuple[bytes, int]:
+    """Builds a bit-for-bit reproducible source `.tar.gz` (mtime=0, uid/gid=0, sorted PAX headers)."""
+    skip_dirs = {".git", "__pycache__", ".starcouncil", "artifacts", "dist", "build", ".pytest_cache"}
+    entries: list[tuple[str, pathlib.Path]] = []
+    for root, dirs, files in os.walk(repo_root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d not in skip_dirs and not d.endswith(".egg-info"))
+        rp = pathlib.Path(root)
+        for name in sorted(files):
+            if name.endswith((".pyc", ".pyo")) or name.startswith("._") or name == ".DS_Store":
+                continue
+            fp = rp / name
+            entries.append((fp.relative_to(repo_root).as_posix(), fp))
+        for dname in list(dirs):
+            dp = rp / dname
+            if dp.is_symlink():
+                entries.append((dp.relative_to(repo_root).as_posix(), dp))
+                dirs.remove(dname)
+
+    entries.sort(key=lambda item: item[0])
+    clean_prefix = prefix.strip("/") or "starcouncil"
+    raw_buf = io.BytesIO()
+    with gzip.GzipFile(filename="", mode="wb", fileobj=raw_buf, compresslevel=9, mtime=0) as gz:
+        with tarfile.open(mode="w", fileobj=gz, format=tarfile.PAX_FORMAT) as tf:
+            for rel, fp in entries:
+                ti = tarfile.TarInfo(name=f"{clean_prefix}/{rel}")
+                ti.mtime = 0
+                ti.uid = 0
+                ti.gid = 0
+                ti.uname = ""
+                ti.gname = ""
+                ti.pax_headers = {}
+                if fp.is_symlink():
+                    ti.type = tarfile.SYMTYPE
+                    ti.linkname = os.readlink(fp)
+                    ti.mode = 0o777
+                    tf.addfile(ti)
+                elif fp.is_file():
+                    data = fp.read_bytes()
+                    ti.type = tarfile.REGTYPE
+                    ti.size = len(data)
+                    ti.mode = 0o755 if os.access(fp, os.X_OK) else 0o644
+                    tf.addfile(ti, io.BytesIO(data))
+    return raw_buf.getvalue(), len(entries)
+
+
+def run_archive(
+    repo_root: pathlib.Path,
+    *,
+    output: pathlib.Path | None = None,
+    prefix: str = "starcouncil",
+    verify: bool = False,
+    verify_file: pathlib.Path | None = None,
+) -> dict[str, Any]:
+    """Creates and optionally verifies a deterministic tarball from `repo_root`."""
+    bytes_a, file_count = build_reproducible_tarball_bytes(repo_root, prefix=prefix)
+    sha_a = hashlib.sha256(bytes_a).hexdigest()
+
+    if verify_file is not None:
+        if not verify_file.is_file():
+            raise FileNotFoundError(f"Archive not found: {verify_file}")
+        actual = hashlib.sha256(verify_file.read_bytes()).hexdigest()
+        if actual != sha_a:
+            raise ValueError(f"REPRODUCIBLE_BUILD_MISMATCH: expected={sha_a}, got={actual}")
+        return {"ok": True, "verified_file": str(verify_file), "sha256": sha_a, "files": file_count}
+
+    if verify:
+        bytes_b, _ = build_reproducible_tarball_bytes(repo_root, prefix=prefix)
+        sha_b = hashlib.sha256(bytes_b).hexdigest()
+        if bytes_a != bytes_b or sha_a != sha_b:
+            raise ValueError("NON_DETERMINISTIC_ARCHIVE_DETECTED")
+
+    if output is not None:
+        out_path = output.resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(bytes_a)
+        return {"ok": True, "output": str(out_path), "sha256": sha_a, "files": file_count, "verified": verify}
+
+    return {"ok": True, "sha256": sha_a, "files": file_count, "verified": verify}

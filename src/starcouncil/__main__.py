@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-License-Identifier: MIT
 """Allows `PYTHONPATH=src python3 -m starcouncil ...` out-of-the-box execution."""
 
 import sys

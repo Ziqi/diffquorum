@@ -3,6 +3,7 @@ __pycache__/
 *$py.class
 *.egg-info/
 dist/
+artifacts/
 build/
 .starcouncil/
 .DS_Store

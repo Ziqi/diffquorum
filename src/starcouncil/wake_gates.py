@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-License-Identifier: MIT
 """Six-gate 0-Token idle wakeup state machine (`[BUS-WAKE]`) for tmux + AI CLI panes."""
 
 from __future__ import annotations

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Zero-dependency StarCouncil v0.1.0 microkernel CLI."""
+# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-License-Identifier: MIT
+"""Zero-dependency StarCouncil microkernel CLI."""
 
 from __future__ import annotations
 
@@ -9,6 +11,7 @@ import pathlib
 import sys
 from typing import Any
 
+from . import __version__
 from .blackboard import (
     MAX_STDIN_BYTES,
     ack_pointer,
@@ -31,6 +34,7 @@ from .governance import (
     plan_council,
     pseudonymize_text,
     render_council_workflow,
+    run_archive,
     run_doctor,
     run_sanitize_lint,
 )
@@ -44,9 +48,10 @@ def _out(obj: Any) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="starcouncil",
-        description="StarCouncil v0.1.0 — 零依赖多智能体五类活档案、防假会校验、联席与把关微内核",
+        description=f"StarCouncil v{__version__} — 零依赖多智能体五类活档案、防假会校验、联席与把关微内核",
         allow_abbrev=False,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # 1. init
@@ -165,6 +170,14 @@ def main(argv: list[str] | None = None) -> int:
     # 11. wake-check
     p_wk = sub.add_parser("wake-check", help="从 stdin JSON 校验 [BUS-WAKE] 六道空闲门禁", allow_abbrev=False)
     p_wk.add_argument("--snapshot-json", default="")
+
+    # 12. archive
+    p_ar = sub.add_parser("archive", help="构建或校验位级可重现的源码发行包 (.tar.gz)", allow_abbrev=False)
+    p_ar.add_argument("--repo-root", default=".")
+    p_ar.add_argument("--output", default="")
+    p_ar.add_argument("--prefix", default="starcouncil")
+    p_ar.add_argument("--verify", action="store_true")
+    p_ar.add_argument("--verify-file", default="")
 
     args = parser.parse_args(argv)
     try:
@@ -340,6 +353,18 @@ def main(argv: list[str] | None = None) -> int:
             snap_raw = args.snapshot_json or sys.stdin.read()
             snap = json.loads(snap_raw)
             _out(evaluate_six_gates(snap))
+            return 0
+
+        if args.cmd == "archive":
+            _out(
+                run_archive(
+                    pathlib.Path(args.repo_root).resolve(),
+                    output=pathlib.Path(args.output) if args.output else None,
+                    prefix=args.prefix,
+                    verify=args.verify,
+                    verify_file=pathlib.Path(args.verify_file) if args.verify_file else None,
+                )
+            )
             return 0
     except Exception as exc:
         _out({"ok": False, "error": str(exc)})

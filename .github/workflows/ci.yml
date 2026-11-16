@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-License-Identifier: MIT
 name: StarCouncil CI
 
 on:
@@ -10,8 +12,12 @@ permissions: {}
 
 jobs:
   verify:
-    name: Stdlib Tests & Clean-Room Sanitize Lint
+    name: Stdlib Tests, Coverage (>=90%), Fuzzing & Sanitize Lint (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
     permissions:
       contents: read
     steps:
@@ -20,18 +26,30 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Run zero-dependency unittest suite
-        run: python3 -m unittest discover -s tests -v
+        run: python3 -W error -m unittest discover -s tests -v
+
+      - name: Enforce >=90% statement coverage gate
+        run: python3 -W error tests/test_coverage_gate.py --min-coverage 90.0
+
+      - name: Run 2,000-iteration security-invariant fuzzing harness
+        run: python3 -W error tests/fuzz_starcouncil.py --iterations 2000
 
       - name: Enforce clean-room zero-leak sanitize-lint
-        run: python3 scripts/starcouncil.py sanitize-lint --target .
+        run: python3 -W error scripts/starcouncil.py sanitize-lint --target .
 
-      - name: Smoke test 30-second init and doctor workflow
+      - name: Verify bit-for-bit reproducible source archive & SPDX-2.3 SBOM
         run: |
-          python3 scripts/starcouncil.py init --root /tmp/sc-ci-demo
-          python3 scripts/starcouncil.py doctor --root /tmp/sc-ci-demo
+          python3 -W error scripts/starcouncil.py archive --prefix starcouncil-ci --output /tmp/starcouncil-ci.tar.gz --verify
+          python3 -W error scripts/generate-sbom.py --version ci --output /tmp/starcouncil-ci.spdx.json
+
+      - name: Smoke test 30-second init, doctor & council workflow
+        run: |
+          python3 -W error scripts/starcouncil.py init --root /tmp/sc-ci-demo --force
+          python3 -W error scripts/starcouncil.py doctor --root /tmp/sc-ci-demo
+          python3 -W error scripts/starcouncil.py council --root /tmp/sc-ci-demo --topic "Verify CI smoke test"

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-License-Identifier: MIT
 """Pointer-Over-Blackboard IPC, 5 Live Archives, nofollow I/O, flock locks, and hop<=1 bridge."""
 
 from __future__ import annotations

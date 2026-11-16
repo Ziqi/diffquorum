@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Deterministic clean-room unit tests for StarCouncil v0.1.0 (5 live archives + anti-fake-council + 6 gates)."""
+# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-License-Identifier: MIT
+"""Deterministic clean-room unit tests for StarCouncil (5 live archives + anti-fake-council + 6 gates)."""
 
 from __future__ import annotations
 

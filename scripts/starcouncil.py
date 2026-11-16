@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-License-Identifier: MIT
 """Convenience entrypoint wrapper so `python3 scripts/starcouncil.py ...` works with zero pip install."""
 
 from __future__ import annotations
