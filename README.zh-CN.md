@@ -43,7 +43,8 @@
 brew install Ziqi/tap/starcouncil
 starcouncil init --root /tmp/sc-demo && starcouncil doctor --root /tmp/sc-demo
 
-# 方式 B：克隆即用（纯 Python 3.10+ 标准库，零 pip 依赖）
+# 方式 B：克隆即用（纯 Python 3.10+ 标准库，零 pip 依赖；国内读者可用 AtomGit 免代理镜像）
+# 国内镜像：git clone https://atomgit.com/sinoziqi/starcouncil.git && cd starcouncil
 git clone https://github.com/Ziqi/starcouncil.git && cd starcouncil
 python3 scripts/starcouncil.py init --root /tmp/sc-demo
 python3 scripts/starcouncil.py doctor --root /tmp/sc-demo
