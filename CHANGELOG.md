@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.1 (2026-11-16)
+
+Supply-chain assurance, reproducible release packaging, and verification gate upgrade:
+
+- **>= 90% Statement Coverage & 2,000-Iteration Fuzzing**: Added stdlib `dis` + `trace` statement coverage gate (`tests/test_coverage_gate.py`, achieving `91.06%` across `src/starcouncil/*.py`) and dual-mode Google Atheris / property-invariant fuzzer (`tests/fuzz_starcouncil.py`, `2,000` iterations).
+- **Reproducible Packaging & `SPDX-2.3` SBOM**: Added `starcouncil archive --verify` (deterministic `mtime=0`, `uid/gid=0` `.tar.gz`), `bin/starcouncil` executable launcher, `scripts/generate-sbom.py`, detached Ed25519 signatures (`.sig`), and signed in-toto DSSE bundles (`.intoto.jsonl`).
+- **GitHub Supply-Chain Hardening**: Pinned all workflow actions (`CI`, `CodeQL`, `OpenSSF Scorecard`, `SLSA Build Level 3 & SBOM Attestation`) to full 40-char commit SHAs with least-privilege permissions, enabled Private Vulnerability Reporting, `Dependabot`, `FSFE REUSE 3.3` (`REUSE.toml` + `LICENSES/MIT.txt`), `CITATION.cff`, `GOVERNANCE.md`, `CODE_OF_CONDUCT.md`, and `SECURITY_ASSURANCE_CASE.md`.
+- **Permanent Archival & Distribution**: Archived in UNESCO Software Heritage (`swh:1:snp:8ebe52eac91444368f75eeb4aa75324c40bb21f5`) and packaged for official Homebrew distribution (`brew install Ziqi/tap/starcouncil`).
+
 ## v0.1.0 (2026-11-16)
 
 Initial public clean-room release of **StarCouncil**:

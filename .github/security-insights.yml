@@ -17,7 +17,7 @@ project:
   repositories:
     - name: starcouncil
       url: https://github.com/Ziqi/starcouncil
-      comment: Pointer-Over-Blackboard orchestration, anti-fake-council verifier, 6-gate idle wakeup & tiered review microkernel
+      comment: Pointer-Over-Blackboard orchestration, anti-fake-council verifier, 6-gate idle wakeup & tiered review microkernel (OpenSSF Best Practices Silver #16755)
   vulnerability-reporting:
     reports-accepted: true
     bug-bounty-available: false
@@ -42,9 +42,9 @@ repository:
   security:
     assessments:
       self:
-        evidence: https://github.com/Ziqi/starcouncil/blob/main/SECURITY_ASSURANCE_CASE.md
+        evidence: https://www.bestpractices.dev/projects/16755
         date: '2026-11-16'
-        comment: Trust-boundary threat model, >=90% coverage gate, and 2,000-iteration security-invariant fuzzer.
+        comment: OpenSSF Best Practices Silver certification (Project #16755) and trust-boundary threat model (SECURITY_ASSURANCE_CASE.md), >=90% coverage gate, and 2,000-iteration security-invariant fuzzer.
     tools:
       - name: CodeQL
         type: SAST

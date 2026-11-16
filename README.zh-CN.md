@@ -1,5 +1,16 @@
 # StarCouncil（星议 · 多智能体轻量协作与防假会套件）
 
+[![CI](https://github.com/Ziqi/starcouncil/actions/workflows/ci.yml/badge.svg)](https://github.com/Ziqi/starcouncil/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Ziqi/starcouncil/actions/workflows/codeql.yml/badge.svg)](https://github.com/Ziqi/starcouncil/actions/workflows/codeql.yml)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16755/badge)](https://www.bestpractices.dev/projects/16755)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Ziqi/starcouncil/badge)](https://scorecard.dev/viewer/?uri=github.com/Ziqi/starcouncil)
+[![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://github.com/Ziqi/starcouncil/attestations)
+[![REUSE 3.3](https://img.shields.io/badge/REUSE-3.3%20Compliant-brightgreen)](./REUSE.toml)
+[![Coverage](https://img.shields.io/badge/Coverage-91.06%25-brightgreen)](./tests/test_coverage_gate.py)
+[![Fuzzing](https://img.shields.io/badge/Fuzzing-10%2F10%20%282%2C000%20iters%29-brightgreen)](./tests/fuzz_starcouncil.py)
+[![Homebrew](https://img.shields.io/badge/Homebrew-Ziqi%2Ftap%2Fstarcouncil-FBB040?logo=homebrew&logoColor=white)](https://github.com/Ziqi/homebrew-tap)
+[![SWHID](https://img.shields.io/badge/SWHID-swh%3A1%3Asnp%3A8ebe52ea-e20026.svg)](https://archive.softwareheritage.org/swh:1:snp:8ebe52eac91444368f75eeb4aa75324c40bb21f5)
+
 **零第三方依赖（纯 Python 3.10+ 标准库）的多智能体指针黑板调度、防假开会哈希校验、六门禁空闲唤醒与可选分级把关工具。**
 
 语言：[English](./README.md) | **简体中文** | [实战踩坑与修复实录（6 大核心经验）](./docs/PITFALLS_AND_FIXES.md)
@@ -28,12 +39,19 @@
 ## 30 秒本地开箱体验
 
 ```bash
+# 方式 A：通过官方 Homebrew 源一键安装（macOS / Linuxbrew）
+brew install Ziqi/tap/starcouncil
+starcouncil init --root /tmp/sc-demo && starcouncil doctor --root /tmp/sc-demo
+
+# 方式 B：克隆即用（纯 Python 3.10+ 标准库，零 pip 依赖）
 git clone https://github.com/Ziqi/starcouncil.git && cd starcouncil
 python3 scripts/starcouncil.py init --root /tmp/sc-demo
 python3 scripts/starcouncil.py doctor --root /tmp/sc-demo
 python3 scripts/starcouncil.py council --root /tmp/sc-demo --topic "设计轻量多智能体协作工具"
-python3 -m unittest discover -s tests -v
-python3 scripts/starcouncil.py sanitize-lint --target .
+python3 -W error -m unittest discover -s tests -v
+python3 -W error tests/test_coverage_gate.py --min-coverage 90.0
+python3 -W error tests/fuzz_starcouncil.py --iterations 2000
+python3 -W error scripts/starcouncil.py sanitize-lint --target .
 ```
 
 ## 三个模块化薄 Skill（均 `< 120` 行）

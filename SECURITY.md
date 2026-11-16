@@ -18,7 +18,16 @@ Full trust-boundary analysis is documented in [SECURITY_ASSURANCE_CASE.md](./SEC
 
 - **Immutable GitHub Actions (`Pinned-Dependencies`)**: All workflows under `.github/workflows/` pin actions to full 40-character commit SHAs with least-privilege `permissions`, `persist-credentials: false`, and weekly `.github/dependabot.yml` monitoring.
 - **Static Analysis, Coverage & Fuzzing**: Every push and pull request runs **CodeQL** Python SAST (`.github/workflows/codeql.yml`), **`>= 90%` statement coverage gate** (`tests/test_coverage_gate.py`), **2,000-iteration security-invariant fuzzing** (`tests/fuzz_starcouncil.py`, supporting Google `atheris`), and **OpenSSF Scorecard** (`.github/workflows/scorecard.yml`).
-- **Sigstore `SLSA Build Level 3` Provenance & `SPDX-2.3` SBOM**: Automated GitHub OIDC provenance and `SPDX-2.3` SBOM attestations are published at [`github.com/Ziqi/starcouncil/attestations`](https://github.com/Ziqi/starcouncil/attestations), paired with bit-for-bit reproducible source tarballs (`starcouncil archive --verify`).
+- **Sigstore `SLSA Build Level 3` Provenance & `SPDX-2.3` SBOM**: Automated GitHub OIDC provenance and `SPDX-2.3` SBOM attestations are published at [`github.com/Ziqi/starcouncil/attestations`](https://github.com/Ziqi/starcouncil/attestations), paired with bit-for-bit reproducible source tarballs (`starcouncil archive --verify`), detached Ed25519 signatures (`.sig`), and signed in-toto DSSE bundles (`.intoto.jsonl`). Verify release signatures with the official Ed25519 public key:
+  ```pem
+  -----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAxuIA6FCv17guUFZfrXZuTB+erFYRwrm2Lof3/hzm/HM=
+  -----END PUBLIC KEY-----
+  ```
+  ```bash
+  openssl pkeyutl -verify -pubin -inkey release_ed25519_pub.pem \
+    -rawin -in starcouncil-v0.1.1.tar.gz -sigfile starcouncil-v0.1.1.tar.gz.sig
+  ```
 - **FSFE `REUSE 3.3` Licensing**: Repository-wide SPDX compliance declared via `REUSE.toml` and `LICENSES/MIT.txt`.
 
 ## 4. Reporting a Vulnerability (Coordinated Disclosure & SLA)

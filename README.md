@@ -1,5 +1,16 @@
 # StarCouncil
 
+[![CI](https://github.com/Ziqi/starcouncil/actions/workflows/ci.yml/badge.svg)](https://github.com/Ziqi/starcouncil/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Ziqi/starcouncil/actions/workflows/codeql.yml/badge.svg)](https://github.com/Ziqi/starcouncil/actions/workflows/codeql.yml)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16755/badge)](https://www.bestpractices.dev/projects/16755)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Ziqi/starcouncil/badge)](https://scorecard.dev/viewer/?uri=github.com/Ziqi/starcouncil)
+[![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://github.com/Ziqi/starcouncil/attestations)
+[![REUSE 3.3](https://img.shields.io/badge/REUSE-3.3%20Compliant-brightgreen)](./REUSE.toml)
+[![Coverage](https://img.shields.io/badge/Coverage-91.06%25-brightgreen)](./tests/test_coverage_gate.py)
+[![Fuzzing](https://img.shields.io/badge/Fuzzing-10%2F10%20%282%2C000%20iters%29-brightgreen)](./tests/fuzz_starcouncil.py)
+[![Homebrew](https://img.shields.io/badge/Homebrew-Ziqi%2Ftap%2Fstarcouncil-FBB040?logo=homebrew&logoColor=white)](https://github.com/Ziqi/homebrew-tap)
+[![SWHID](https://img.shields.io/badge/SWHID-swh%3A1%3Asnp%3A8ebe52ea-e20026.svg)](https://archive.softwareheritage.org/swh:1:snp:8ebe52eac91444368f75eeb4aa75324c40bb21f5)
+
 **Lightweight, zero-dependency Pointer-Over-Blackboard orchestration, anti-fake-council verification, 6-gate idle wakeup, and tiered review skills for AI coding agents.**
 
 Language: **English** | [简体中文 (Simplified Chinese)](./README.zh-CN.md) | [6 Production Pitfalls & Fixes](./docs/PITFALLS_AND_FIXES.md)
@@ -28,12 +39,19 @@ Most multi-agent frameworks broadcast walls of text into every pane and burn tok
 ## 30-Second Quickstart
 
 ```bash
+# Option A: Official Homebrew Tap (macOS & Linuxbrew)
+brew install Ziqi/tap/starcouncil
+starcouncil init --root /tmp/sc-demo && starcouncil doctor --root /tmp/sc-demo
+
+# Option B: Zero-install from Git (Python 3.10+ stdlib only)
 git clone https://github.com/Ziqi/starcouncil.git && cd starcouncil
 python3 scripts/starcouncil.py init --root /tmp/sc-demo
 python3 scripts/starcouncil.py doctor --root /tmp/sc-demo
 python3 scripts/starcouncil.py council --root /tmp/sc-demo --topic "Design modular skill architecture"
-python3 -m unittest discover -s tests -v
-python3 scripts/starcouncil.py sanitize-lint --target .
+python3 -W error -m unittest discover -s tests -v
+python3 -W error tests/test_coverage_gate.py --min-coverage 90.0
+python3 -W error tests/fuzz_starcouncil.py --iterations 2000
+python3 -W error scripts/starcouncil.py sanitize-lint --target .
 ```
 
 ## Included Modular Skills (`< 120` lines each)
