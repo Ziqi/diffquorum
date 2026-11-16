@@ -45,7 +45,7 @@ diffquorum init --root /tmp/dq-demo && diffquorum preflight --root /tmp/dq-demo 
 diffquorum doctor --root /tmp/dq-demo
 
 # 方式 B：克隆即用（纯 Python 3.10+ 标准库，零 pip 依赖；国内读者可用 AtomGit 免代理镜像）
-# 国内镜像：git clone https://atomgit.com/sinoziqi/starcouncil.git diffquorum && cd diffquorum
+# 国内镜像：git clone https://atomgit.com/sinoziqi/diffquorum.git && cd diffquorum
 git clone https://github.com/Ziqi/diffquorum.git && cd diffquorum
 python3 scripts/diffquorum.py init --root /tmp/dq-demo
 python3 scripts/diffquorum.py preflight --root /tmp/dq-demo --write-path /tmp/dq-demo
