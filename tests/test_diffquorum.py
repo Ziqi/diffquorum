@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-FileCopyrightText: 2026 DiffQuorum Contributors
 # SPDX-License-Identifier: MIT
-"""Deterministic clean-room unit tests for StarCouncil (5 live archives + anti-fake-council + 6 gates)."""
+"""Deterministic clean-room unit tests for DiffQuorum (5 live archives, blind quorum, 6 gates, preflight & presets)."""
 
 from __future__ import annotations
 
@@ -15,27 +15,29 @@ import unittest
 
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC_DIR = PKG_ROOT / "src"
-SCRIPT = PKG_ROOT / "scripts" / "starcouncil.py"
+SCRIPT = PKG_ROOT / "scripts" / "diffquorum.py"
+LEGACY_SCRIPT = PKG_ROOT / "scripts" / "starcouncil.py"
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from starcouncil.blackboard import (  # noqa: E402
+from diffquorum.blackboard import (  # noqa: E402
     MAX_ENVELOPE_BYTES,
     MAX_STDIN_BYTES,
     ack_pointer,
     build_ssh_peer_command,
     dispatch_pointer,
+    dq_dir,
     ingest_peer_stdin,
     init_workspace,
     read_board,
     refresh_board_locks,
+    run_preflight,
     run_with_lock,
     update_board,
 )
-from starcouncil.governance import (  # noqa: E402
-    council_submit,
-    council_verify,
+from diffquorum.governance import (  # noqa: E402
+    build_runner_preset,
     evaluate_review_gate,
     format_plain_3line,
     lint_plain_summary,
@@ -43,17 +45,31 @@ from starcouncil.governance import (  # noqa: E402
     log_pitfall,
     plan_council,
     pseudonymize_text,
+    quorum_render_blind_packet,
+    quorum_submit,
+    quorum_verify,
     render_council_workflow,
     run_doctor,
     run_sanitize_lint,
 )
-from starcouncil.wake_gates import apply_wake_attempt, evaluate_six_gates  # noqa: E402
+from diffquorum.wake_gates import (  # noqa: E402
+    apply_wake_attempt,
+    evaluate_six_gates,
+    is_bare_idle_prompt,
+    strip_terminal_escapes,
+)
 
 
-class StarCouncilCleanRoomTests(unittest.TestCase):
-    def run_cli(self, *args: str, check: bool = True, input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+class DiffQuorumCleanRoomTests(unittest.TestCase):
+    def run_cli(
+        self,
+        *args: str,
+        check: bool = True,
+        input_bytes: bytes | None = None,
+        script_path: pathlib.Path = SCRIPT,
+    ) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *args],
+            [sys.executable, str(script_path), *args],
             input=input_bytes,
             capture_output=True,
             check=check,
@@ -65,9 +81,9 @@ class StarCouncilCleanRoomTests(unittest.TestCase):
             res = init_workspace(root, topology="local-tmux", subscription="single-sub")
             self.assertTrue(res["ok"])
             self.assertEqual(res["max_concurrent_agents"], 1)
-            self.assertTrue((root / ".starcouncil" / "logs" / "events.jsonl").is_file())
-            self.assertTrue((root / ".starcouncil" / "fixes_log.md").is_file())
-            self.assertTrue((root / ".starcouncil" / "meetings").is_dir())
+            self.assertTrue((root / ".diffquorum" / "logs" / "events.jsonl").is_file())
+            self.assertTrue((root / ".diffquorum" / "fixes_log.md").is_file())
+            self.assertTrue((root / ".diffquorum" / "meetings").is_dir())
 
             ok_board = update_board(root, "# Board\n\nAll good.\n")
             self.assertLess(ok_board["bytes"], 3072)
@@ -106,14 +122,14 @@ class StarCouncilCleanRoomTests(unittest.TestCase):
             )
             self.assertEqual(res["action"], "DISPATCHED")
             self.assertLess(res["pointer_bytes"], MAX_ENVELOPE_BYTES)
-            inbox_file = root / ".starcouncil" / "inbox" / "builder.jsonl"
+            inbox_file = root / ".diffquorum" / "inbox" / "builder.jsonl"
             lines = inbox_file.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1)
             self.assertLess(len(lines[0].encode("utf-8")), MAX_ENVELOPE_BYTES)
 
             evil_target = root / "outside.jsonl"
             evil_target.write_text("", encoding="utf-8")
-            sym_inbox = root / ".starcouncil" / "inbox" / "reviewer.jsonl"
+            sym_inbox = root / ".diffquorum" / "inbox" / "reviewer.jsonl"
             sym_inbox.symlink_to(evil_target)
             with self.assertRaises(OSError):
                 dispatch_pointer(
@@ -203,9 +219,9 @@ class StarCouncilCleanRoomTests(unittest.TestCase):
             self.assertIn("RESONANCE_CIRCUIT_OPEN", str(ctx_slow.exception))
 
     def test_04_ssh_federated_shlex_quote_and_ascii_stdin_limits(self) -> None:
-        argv = build_ssh_peer_command("workstation", "/opt/bin/starcouncil;rm -rf /")
+        argv = build_ssh_peer_command("workstation", "/opt/bin/diffquorum;rm -rf /")
         self.assertEqual(argv[:6], ["ssh", "-o", "BatchMode=yes", "-o", "ForwardAgent=no", "workstation"])
-        self.assertIn("'/opt/bin/starcouncil;rm -rf /'", argv[6])
+        self.assertIn("'/opt/bin/diffquorum;rm -rf /'", argv[6])
 
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -249,10 +265,10 @@ class StarCouncilCleanRoomTests(unittest.TestCase):
             init_workspace(root)
             rc = run_with_lock(root, "browser", "lead", [sys.executable, "-c", "import sys; sys.exit(0)"])
             self.assertEqual(rc, 0)
-            self.assertFalse((root / ".starcouncil" / "locks" / "browser.holder.json").exists())
+            self.assertFalse((root / ".diffquorum" / "locks" / "browser.holder.json").exists())
             ev_actions = [
                 json.loads(ln)["action"]
-                for ln in (root / ".starcouncil" / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for ln in (root / ".diffquorum" / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             self.assertIn("LOCK_ACQUIRE", ev_actions)
             self.assertIn("LOCK_RELEASE", ev_actions)
@@ -300,7 +316,7 @@ class StarCouncilCleanRoomTests(unittest.TestCase):
         self.assertEqual(r2["attempts"], 2)
         self.assertEqual(r2["status"], "SEEN_AWAITING_HUMAN")
 
-    def test_07_council_single_sub_serial_remote_dnd_and_workflow_ast(self) -> None:
+    def test_07_quorum_single_sub_serial_remote_dnd_and_workflow_ast(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             init_workspace(root, topology="ssh-federated", subscription="single-sub", host_alias="workstation")
@@ -352,7 +368,7 @@ class StarCouncilCleanRoomTests(unittest.TestCase):
             )
             self.assertEqual(r_halt["status"], "PITFALL_HALT")
             self.assertTrue(r_halt["blocked"])
-            self.assertIn("PITFALL_HALT", (root / ".starcouncil" / "pitfalls.md").read_text(encoding="utf-8"))
+            self.assertIn("PITFALL_HALT", (root / ".diffquorum" / "pitfalls.md").read_text(encoding="utf-8"))
 
             secret = "ephemeral-secret-2026"
             sample_home = "/".join(["", "Users", "alice_dev", "project"])
@@ -378,10 +394,12 @@ class StarCouncilCleanRoomTests(unittest.TestCase):
             rules = {f["rule"] for f in bad_rep["findings"]}
             self.assertEqual(rules, {"HOME_ABS_PATH", "PRIVATE_OR_TAILSCALE_IP", "REAL_SESSION_UUID"})
 
-        for skill in ("starcouncil-teamwork", "starcouncil-review", "starcouncil-council"):
+        for skill in ("diffquorum-coord", "diffquorum-quorum", "diffquorum-gate"):
             sf = PKG_ROOT / "skills" / skill / "SKILL.md"
             self.assertTrue(sf.is_file(), f"Missing {sf}")
-            self.assertLess(len(sf.read_text(encoding="utf-8").splitlines()), 120)
+            txt = sf.read_text(encoding="utf-8")
+            self.assertLess(len(txt.splitlines()), 100)
+            self.assertIn("<SUBAGENT-STOP>", txt)
 
         clean_rep = run_sanitize_lint(PKG_ROOT)
         self.assertTrue(clean_rep["ok"], f"Clean-room leak detected: {clean_rep['findings']}")
@@ -393,7 +411,7 @@ class StarCouncilCleanRoomTests(unittest.TestCase):
             root = pathlib.Path(tmp)
             init_workspace(root)
             log_pitfall(root, title="Quote leak bug", root_cause="Used unquoted string", guard="Use shlex.quote")
-            log_fix(root, title="Quote fix", fix_summary="Switched to shlex.quote", files="src/starcouncil/blackboard.py")
+            log_fix(root, title="Quote fix", fix_summary="Switched to shlex.quote", files="src/diffquorum/blackboard.py")
 
             cn = plan_council(root, topic="Check security hardening")
             self.assertTrue(any("Quote leak bug" in p for p in cn["recent_pitfalls"]))
@@ -407,56 +425,195 @@ class StarCouncilCleanRoomTests(unittest.TestCase):
                 record_fix="Added nofollow guard",
             )
             self.assertEqual(rv["status"], "PASS")
-            self.assertIn("Added nofollow guard", (root / ".starcouncil" / "fixes_log.md").read_text(encoding="utf-8"))
+            self.assertIn("Added nofollow guard", (root / ".diffquorum" / "fixes_log.md").read_text(encoding="utf-8"))
 
             events = [
                 json.loads(ln)["action"]
-                for ln in (root / ".starcouncil" / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for ln in (root / ".diffquorum" / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
             ]
-            for expected in ("INIT", "LOG_PITFALL", "LOG_FIX", "COUNCIL_PLAN", "REVIEW"):
+            for expected in ("INIT", "LOG_PITFALL", "LOG_FIX", "QUORUM_PLAN", "REVIEW"):
                 self.assertIn(expected, events)
 
-    def test_11_anti_fake_council_blocks_solo_or_duplicate_and_allows_verified_multi_seat(self) -> None:
+    def test_11_anti_fake_quorum_blocks_solo_or_duplicate_and_allows_verified_multi_seat(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             init_workspace(root)
 
-            # 1) Single-author submission cannot pass as MULTI_SEAT_DECISION
-            council_submit(root, meeting_id="rfc-solo", author="lead", source_kind="local_seat", content="Only one view.")
-            solo_blocked = council_verify(root, meeting_id="rfc-solo", require_multi_seat=True)
+            quorum_submit(root, meeting_id="rfc-solo", author="lead", source_kind="local_seat", content="Only one view.")
+            solo_blocked = quorum_verify(root, meeting_id="rfc-solo", require_multi_seat=True)
             self.assertTrue(solo_blocked["blocked"])
             self.assertEqual(solo_blocked["decision_grade"], "SOLO_SYNTHESIS")
-            self.assertIn("Fake-Council Guard Blocked", (root / ".starcouncil" / "pitfalls.md").read_text(encoding="utf-8"))
+            self.assertIn("Fake-Quorum Guard Blocked", (root / ".diffquorum" / "pitfalls.md").read_text(encoding="utf-8"))
 
-            # With --allow-solo (require_multi_seat=False), allowed ONLY with SOLO_SYNTHESIS watermark
-            solo_allowed = council_verify(root, meeting_id="rfc-solo", require_multi_seat=False)
+            solo_allowed = quorum_verify(root, meeting_id="rfc-solo", require_multi_seat=False)
             self.assertFalse(solo_allowed["blocked"])
             self.assertEqual(solo_allowed["decision_grade"], "SOLO_SYNTHESIS")
 
-            # CLI council-verify exit code 2 when blocked
-            r_blk = self.run_cli("council-verify", "--root", str(root), "--meeting-id", "rfc-solo", check=False)
+            r_blk = self.run_cli("quorum-verify", "--root", str(root), "--meeting-id", "rfc-solo", check=False)
             self.assertEqual(r_blk.returncode, 2)
 
-            # 2) Two authors submitting byte-for-byte identical copy-paste content must NOT pass!
-            council_submit(root, meeting_id="rfc-dup", author="lead", source_kind="local_seat", content="Same copied opinion")
-            council_submit(root, meeting_id="rfc-dup", author="builder", source_kind="external_llm", content="Same copied opinion")
-            dup_res = council_verify(root, meeting_id="rfc-dup", require_multi_seat=True)
+            quorum_submit(root, meeting_id="rfc-dup", author="lead", source_kind="local_seat", content="Same copied opinion")
+            quorum_submit(root, meeting_id="rfc-dup", author="builder", source_kind="external_llm", content="Same copied opinion")
+            dup_res = quorum_verify(root, meeting_id="rfc-dup", require_multi_seat=True)
             self.assertTrue(dup_res["blocked"])
             self.assertEqual(dup_res["decision_grade"], "SOLO_SYNTHESIS")
 
-            # 3) Distinct authors, source kinds & distinct content hashes -> MULTI_SEAT_DECISION
-            council_submit(root, meeting_id="rfc-real", author="lead", source_kind="local_seat", content="Keep interfaces minimal.")
-            council_submit(root, meeting_id="rfc-real", author="advisor", source_kind="external_llm", content="Verified hash checks prevent tampering.")
-            ok_res = council_verify(root, meeting_id="rfc-real", require_multi_seat=True, resolution_summary="Adopt hash check.")
+            quorum_submit(root, meeting_id="rfc-real", author="lead", source_kind="local_seat", content="Keep interfaces minimal.")
+            quorum_submit(root, meeting_id="rfc-real", author="advisor", source_kind="external_llm", content="Verified hash checks prevent tampering.")
+            ok_res = quorum_verify(root, meeting_id="rfc-real", require_multi_seat=True, resolution_summary="Adopt hash check.")
             self.assertFalse(ok_res["blocked"])
             self.assertEqual(ok_res["decision_grade"], "MULTI_SEAT_DECISION")
             self.assertEqual(ok_res["distinct_authors"], ["advisor", "lead"])
 
-            # 4) Tampering with a raw .md file after submission raises tamper error
-            (root / ".starcouncil" / "meetings" / "rfc-real" / "submissions" / "lead__local_seat.md").write_text("Tampered!", encoding="utf-8")
+            (root / ".diffquorum" / "meetings" / "rfc-real" / "submissions" / "lead__local_seat.md").write_text("Tampered!", encoding="utf-8")
             with self.assertRaises(ValueError) as ctx_tamp:
-                council_verify(root, meeting_id="rfc-real", require_multi_seat=True)
+                quorum_verify(root, meeting_id="rfc-real", require_multi_seat=True)
             self.assertIn("TAMPERED_SUBMISSION_HASH_MISMATCH", str(ctx_tamp.exception))
+
+    def test_12_preflight_zero_token_readiness_and_legacy_starcouncil_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            init_workspace(root)
+            fake_agy_dir = root / "agy_state"
+            fake_agy_dir.mkdir()
+
+            ok_pf = run_preflight(root, write_paths=[str(root)], cli_tools=["python3"], agy_state_dir=fake_agy_dir)
+            self.assertTrue(ok_pf["ok"], ok_pf)
+            self.assertFalse(ok_pf["blocked"])
+
+            r_bad_cli = self.run_cli("preflight", "--root", str(root), "--cli", "nonexistent_dq_tool_xyz", check=False)
+            self.assertEqual(r_bad_cli.returncode, 2)
+            self.assertFalse(json.loads(r_bad_cli.stdout.decode("utf-8"))["ok"])
+
+            bad_agy_sym = root / "sym_agy"
+            bad_agy_sym.symlink_to(fake_agy_dir)
+            bad_pf = run_preflight(root, cli_tools=["agy"], agy_state_dir=bad_agy_sym)
+            self.assertFalse(bad_pf["ok"])
+            self.assertTrue(any(c["check"] == "agy_state_dir" and not c["ok"] for c in bad_pf["checks"]))
+
+            # Legacy .starcouncil/ fallback + scripts/starcouncil.py shim
+            legacy_ws = root / "legacy_ws"
+            legacy_dir = legacy_ws / ".starcouncil"
+            legacy_dir.mkdir(parents=True)
+            (legacy_dir / "BOARD.md").write_text("# Legacy Board\n", encoding="utf-8")
+            self.assertEqual(dq_dir(legacy_ws), legacy_dir)
+            self.assertIn("Legacy Board", read_board(legacy_ws))
+
+            shim_ver = self.run_cli("--version", script_path=LEGACY_SCRIPT)
+            self.assertEqual(shim_ver.returncode, 0)
+            self.assertIn("0.2.0", shim_ver.stdout.decode("utf-8"))
+
+    def test_13_wake_gates_ansi_strip_unicode_ellipsis_and_modal_blocking(self) -> None:
+        colored_prompt = "\x1b[32m>\x1b[0m\x1b[3CAsk anything..."
+        self.assertEqual(strip_terminal_escapes(colored_prompt), "> Ask anything...")
+        self.assertTrue(is_bare_idle_prompt([colored_prompt], cursor_x=4))
+        self.assertFalse(is_bare_idle_prompt(["⠋ Thinking…"], cursor_x=4))
+        self.assertFalse(is_bare_idle_prompt(["Allow once [Y/n]", ">   Ask anything..."], cursor_x=4))
+
+        base_snap = {
+            "msg_id": "msg-ansi",
+            "msg_text": "check",
+            "msg_status": "PENDING",
+            "msg_attempts": 0,
+            "last_attempt_ts": 0.0,
+            "pane_in_mode": 0,
+            "pane_fg": "claude",
+            "agy_in_tree": False,
+            "client_activity_ts": 100.0,
+            "capture_lines": [colored_prompt],
+            "cursor_x": 4,
+            "transcript_last_type": "PLANNER_RESPONSE",
+            "transcript_last_status": "DONE",
+            "transcript_has_tool_calls": False,
+            "running_tasks": [],
+            "recent_seat_wakes": [],
+        }
+        self.assertTrue(evaluate_six_gates(base_snap, now_ts=1000.0)["wake"])
+        self.assertTrue(evaluate_six_gates(dict(base_snap, pane_fg="codex", capture_lines=["›"]), now_ts=1000.0)["wake"])
+
+        modal_snap = dict(
+            base_snap,
+            capture_lines=["Approve plan? ↑/↓ to navigate • enter Toggle", ">   Ask anything..."],
+        )
+        modal_res = evaluate_six_gates(modal_snap, now_ts=1000.0)
+        self.assertFalse(modal_res["wake"])
+        self.assertEqual(modal_res["reason"], "WAITING_USER_ANSWER")
+
+        ellipsis_snap = dict(base_snap, capture_lines=["Working…"])
+        ellipsis_res = evaluate_six_gates(ellipsis_snap, now_ts=1000.0)
+        self.assertFalse(ellipsis_res["wake"])
+        self.assertEqual(ellipsis_res["reason"], "PROMPT_BUSY_OR_MISSING")
+
+    def test_14_quorum_diff_sha256_and_stage2_blind_peer_anonymization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            init_workspace(root)
+
+            quorum_submit(
+                root,
+                meeting_id="m-blind",
+                author="seat-kimi",
+                source_kind="external_llm",
+                content="Check symlink guard first.",
+                diff_sha256="abc123def456",
+            )
+            quorum_submit(
+                root,
+                meeting_id="m-blind",
+                author="seat-grok",
+                source_kind="remote_node",
+                content="Narrow matcher to mutating tools.",
+                diff_sha256="abc123def456",
+            )
+            quorum_submit(
+                root,
+                meeting_id="m-blind",
+                author="seat-lead",
+                source_kind="local_seat",
+                content="Ensure coverage remains >= 90%.",
+                diff_sha256="abc123def456",
+            )
+
+            blind_res = quorum_render_blind_packet(root, meeting_id="m-blind", seed=42)
+            self.assertTrue(blind_res["ok"])
+            self.assertEqual(blind_res["labels"], ["Peer A", "Peer B", "Peer C"])
+
+            packet_txt = pathlib.Path(blind_res["blind_packet"]).read_text(encoding="utf-8")
+            self.assertIn("Peer A", packet_txt)
+            self.assertIn("Peer B", packet_txt)
+            self.assertIn("Peer C", packet_txt)
+            self.assertNotIn("seat-kimi", packet_txt)
+            self.assertNotIn("seat-grok", packet_txt)
+            self.assertNotIn("seat-lead", packet_txt)
+
+            reveal = json.loads(pathlib.Path(blind_res["reveal_map"]).read_text(encoding="utf-8"))
+            authors_mapped = {v["author"] for v in reveal.values()}
+            self.assertEqual(authors_mapped, {"seat-kimi", "seat-grok", "seat-lead"})
+            self.assertTrue(all(v["diff_sha256"] == "abc123def456" for v in reveal.values()))
+
+            cli_ver = self.run_cli("quorum-verify", "--root", str(root), "--meeting-id", "m-blind", "--resolution", "Ship Stage-2 fix")
+            self.assertEqual(cli_ver.returncode, 0)
+            out_json = json.loads(cli_ver.stdout.decode("utf-8"))
+            self.assertEqual(out_json["decision_grade"], "MULTI_SEAT_DECISION")
+            self.assertEqual(out_json["bound_diff_hashes"], ["abc123def456"])
+
+    def test_15_optional_runner_presets_including_agy_hydrogen(self) -> None:
+        for prof in ("agy-hydrogen", "claude-sub", "codex", "generic-ptr"):
+            res = build_runner_preset(prof, task_pointer="artifacts/task-01.md")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["profile"], prof)
+            self.assertIn("artifacts/task-01.md", " ".join(res["argv"]))
+
+        hydro = build_runner_preset("agy-hydrogen", task_pointer="artifacts/task-01.md", model_override="gemini-4-hydrogen-xhigh")
+        self.assertEqual(hydro["selected_model"], "gemini-4-hydrogen-xhigh")
+        self.assertIn("Optional", hydro["notes"])
+        self.assertEqual(hydro["preflight_argv"], ["diffquorum", "preflight", "--cli", "agy"])
+
+        with self.assertRaises(ValueError):
+            build_runner_preset("unknown-profile", task_pointer="artifacts/task-01.md")
+
+        bad_cli = self.run_cli("preset", "--profile", "unknown-profile", "--task-pointer", "artifacts/x.md", check=False)
+        self.assertEqual(bad_cli.returncode, 2)
 
 
 if __name__ == "__main__":

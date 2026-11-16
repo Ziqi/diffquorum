@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-FileCopyrightText: 2026 DiffQuorum Contributors
 # SPDX-License-Identifier: MIT
-"""Zero-dependency StarCouncil microkernel CLI."""
+"""Zero-dependency DiffQuorum microkernel CLI."""
 
 from __future__ import annotations
 
@@ -21,18 +21,22 @@ from .blackboard import (
     init_workspace,
     read_board,
     refresh_board_locks,
+    run_preflight,
     run_with_lock,
     update_board,
 )
 from .governance import (
-    council_submit,
-    council_verify,
+    RUNNER_PRESETS,
+    build_runner_preset,
     evaluate_review_gate,
     lint_plain_summary,
     log_fix,
     log_pitfall,
     plan_council,
     pseudonymize_text,
+    quorum_render_blind_packet,
+    quorum_submit,
+    quorum_verify,
     render_council_workflow,
     run_archive,
     run_doctor,
@@ -47,20 +51,20 @@ def _out(obj: Any) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="starcouncil",
-        description=f"StarCouncil v{__version__} — 零依赖多智能体五类活档案、防假会校验、联席与把关微内核",
+        prog="diffquorum",
+        description=f"DiffQuorum v{__version__} — 零依赖多智能体指针协调、匿名防假会、六门禁唤醒与预检工具",
         allow_abbrev=False,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # 1. init
-    p_init = sub.add_parser("init", help="初始化 .starcouncil/ 五类活档案工作区", allow_abbrev=False)
+    p_init = sub.add_parser("init", help="初始化 .diffquorum/ 五类活档案工作区", allow_abbrev=False)
     p_init.add_argument("--root", default=".")
     p_init.add_argument("--topology", choices=("local-tmux", "ssh-federated"), default="local-tmux")
     p_init.add_argument("--subscription", choices=("single-sub", "multi-sub"), default="single-sub")
     p_init.add_argument("--host-alias", default="workstation")
-    p_init.add_argument("--remote-bin", default="starcouncil")
+    p_init.add_argument("--remote-bin", default="diffquorum")
     p_init.add_argument("--force", action="store_true")
 
     # 2. board
@@ -101,7 +105,21 @@ def main(argv: list[str] | None = None) -> int:
     p_lk.add_argument("--seat", required=True)
     p_lk.add_argument("cmd_args", nargs=argparse.REMAINDER)
 
-    # 6. log-pitfall & log-fix
+    # 6. preflight (<1s zero-token environment check)
+    p_pf = sub.add_parser("preflight", help="派活前 <1s 零消耗预检：目录可写性、资源锁与 CLI 可用性", allow_abbrev=False)
+    p_pf.add_argument("--root", default=".")
+    p_pf.add_argument("--write-path", action="append", default=[])
+    p_pf.add_argument("--resource", default="")
+    p_pf.add_argument("--cli", action="append", default=[])
+    p_pf.add_argument("--agy-state-dir", default="")
+
+    # 7. preset (optional vendor-neutral & Hydrogen runner preset helper)
+    p_pr = sub.add_parser("preset", help="可选无头执行器命令模板生成器 (含可选 agy-hydrogen 预设)", allow_abbrev=False)
+    p_pr.add_argument("--profile", choices=tuple(RUNNER_PRESETS.keys()), default="generic-ptr")
+    p_pr.add_argument("--task-pointer", required=True)
+    p_pr.add_argument("--model", default="")
+
+    # 8. log-pitfall & log-fix
     p_lp = sub.add_parser("log-pitfall", help="记录踩坑根因到 pitfalls.md 并写入事件流水", allow_abbrev=False)
     p_lp.add_argument("--root", default=".")
     p_lp.add_argument("--title", required=True)
@@ -116,41 +134,49 @@ def main(argv: list[str] | None = None) -> int:
     p_lf.add_argument("--files", default="")
     p_lf.add_argument("--actor", default="cli")
 
-    # 7. doctor
+    # 9. doctor & sanitize-lint
     p_doc = sub.add_parser("doctor", help="校验五类活档案、指针上限、单订阅锁与 settings.json 纯净度", allow_abbrev=False)
     p_doc.add_argument("--root", default=".")
     p_doc.add_argument("--settings-path", default="")
     p_doc.add_argument("--transcript-steps", type=int, default=None)
 
-    # 8. sanitize-lint
     p_san = sub.add_parser("sanitize-lint", help="扫描私密路径、内网/Tailscale IP、真实 UUID 与禁用词", allow_abbrev=False)
     p_san.add_argument("--target", default=".")
     p_san.add_argument("--forbid", default="")
 
-    # 9. council, council-submit, council-verify
-    p_cn = sub.add_parser("council", help="2x2 按话题标签摇人规划或输出单轮并行工作流", allow_abbrev=False)
-    p_cn.add_argument("--root", default=".")
-    p_cn.add_argument("--topic", required=True)
-    p_cn.add_argument("--tags", default="")
-    p_cn.add_argument("--subscription", choices=("", "single-sub", "multi-sub"), default="")
-    p_cn.add_argument("--emit-workflow", action="store_true")
-    p_cn.add_argument("--model", default="pro")
+    # 10. quorum / council planning, submission, anonymization, and verification
+    for name in ("quorum", "council"):
+        p_cn = sub.add_parser(name, help="按话题标签摇人规划或输出单轮并行工作流", allow_abbrev=False)
+        p_cn.add_argument("--root", default=".")
+        p_cn.add_argument("--topic", required=True)
+        p_cn.add_argument("--tags", default="")
+        p_cn.add_argument("--subscription", choices=("", "single-sub", "multi-sub"), default="")
+        p_cn.add_argument("--emit-workflow", action="store_true")
+        p_cn.add_argument("--model", default="pro")
 
-    p_cs = sub.add_parser("council-submit", help="保存参会席位独立原始发言与 SHA-256 指纹", allow_abbrev=False)
-    p_cs.add_argument("--root", default=".")
-    p_cs.add_argument("--meeting-id", required=True)
-    p_cs.add_argument("--author", required=True)
-    p_cs.add_argument("--source-kind", required=True, choices=("local_seat", "remote_node", "external_llm", "subagent"))
-    p_cs.add_argument("--content", default="")
-    p_cs.add_argument("--file", default="")
+    for name in ("quorum-submit", "council-submit"):
+        p_cs = sub.add_parser(name, help="保存参会席位独立原始发言、可选 diff 哈希与 SHA-256 指纹", allow_abbrev=False)
+        p_cs.add_argument("--root", default=".")
+        p_cs.add_argument("--meeting-id", required=True)
+        p_cs.add_argument("--author", required=True)
+        p_cs.add_argument("--source-kind", required=True, choices=("local_seat", "remote_node", "external_llm", "subagent"))
+        p_cs.add_argument("--diff-sha256", default="")
+        p_cs.add_argument("--content", default="")
+        p_cs.add_argument("--file", default="")
 
-    p_cv = sub.add_parser("council-verify", help="防假会哈希校验：>=2 个独立来源才准出具 MULTI_SEAT_DECISION", allow_abbrev=False)
-    p_cv.add_argument("--root", default=".")
-    p_cv.add_argument("--meeting-id", required=True)
-    p_cv.add_argument("--allow-solo", action="store_true")
-    p_cv.add_argument("--resolution", default="")
+    for name in ("quorum-verify", "council-verify"):
+        p_cv = sub.add_parser(name, help="防假会哈希校验：>=2 个独立来源才准出具 MULTI_SEAT_DECISION", allow_abbrev=False)
+        p_cv.add_argument("--root", default=".")
+        p_cv.add_argument("--meeting-id", required=True)
+        p_cv.add_argument("--allow-solo", action="store_true")
+        p_cv.add_argument("--resolution", default="")
 
-    # 10. review
+    p_qb = sub.add_parser("quorum-blind", help="导出 Peer A/B/C 匿名盲审数据包并生成解盲映射", allow_abbrev=False)
+    p_qb.add_argument("--root", default=".")
+    p_qb.add_argument("--meeting-id", required=True)
+    p_qb.add_argument("--seed", type=int, default=0)
+
+    # 11. review, wake-check, archive
     p_rv = sub.add_parser("review", help="0/1/2 级轻量审稿、两轮安灯拉闸与 Fail-Closed 门禁", allow_abbrev=False)
     p_rv.add_argument("--root", default=".")
     p_rv.add_argument("--level", type=int, choices=(0, 1, 2), default=0)
@@ -167,15 +193,13 @@ def main(argv: list[str] | None = None) -> int:
     p_rv.add_argument("--hmac-key", default="session-ephemeral-key")
     p_rv.add_argument("--lint-text", default="")
 
-    # 11. wake-check
     p_wk = sub.add_parser("wake-check", help="从 stdin JSON 校验 [BUS-WAKE] 六道空闲门禁", allow_abbrev=False)
     p_wk.add_argument("--snapshot-json", default="")
 
-    # 12. archive
     p_ar = sub.add_parser("archive", help="构建或校验位级可重现的源码发行包 (.tar.gz)", allow_abbrev=False)
     p_ar.add_argument("--repo-root", default=".")
     p_ar.add_argument("--output", default="")
-    p_ar.add_argument("--prefix", default="starcouncil")
+    p_ar.add_argument("--prefix", default="diffquorum")
     p_ar.add_argument("--verify", action="store_true")
     p_ar.add_argument("--verify-file", default="")
 
@@ -208,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             root = pathlib.Path(args.root).resolve()
             if args.print_ssh_cmd:
                 host, _, rbin = args.print_ssh_cmd.partition(":")
-                _out({"argv": build_ssh_peer_command(host, rbin or "starcouncil")})
+                _out({"argv": build_ssh_peer_command(host, rbin or "diffquorum")})
                 return 0
             if args.ingest_stdin:
                 raw = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
@@ -251,6 +275,22 @@ def main(argv: list[str] | None = None) -> int:
                 cmd_argv = cmd_argv[1:]
             return run_with_lock(pathlib.Path(args.root).resolve(), args.resource, args.seat, cmd_argv)
 
+        if args.cmd == "preflight":
+            agy_dir = pathlib.Path(args.agy_state_dir).expanduser().resolve() if args.agy_state_dir else None
+            rep = run_preflight(
+                pathlib.Path(args.root).resolve(),
+                write_paths=args.write_path,
+                resource=args.resource,
+                cli_tools=args.cli,
+                agy_state_dir=agy_dir,
+            )
+            _out(rep)
+            return 0 if rep["ok"] else 2
+
+        if args.cmd == "preset":
+            _out(build_runner_preset(args.profile, task_pointer=args.task_pointer, model_override=args.model))
+            return 0
+
         if args.cmd == "log-pitfall":
             _out(
                 log_pitfall(
@@ -287,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
             _out(rep)
             return 0 if rep["ok"] else 1
 
-        if args.cmd == "council":
+        if args.cmd in ("quorum", "council"):
             if args.emit_workflow:
                 sys.stdout.write(render_council_workflow(args.topic, model_tier=args.model))
                 return 0
@@ -301,21 +341,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
-        if args.cmd == "council-submit":
+        if args.cmd in ("quorum-submit", "council-submit"):
             body = args.content or (pathlib.Path(args.file).read_text(encoding="utf-8") if args.file else "")
             _out(
-                council_submit(
+                quorum_submit(
                     pathlib.Path(args.root).resolve(),
                     meeting_id=args.meeting_id,
                     author=args.author,
                     source_kind=args.source_kind,
                     content=body,
+                    diff_sha256=args.diff_sha256,
                 )
             )
             return 0
 
-        if args.cmd == "council-verify":
-            rep = council_verify(
+        if args.cmd in ("quorum-verify", "council-verify"):
+            rep = quorum_verify(
                 pathlib.Path(args.root).resolve(),
                 meeting_id=args.meeting_id,
                 require_multi_seat=not args.allow_solo,
@@ -323,6 +364,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             _out(rep)
             return 2 if rep.get("blocked") else 0
+
+        if args.cmd == "quorum-blind":
+            _out(
+                quorum_render_blind_packet(
+                    pathlib.Path(args.root).resolve(),
+                    meeting_id=args.meeting_id,
+                    seed=args.seed,
+                )
+            )
+            return 0
 
         if args.cmd == "review":
             if args.lint_text:

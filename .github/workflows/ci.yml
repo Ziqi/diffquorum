@@ -1,6 +1,6 @@
-# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-FileCopyrightText: 2026 DiffQuorum Contributors
 # SPDX-License-Identifier: MIT
-name: StarCouncil CI
+name: DiffQuorum CI
 
 on:
   push:
@@ -38,18 +38,19 @@ jobs:
         run: python3 -W error tests/test_coverage_gate.py --min-coverage 90.0
 
       - name: Run 2,000-iteration security-invariant fuzzing harness
-        run: python3 -W error tests/fuzz_starcouncil.py --iterations 2000
+        run: python3 -W error tests/fuzz_diffquorum.py --iterations 2000
 
       - name: Enforce clean-room zero-leak sanitize-lint
-        run: python3 -W error scripts/starcouncil.py sanitize-lint --target .
+        run: python3 -W error scripts/diffquorum.py sanitize-lint --target .
 
       - name: Verify bit-for-bit reproducible source archive & SPDX-2.3 SBOM
         run: |
-          python3 -W error scripts/starcouncil.py archive --prefix starcouncil-ci --output /tmp/starcouncil-ci.tar.gz --verify
-          python3 -W error scripts/generate-sbom.py --version ci --output /tmp/starcouncil-ci.spdx.json
+          python3 -W error scripts/diffquorum.py archive --prefix diffquorum-ci --output /tmp/diffquorum-ci.tar.gz --verify
+          python3 -W error scripts/generate-sbom.py --version ci --output /tmp/diffquorum-ci.spdx.json
 
-      - name: Smoke test 30-second init, doctor & council workflow
+      - name: Smoke test 30-second init, preflight, doctor & quorum workflow
         run: |
-          python3 -W error scripts/starcouncil.py init --root /tmp/sc-ci-demo --force
-          python3 -W error scripts/starcouncil.py doctor --root /tmp/sc-ci-demo
-          python3 -W error scripts/starcouncil.py council --root /tmp/sc-ci-demo --topic "Verify CI smoke test"
+          python3 -W error scripts/diffquorum.py init --root /tmp/dq-ci-demo --force
+          python3 -W error scripts/diffquorum.py preflight --root /tmp/dq-ci-demo --write-path /tmp/dq-ci-demo
+          python3 -W error scripts/diffquorum.py doctor --root /tmp/dq-ci-demo
+          python3 -W error scripts/diffquorum.py quorum --root /tmp/dq-ci-demo --topic "Verify CI smoke test"

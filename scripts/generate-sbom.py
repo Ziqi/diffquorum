@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-FileCopyrightText: 2026 DiffQuorum Contributors
 # SPDX-License-Identifier: MIT
-"""Zero-dependency ISO/IEC 5962 (SPDX-2.3) Software Bill of Materials (SBOM) generator for StarCouncil."""
+"""Zero-dependency ISO/IEC 5962 (SPDX-2.3) Software Bill of Materials (SBOM) generator for DiffQuorum."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import pathlib
 import sys
 
 DEFAULT_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-SKIP_DIRS = {".git", "__pycache__", ".starcouncil", "artifacts", "dist", "build", ".pytest_cache"}
+SKIP_DIRS = {".git", "__pycache__", ".diffquorum", ".starcouncil", "artifacts", "dist", "build", ".pytest_cache"}
 
 
 def sha1_bytes(data: bytes) -> str:
@@ -59,12 +59,12 @@ def build_spdx_document(repo_root: pathlib.Path, version: str) -> dict:
                     ],
                     "licenseConcluded": "MIT",
                     "licenseInfoInFiles": ["MIT"],
-                    "copyrightText": "2026 StarCouncil Contributors",
+                    "copyrightText": "2026 DiffQuorum Contributors",
                 }
             )
 
     verif_digest = hashlib.sha1("".join(sorted(sha1_hashes_for_verif)).encode("ascii")).hexdigest()
-    pkg_id = "SPDXRef-Package-starcouncil"
+    pkg_id = "SPDXRef-Package-diffquorum"
 
     relationships = [
         {
@@ -86,34 +86,34 @@ def build_spdx_document(repo_root: pathlib.Path, version: str) -> dict:
         "spdxVersion": "SPDX-2.3",
         "dataLicense": "CC0-1.0",
         "SPDXID": "SPDXRef-DOCUMENT",
-        "name": f"starcouncil-{version}",
-        "documentNamespace": f"https://github.com/Ziqi/starcouncil/spdx/{version}/{verif_digest}",
+        "name": f"diffquorum-{version}",
+        "documentNamespace": f"https://github.com/Ziqi/diffquorum/spdx/{version}/{verif_digest}",
         "creationInfo": {
             "created": created_ts,
             "creators": [
-                "Organization: StarCouncil Contributors",
-                "Tool: starcouncil-sbom-generator-1.0",
+                "Organization: DiffQuorum Contributors",
+                "Tool: diffquorum-sbom-generator-1.1",
             ],
         },
         "packages": [
             {
-                "name": "starcouncil",
+                "name": "diffquorum",
                 "SPDXID": pkg_id,
                 "versionInfo": version,
-                "downloadLocation": f"https://github.com/Ziqi/starcouncil/releases/tag/{version}",
+                "downloadLocation": f"https://github.com/Ziqi/diffquorum/releases/tag/{version}",
                 "filesAnalyzed": True,
                 "packageVerificationCode": {
                     "packageVerificationCodeValue": verif_digest,
                 },
                 "licenseConcluded": "MIT",
                 "licenseDeclared": "MIT",
-                "copyrightText": "2026 StarCouncil Contributors",
+                "copyrightText": "2026 DiffQuorum Contributors",
                 "primaryPackagePurpose": "APPLICATION",
                 "externalRefs": [
                     {
                         "referenceCategory": "PACKAGE-MANAGER",
                         "referenceType": "purl",
-                        "referenceLocator": f"pkg:github/Ziqi/starcouncil@{version}",
+                        "referenceLocator": f"pkg:github/Ziqi/diffquorum@{version}",
                     }
                 ],
             }
@@ -124,9 +124,9 @@ def build_spdx_document(repo_root: pathlib.Path, version: str) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate SPDX-2.3 JSON SBOM for StarCouncil")
+    parser = argparse.ArgumentParser(description="Generate SPDX-2.3 JSON SBOM for DiffQuorum")
     parser.add_argument("--repo-root", type=pathlib.Path, default=DEFAULT_REPO_ROOT)
-    parser.add_argument("--version", default="v0.1.1")
+    parser.add_argument("--version", default="v0.2.0")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
 

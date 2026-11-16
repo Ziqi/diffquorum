@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-FileCopyrightText: 2026 DiffQuorum Contributors
 # SPDX-License-Identifier: MIT
 """
-StarCouncil Dual-Mode Adversarial Fuzzing Harness (tests/fuzz_starcouncil.py)
+DiffQuorum Dual-Mode Adversarial Fuzzing Harness (tests/fuzz_diffquorum.py)
 
 Supports:
   1. Native Google Atheris coverage-guided libFuzzer loop (`--atheris`).
   2. Zero-dependency deterministic PRNG + structure-aware security-invariant campaign
-     (`python3 -W error tests/fuzz_starcouncil.py --iterations 2000`) verifying:
+     (`python3 -W error tests/fuzz_diffquorum.py --iterations 2000`) verifying:
        - Pointer envelope budget (< 400 bytes) under arbitrary summary inputs
        - BOARD.md budget (< 3072 bytes) enforcement
-       - Symlink escape & O_NOFOLLOW rejection inside `.starcouncil/`
-       - Anti-fake-council SHA-256 tamper & single-author / copy-paste blocking
-       - Clean-room sanitize-lint & HMAC pseudonymization invariants
+       - Symlink escape & O_NOFOLLOW rejection inside `.diffquorum/`
+       - Anti-fake-quorum SHA-256 tamper & single-author / copy-paste blocking + blind packet integrity
+       - ANSI stripping, modal blocking, clean-room sanitize-lint & HMAC pseudonymization
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from starcouncil.blackboard import (  # noqa: E402
+from diffquorum.blackboard import (  # noqa: E402
     MAX_BOARD_BYTES,
     MAX_ENVELOPE_BYTES,
     MAX_STDIN_BYTES,
@@ -41,15 +41,16 @@ from starcouncil.blackboard import (  # noqa: E402
     init_workspace,
     update_board,
 )
-from starcouncil.governance import (  # noqa: E402
-    council_submit,
-    council_verify,
+from diffquorum.governance import (  # noqa: E402
     evaluate_review_gate,
     lint_plain_summary,
     pseudonymize_text,
+    quorum_render_blind_packet,
+    quorum_submit,
+    quorum_verify,
     run_sanitize_lint,
 )
-from starcouncil.wake_gates import evaluate_six_gates  # noqa: E402
+from diffquorum.wake_gates import evaluate_six_gates, strip_terminal_escapes  # noqa: E402
 
 
 def _rand_text(rng: random.Random, min_len: int = 1, max_len: int = 600) -> str:
@@ -61,6 +62,7 @@ def _rand_text(rng: random.Random, min_len: int = 1, max_len: int = 600) -> str:
 def fuzz_one_bytes(data: bytes) -> None:
     """Arbitrary byte-stream fuzz target for Atheris / CI edge-corpus testing."""
     text = data.decode("utf-8", errors="replace")
+    _ = strip_terminal_escapes(text)
     scrubbed = pseudonymize_text(text, "fuzz-ephemeral-key")
     probe_home = "/".join(["", "Users", "real_user"])
     if probe_home in text and probe_home in scrubbed:
@@ -80,20 +82,18 @@ def fuzz_one_bytes(data: bytes) -> None:
 
 def run_stdlib_campaign(iterations: int, seed: int) -> int:
     rng = random.Random(seed)
-    with tempfile.TemporaryDirectory(prefix="starcouncil_fuzz_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="diffquorum_fuzz_") as tmp:
         root = pathlib.Path(tmp)
         init_workspace(root, topology="ssh-federated", subscription="single-sub", host_alias="workstation")
 
-        # Pre-plant symlink trap outside inbox to confirm O_NOFOLLOW blocks all iterations
         trap_outside = root / "outside_trap.jsonl"
         trap_outside.write_text("", encoding="utf-8")
-        trap_link = root / ".starcouncil" / "inbox" / "trap.jsonl"
+        trap_link = root / ".diffquorum" / "inbox" / "trap.jsonl"
         trap_link.symlink_to(trap_outside)
 
         for i in range(iterations):
             op = i % 5
             if op == 0:
-                # 1. Pointer envelope MUST remain strictly < 400B for any summary
                 summary = _rand_text(rng, 10, 800)
                 if not summary.strip():
                     summary = "fallback"
@@ -109,7 +109,6 @@ def run_stdlib_campaign(iterations: int, seed: int) -> int:
                 )
                 assert res["pointer_bytes"] < MAX_ENVELOPE_BYTES, f"Pointer exceeded limit: {res}"
             elif op == 1:
-                # 2. BOARD.md MUST allow <3KB and reject >=3KB
                 size = rng.choice([128, 1024, MAX_BOARD_BYTES, MAX_BOARD_BYTES + 200])
                 payload = "B" * size
                 if size >= MAX_BOARD_BYTES:
@@ -123,22 +122,21 @@ def run_stdlib_campaign(iterations: int, seed: int) -> int:
                     out = update_board(root, payload)
                     assert out["bytes"] < MAX_BOARD_BYTES
             elif op == 2:
-                # 3. Anti-fake-council MUST block identical copy-paste content or single author
                 text_a = f"opinion-{i}-{rng.randint(1, 9999)}"
                 mid = f"fuzz-m-{i}"
-                council_submit(root, meeting_id=mid, author="lead", source_kind="local_seat", content=text_a)
+                quorum_submit(root, meeting_id=mid, author="lead", source_kind="local_seat", content=text_a)
                 if rng.random() < 0.5:
-                    # Copy-paste attack under second author name -> MUST stay SOLO_SYNTHESIS (blocked=True)
-                    council_submit(root, meeting_id=mid, author="builder", source_kind="external_llm", content=text_a)
-                    ver = council_verify(root, meeting_id=mid, require_multi_seat=True)
+                    quorum_submit(root, meeting_id=mid, author="builder", source_kind="external_llm", content=text_a)
+                    ver = quorum_verify(root, meeting_id=mid, require_multi_seat=True)
                     assert ver["blocked"] is True and ver["decision_grade"] == "SOLO_SYNTHESIS"
                 else:
-                    # Independent non-identical submission -> MUST succeed as MULTI_SEAT_DECISION
-                    council_submit(root, meeting_id=mid, author="advisor", source_kind="remote_node", content=text_a + "-distinct")
-                    ver = council_verify(root, meeting_id=mid, require_multi_seat=True)
+                    quorum_submit(root, meeting_id=mid, author="advisor", source_kind="remote_node", content=text_a + "-distinct")
+                    ver = quorum_verify(root, meeting_id=mid, require_multi_seat=True)
                     assert ver["blocked"] is False and ver["decision_grade"] == "MULTI_SEAT_DECISION"
+                    blind = quorum_render_blind_packet(root, meeting_id=mid, seed=i + 1)
+                    pkt_txt = pathlib.Path(blind["blind_packet"]).read_text(encoding="utf-8")
+                    assert "Peer A" in pkt_txt and "Peer B" in pkt_txt
             elif op == 3:
-                # 4. Symlink trap + unallowlisted stdin bytes must always fail closed
                 try:
                     dispatch_pointer(
                         root,
@@ -161,7 +159,6 @@ def run_stdlib_campaign(iterations: int, seed: int) -> int:
                     except ValueError:
                         pass
             else:
-                # 5. Review Andon cord & HMAC redaction invariants
                 h = hashlib.sha256(f"{seed}-{i}".encode("utf-8")).hexdigest()
                 rv = evaluate_review_gate(
                     root,
@@ -176,10 +173,9 @@ def run_stdlib_campaign(iterations: int, seed: int) -> int:
                 assert fake_ip not in pseudonymize_text(f"{fake_user} {fake_ip}", f"k-{i}")
                 assert trap_outside.read_text(encoding="utf-8") == ""
 
-    # Confirm clean-room self-scan remains 100% green
     assert run_sanitize_lint(REPO_ROOT)["ok"] is True
     print(
-        f"[PASS] [FUZZ-HARNESS] Completed {iterations} iterations (0 crashes; <400B envelope, <3KB board, nofollow, SHA-256 anti-fake-council & HMAC invariants held)."
+        f"[PASS] [FUZZ-HARNESS] Completed {iterations} iterations (0 crashes; <400B envelope, <3KB board, nofollow, SHA-256 anti-fake-quorum, blind packet & HMAC invariants held)."
     )
     return 0
 
@@ -192,7 +188,7 @@ def run_atheris() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="StarCouncil Dual-Mode Fuzzing Harness")
+    parser = argparse.ArgumentParser(description="DiffQuorum Dual-Mode Fuzzing Harness")
     parser.add_argument("--atheris", action="store_true", help="Run native Google Atheris libFuzzer loop")
     parser.add_argument("--iterations", type=int, default=2000, help="Number of deterministic fuzz iterations")
     parser.add_argument("--seed", type=int, default=20261116, help="PRNG seed")

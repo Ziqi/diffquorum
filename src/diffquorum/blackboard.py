@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-FileCopyrightText: 2026 DiffQuorum Contributors
 # SPDX-License-Identifier: MIT
-"""Pointer-Over-Blackboard IPC, 5 Live Archives, nofollow I/O, flock locks, and hop<=1 bridge."""
+"""Pointer-Over-Blackboard IPC, 5 Live Archives, nofollow I/O, flock locks, preflight & hop<=1 bridge."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import time
@@ -33,6 +34,7 @@ SEAT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 HOST_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,79}$")
 RESOURCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+CLI_TOOL_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 VALID_KINDS = ("TASK_DISPATCH", "UPWARD_REPORT", "PEER_SYNC", "MILESTONE_PASS", "ACK")
 VALID_PRIORITIES = ("P0", "P1", "P2")
 
@@ -135,7 +137,7 @@ def read_json_nofollow(path: pathlib.Path, max_bytes: int = 4 * 1024 * 1024) -> 
 
 
 class BusLock:
-    """Exclusive fcntl.flock mutex under `.starcouncil/locks/`."""
+    """Exclusive fcntl.flock mutex under `.diffquorum/locks/`."""
 
     def __init__(self, lock_path: pathlib.Path, non_blocking: bool = False) -> None:
         self.lock_path = lock_path
@@ -164,8 +166,18 @@ class BusLock:
                 self._fd = None
 
 
-def sc_dir(root: pathlib.Path) -> pathlib.Path:
-    return root / ".starcouncil"
+def dq_dir(root: pathlib.Path) -> pathlib.Path:
+    """Resolves `.diffquorum/` or falls back cleanly to legacy `.starcouncil/` if present."""
+    new_dir = root / ".diffquorum"
+    legacy_dir = root / ".starcouncil"
+    if new_dir.exists() or os.path.lexists(new_dir):
+        return new_dir
+    if legacy_dir.exists() or os.path.lexists(legacy_dir):
+        return legacy_dir
+    return new_dir
+
+
+sc_dir = dq_dir
 
 
 def append_jsonl_nofollow(path: pathlib.Path, line_str: str) -> None:
@@ -191,8 +203,8 @@ def append_event_log(
     detail: dict[str, Any] | None = None,
     now_ts: float | None = None,
 ) -> dict[str, Any]:
-    """Appends an immutable structured record to `.starcouncil/logs/events.jsonl` under `events.lock`."""
-    base = sc_dir(root)
+    """Appends an immutable structured record to `.diffquorum/logs/events.jsonl` under `events.lock`."""
+    base = dq_dir(root)
     entry = {
         "ts": utc_iso(now_ts),
         "action": str(action),
@@ -210,11 +222,11 @@ def default_council_toml(
     topology: str = "local-tmux",
     subscription: str = "single-sub",
     host_alias: str = "workstation",
-    remote_bin: str = "starcouncil",
+    remote_bin: str = "diffquorum",
 ) -> str:
     max_conc = 1 if subscription == "single-sub" else 3
     return (
-        'schema_version = "0.1.0"\n\n'
+        'schema_version = "0.2.0"\n\n'
         "[cluster]\n"
         f'topology = "{topology}"\n'
         f'subscription = "{subscription}"\n'
@@ -231,7 +243,7 @@ def default_council_toml(
         'id = "lead"\n'
         'role = "Local dispatcher and coordinator"\n'
         'host = "local"\n'
-        'transport = "local_agy"\n'
+        'transport = "local_cli"\n'
         'attendance = "core"\n'
         'subscribe_tags = ["dispatch", "outreach", "general"]\n'
         'preferred_mode = "sync"\n\n'
@@ -239,7 +251,7 @@ def default_council_toml(
         'id = "builder"\n'
         'role = "Primary implementation engineer"\n'
         'host = "local"\n'
-        'transport = "local_agy"\n'
+        'transport = "local_cli"\n'
         'attendance = "on_tag"\n'
         'subscribe_tags = ["code", "github", "security", "arch", "skill", "general"]\n'
         'preferred_mode = "sync"\n\n'
@@ -262,7 +274,7 @@ def init_workspace(
     topology: str = "local-tmux",
     subscription: str = "single-sub",
     host_alias: str = "workstation",
-    remote_bin: str = "starcouncil",
+    remote_bin: str = "diffquorum",
     force: bool = False,
 ) -> dict[str, Any]:
     if topology not in ("local-tmux", "ssh-federated"):
@@ -272,7 +284,7 @@ def init_workspace(
     if not HOST_ALIAS_RE.fullmatch(host_alias):
         raise ValueError(f"Invalid host_alias: {host_alias}")
 
-    base = sc_dir(root)
+    base = dq_dir(root)
     ensure_safe_dir(base)
     for sub in ("inbox", "artifacts", "locks", "logs", "meetings"):
         ensure_safe_dir(base / sub)
@@ -333,7 +345,8 @@ def init_workspace(
 
     return {
         "ok": True,
-        "starcouncil_dir": str(base),
+        "state_dir": str(base),
+        "diffquorum_dir": str(base),
         "topology": topology,
         "subscription": subscription,
         "max_concurrent_agents": 1 if subscription == "single-sub" else 3,
@@ -342,7 +355,7 @@ def init_workspace(
 
 
 def load_council_config(root: pathlib.Path) -> dict[str, Any]:
-    cfg_path = sc_dir(root) / "council.toml"
+    cfg_path = dq_dir(root) / "council.toml"
     if not cfg_path.is_file() or cfg_path.is_symlink():
         raise FileNotFoundError(f"Missing or unsafe council.toml at {cfg_path}")
     return parse_toml_text(cfg_path.read_text(encoding="utf-8"))
@@ -352,8 +365,8 @@ def update_board(root: pathlib.Path, content: str, actor: str = "cli") -> dict[s
     encoded = content.encode("utf-8")
     if len(encoded) >= MAX_BOARD_BYTES:
         raise ValueError(f"BOARD.md budget exceeded: {len(encoded)} bytes >= {MAX_BOARD_BYTES} bytes")
-    board_path = sc_dir(root) / "BOARD.md"
-    with BusLock(sc_dir(root) / "locks" / "bus.lock"):
+    board_path = dq_dir(root) / "BOARD.md"
+    with BusLock(dq_dir(root) / "locks" / "bus.lock"):
         atomic_write_text(board_path, content)
     append_event_log(root, action="BOARD_UPDATE", actor=actor, status="ok", detail={"bytes": len(encoded)})
     return {"ok": True, "path": str(board_path), "bytes": len(encoded)}
@@ -361,7 +374,7 @@ def update_board(root: pathlib.Path, content: str, actor: str = "cli") -> dict[s
 
 def refresh_board_locks(root: pathlib.Path, actor: str = "cli") -> dict[str, Any]:
     """Updates the Locks status line in BOARD.md from current `locks/*.holder.json` metadata."""
-    base = sc_dir(root)
+    base = dq_dir(root)
     locks_dir = base / "locks"
     holders: list[str] = []
     if locks_dir.is_dir():
@@ -388,7 +401,7 @@ def refresh_board_locks(root: pathlib.Path, actor: str = "cli") -> dict[str, Any
 
 
 def read_board(root: pathlib.Path) -> str:
-    board_path = sc_dir(root) / "BOARD.md"
+    board_path = dq_dir(root) / "BOARD.md"
     fd, st = open_regular_nofollow(board_path, os.O_RDONLY)
     try:
         if st.st_size >= MAX_BOARD_BYTES:
@@ -438,7 +451,7 @@ def dispatch_pointer(
     if not EVENT_ID_RE.fullmatch(eid):
         raise ValueError(f"Invalid event_id: {eid}")
 
-    base = sc_dir(root)
+    base = dq_dir(root)
     bridge_path = base / "bridge_state.json"
 
     with BusLock(base / "locks" / "bus.lock"):
@@ -528,7 +541,7 @@ def ack_pointer(
     if not SEAT_NAME_RE.fullmatch(seat) or not EVENT_ID_RE.fullmatch(event_id):
         raise ValueError("Invalid seat or event_id")
     now_ep = time.time() if now_ts is None else float(now_ts)
-    base = sc_dir(root)
+    base = dq_dir(root)
     bridge_path = base / "bridge_state.json"
 
     with BusLock(base / "locks" / "bus.lock"):
@@ -567,7 +580,7 @@ def ack_pointer(
     return res
 
 
-def build_ssh_peer_command(host_alias: str, remote_bin: str = "starcouncil") -> list[str]:
+def build_ssh_peer_command(host_alias: str, remote_bin: str = "diffquorum") -> list[str]:
     """Builds a zero-shell-interpolation SSH argv carrying dynamic JSON exclusively over stdin."""
     if not HOST_ALIAS_RE.fullmatch(host_alias):
         raise ValueError(f"Unsafe ssh host alias: {host_alias}")
@@ -619,7 +632,7 @@ def run_with_lock(root: pathlib.Path, resource: str, seat: str, cmd_argv: list[s
         raise ValueError(f"Invalid seat name: {seat}")
     if not cmd_argv:
         raise ValueError("Empty command for lock execution")
-    base = sc_dir(root)
+    base = dq_dir(root)
     lock_file = base / "locks" / f"{resource}.lock"
     holder_file = base / "locks" / f"{resource}.holder.json"
     with BusLock(lock_file, non_blocking=False):
@@ -633,3 +646,102 @@ def run_with_lock(root: pathlib.Path, resource: str, seat: str, cmd_argv: list[s
                 holder_file.unlink()
             append_event_log(root, action="LOCK_RELEASE", actor=seat, status="ok", detail={"resource": resource})
         return rc
+
+
+def _probe_writable_dir(target_dir: pathlib.Path) -> tuple[bool, str]:
+    if os.path.lexists(target_dir) and target_dir.is_symlink():
+        return False, f"Symlink target blocked: {target_dir}"
+    probe_dir = target_dir if target_dir.exists() else target_dir.parent
+    while not probe_dir.exists() and probe_dir != probe_dir.parent:
+        probe_dir = probe_dir.parent
+    if not probe_dir.is_dir():
+        return False, f"No existing directory ancestor for {target_dir}"
+    probe_file = probe_dir / f".dq_preflight_{os.getpid()}.tmp"
+    try:
+        fd, _ = open_regular_nofollow(probe_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        os.close(fd)
+        return True, f"Writable directory confirmed ({probe_dir})"
+    except OSError as exc:
+        return False, f"Write probe blocked ({type(exc).__name__}: {exc.strerror or exc})"
+    finally:
+        try:
+            probe_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def run_preflight(
+    root: pathlib.Path,
+    *,
+    write_paths: list[str] | tuple[str, ...] = (),
+    resource: str = "",
+    cli_tools: list[str] | tuple[str, ...] = (),
+    agy_state_dir: pathlib.Path | None = None,
+) -> dict[str, Any]:
+    """Deterministic <1s 0-token check for path writability, lock contention, and worker CLI availability."""
+    checks: list[dict[str, Any]] = []
+
+    def _add(name: str, ok: bool, detail: str, fix: str = "") -> None:
+        item: dict[str, Any] = {"check": name, "ok": ok, "detail": detail}
+        if fix:
+            item["fix"] = fix
+        checks.append(item)
+
+    targets = [pathlib.Path(p).expanduser() for p in write_paths] or [root]
+    for tp in targets:
+        abs_tp = tp.resolve() if not os.path.lexists(tp) or not tp.is_symlink() else tp
+        target_dir = abs_tp if abs_tp.is_dir() or not abs_tp.suffix else abs_tp.parent
+        ok_w, msg = _probe_writable_dir(target_dir)
+        _add(
+            f"write_path:{tp}",
+            ok_w,
+            msg,
+            "" if ok_w else "Run outside read-only sandbox or grant host write permission before dispatching worker",
+        )
+
+    if resource:
+        if not RESOURCE_NAME_RE.fullmatch(resource):
+            _add("lock_resource", False, f"Invalid resource name: {resource}")
+        else:
+            holder = dq_dir(root) / "locks" / f"{resource}.holder.json"
+            if holder.exists():
+                info = read_json_nofollow(holder)
+                _add(
+                    f"lock:{resource}",
+                    False,
+                    f"Held by seat={info.get('seat', '?')} pid={info.get('pid', '?')}",
+                    "Wait for lock release before spawning conflicting worker",
+                )
+            else:
+                _add(f"lock:{resource}", True, f"Resource lock `{resource}` is free")
+
+    saw_agy = False
+    for tool in cli_tools:
+        t = tool.strip()
+        if not t:
+            continue
+        if not CLI_TOOL_RE.fullmatch(t):
+            _add(f"cli:{t}", False, f"Invalid CLI name: {t}")
+            continue
+        if t == "agy":
+            saw_agy = True
+        resolved = shutil.which(t)
+        _add(
+            f"cli:{t}",
+            resolved is not None,
+            resolved or f"Command `{t}` not found on PATH",
+            "" if resolved else f"Install `{t}` or adjust PATH before invoking headless preset",
+        )
+
+    if saw_agy or agy_state_dir is not None:
+        state_dir = agy_state_dir or (pathlib.Path.home() / ".gemini" / "antigravity-cli")
+        ok_agy, msg_agy = _probe_writable_dir(state_dir)
+        _add(
+            "agy_state_dir",
+            ok_agy,
+            msg_agy,
+            "" if ok_agy else "Headless `agy -p` writes installation_id under ~/.gemini/antigravity-cli; run unsandboxed/host",
+        )
+
+    all_ok = all(c["ok"] for c in checks)
+    return {"ok": all_ok, "blocked": not all_ok, "checks": checks}

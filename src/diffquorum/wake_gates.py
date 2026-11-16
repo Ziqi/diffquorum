@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-FileCopyrightText: 2026 DiffQuorum Contributors
 # SPDX-License-Identifier: MIT
 """Six-gate 0-Token idle wakeup state machine (`[BUS-WAKE]`) for tmux + AI CLI panes."""
 
@@ -17,21 +17,53 @@ RATE_LIMIT_MAX_WAKES = 2
 RETRY_COOLDOWN_SECONDS = 30.0
 
 SILENT_FIRST_LINE_PREFIXES = ("【TERMINAL-ACK】", "【INFO-SYNC")
-BUSY_SPINNER_RE = re.compile(r"^\s*(?:[\u2800-\u28ff✦✻*•]\s+)?(?:Working|Thinking|Generating)\.{0,3}\s*$")
+SUPPORTED_AGENT_COMMANDS = frozenset({"agy", "antigravity", "claude", "codex", "opencode"})
+
+# Cursor-to-column-1 sequences mark real visual line breaks before CSI stripping
+_LINE_START_CSI_RE = re.compile(r"\x1b\[(?:1?G|\d*A|\d*E|\d+;1H)")
+_FORWARD_CURSOR_CSI_RE = re.compile(r"\x1b\[\d*[GC]")
+_CSI_RE = re.compile(r"(\x9B|\x1B\[)[0-?]*[ -/]*[@-~]")
+_OSC_RE = re.compile("\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f\x80-\x9a\x9c-\x9f]")
+
+BUSY_SPINNER_RE = re.compile(
+    r"^\s*(?:[\u2800-\u28ff✦✻*•✢✳]\s+)?(?:Working|Thinking|Generating|Running|Cultivating)(?:\.{1,3}|…)\s*$"
+)
 BUSY_UI_MARKERS = (
     "Working...",
+    "Working…",
     "Thinking...",
+    "Thinking…",
+    "Generating...",
+    "Generating…",
     "esc to interrupt",
     "esc to cancel",
     "Esc to cancel",
-    "Allow once",
-    "Always allow",
-    "BypassSandbox",
-    "[y/n]",
-    "(y/n)",
 )
-# Supports bare `>` as well as fresh-session placeholder hints such as `>   Ask anything...`
-IDLE_PROMPT_LINE_RE = re.compile(r"^\s*>\s*(?:$|Ask\b|Try\b|Type\b)")
+# Blocking interactive modals can render ABOVE `? for shortcuts`; check before idle prompts.
+WAITING_MODAL_RE = re.compile(
+    r"(?:Yes,\s*I trust this folder"
+    r"|requires permission to read,\s*edit"
+    r"|How'?s the CLI experience so far"
+    r"|↑/↓\s*(?:to\s*)?[Nn]avigate"
+    r"|enter\s+(?:Toggle|Confirm)"
+    r"|Allow once|Always allow|Allow always|BypassSandbox"
+    r"|Do you want to (?:allow|run|proceed)"
+    r"|\[y/n\]|\(y/n\))",
+    re.IGNORECASE,
+)
+# Supports bare `>`, Codex `›`, and fresh-session placeholder hints such as `>   Ask anything...`
+IDLE_PROMPT_LINE_RE = re.compile(r"^\s*[>›]\s*(?:$|Ask\b|Try\b|Type\b)")
+
+
+def strip_terminal_escapes(text: str) -> str:
+    """Strips ANSI CSI/OSC escapes and normalizes terminal cursor moves cleanly."""
+    normalized = _LINE_START_CSI_RE.sub("\n", str(text or ""))
+    normalized = _FORWARD_CURSOR_CSI_RE.sub(" ", normalized)
+    normalized = _OSC_RE.sub("", normalized)
+    normalized = _CSI_RE.sub("", normalized)
+    normalized = _CTRL_CHARS_RE.sub("", normalized)
+    return normalized.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def is_silent_sync_message(text: str) -> bool:
@@ -44,10 +76,13 @@ def is_silent_sync_message(text: str) -> bool:
 
 
 def is_bare_idle_prompt(capture_lines: list[str], cursor_x: int | None = None) -> bool:
-    tail = [ln.rstrip("\r") for ln in capture_lines if ln.strip()][-6:]
+    cleaned = [strip_terminal_escapes(ln).rstrip() for ln in capture_lines]
+    tail = [ln for ln in cleaned if ln.strip()][-10:]
     if not tail:
         return False
     joined = "\n".join(tail)
+    if WAITING_MODAL_RE.search(joined):
+        return False
     if any(m in joined for m in BUSY_UI_MARKERS):
         return False
     if any(BUSY_SPINNER_RE.match(ln) for ln in tail):
@@ -86,7 +121,9 @@ def evaluate_six_gates(snapshot: dict[str, Any], now_ts: float | None = None) ->
     # Gate 1: tmux not in copy-mode and foreground is live AI CLI
     if int(snapshot.get("pane_in_mode", 0)) != 0:
         return {"wake": False, "gate": "gate1", "reason": "PANE_IN_COPY_MODE"}
-    if str(snapshot.get("pane_fg") or "") not in ("agy", "antigravity") and not snapshot.get("agy_in_tree"):
+    pane_fg = str(snapshot.get("pane_fg") or "").strip().lower()
+    agent_in_tree = bool(snapshot.get("agy_in_tree") or snapshot.get("agent_in_tree"))
+    if pane_fg not in SUPPORTED_AGENT_COMMANDS and not agent_in_tree:
         return {"wake": False, "gate": "gate1", "reason": "NO_LIVE_AGENT_IN_PANE"}
 
     # Gate 2: Real human keyboard idle >= 15s (uses client_activity, protects CJK IME composition)
@@ -94,8 +131,11 @@ def evaluate_six_gates(snapshot: dict[str, Any], now_ts: float | None = None) ->
     if (now_ep - client_act) < MIN_CLIENT_IDLE_SECONDS:
         return {"wake": False, "gate": "gate2", "reason": "CLIENT_TYPING_ACTIVE"}
 
-    # Gate 3: Idle bare `>` prompt (cursor_x >= 2) and no busy/approval UI chrome
+    # Gate 3: Idle bare `>` prompt (cursor_x >= 2), no modals, no busy spinners
     cap_lines = list(snapshot.get("capture_lines") or [])
+    cleaned_tail = "\n".join(strip_terminal_escapes(ln) for ln in cap_lines[-10:])
+    if WAITING_MODAL_RE.search(cleaned_tail):
+        return {"wake": False, "gate": "gate3", "reason": "WAITING_USER_ANSWER"}
     cx = snapshot.get("cursor_x")
     if not is_bare_idle_prompt(cap_lines, cursor_x=int(cx) if cx is not None else None):
         return {"wake": False, "gate": "gate3", "reason": "PROMPT_BUSY_OR_MISSING"}

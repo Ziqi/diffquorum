@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "starcouncil"
-version = "0.1.1"
-description = "Zero-dependency Pointer-Over-Blackboard orchestration, anti-fake-council verifier, 6-gate idle wakeup, and tiered review toolkit for AI coding agents."
+name = "diffquorum"
+version = "0.2.0"
+description = "Zero-dependency multi-agent session coordination (<400B pointer blackboard, 6-gate idle wakeup), blind anti-fake-quorum verifier & 0-token pitfall ratchet."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -28,14 +28,15 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/Ziqi/starcouncil"
-Repository = "https://github.com/Ziqi/starcouncil"
-Issues = "https://github.com/Ziqi/starcouncil/issues"
-Security = "https://github.com/Ziqi/starcouncil/blob/main/SECURITY.md"
-Changelog = "https://github.com/Ziqi/starcouncil/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/Ziqi/diffquorum"
+Repository = "https://github.com/Ziqi/diffquorum"
+Issues = "https://github.com/Ziqi/diffquorum/issues"
+Security = "https://github.com/Ziqi/diffquorum/blob/main/SECURITY.md"
+Changelog = "https://github.com/Ziqi/diffquorum/blob/main/CHANGELOG.md"
 
 [project.scripts]
-starcouncil = "starcouncil.cli:main"
+diffquorum = "diffquorum.cli:main"
+dq = "diffquorum.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-FileCopyrightText: 2026 DiffQuorum Contributors
 # SPDX-License-Identifier: MIT
 """
-Zero-dependency executable statement coverage gate for StarCouncil
+Zero-dependency executable statement coverage gate for DiffQuorum
 (satisfies OpenSSF Best Practices Silver `test_statement_coverage80`, targeting >=90%).
 
 Measures Python stdlib `dis` + `trace` statement coverage across
-`src/starcouncil/{blackboard,governance,wake_gates,cli}.py`.
+`src/diffquorum/{blackboard,governance,wake_gates,cli}.py`.
 """
 
 from __future__ import annotations
@@ -26,10 +26,10 @@ from contextlib import redirect_stderr, redirect_stdout
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 TARGET_FILES = (
-    (SRC_DIR / "starcouncil" / "blackboard.py").resolve(),
-    (SRC_DIR / "starcouncil" / "governance.py").resolve(),
-    (SRC_DIR / "starcouncil" / "wake_gates.py").resolve(),
-    (SRC_DIR / "starcouncil" / "cli.py").resolve(),
+    (SRC_DIR / "diffquorum" / "blackboard.py").resolve(),
+    (SRC_DIR / "diffquorum" / "governance.py").resolve(),
+    (SRC_DIR / "diffquorum" / "wake_gates.py").resolve(),
+    (SRC_DIR / "diffquorum" / "cli.py").resolve(),
 )
 
 
@@ -57,24 +57,17 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     if str(SRC_DIR) not in sys.path:
         sys.path.insert(0, str(SRC_DIR))
 
-    import starcouncil.blackboard as bb
-    import starcouncil.cli as cli
-    import starcouncil.governance as gov
-    import starcouncil.wake_gates as wg
+    import diffquorum.blackboard as bb
+    import diffquorum.cli as cli
+    import diffquorum.governance as gov
+    import diffquorum.wake_gates as wg
 
     # 1. Init, TOML error branches, and board refresh / overflow branches
-    try:
-        bb.init_workspace(temp_root / "bad", topology="invalid")
-    except ValueError:
-        pass
-    try:
-        bb.init_workspace(temp_root / "bad", subscription="invalid")
-    except ValueError:
-        pass
-    try:
-        bb.init_workspace(temp_root / "bad", host_alias="bad host!")
-    except ValueError:
-        pass
+    for kwargs in ({"topology": "invalid"}, {"subscription": "invalid"}, {"host_alias": "bad host!"}):
+        try:
+            bb.init_workspace(temp_root / "bad", **kwargs)
+        except ValueError:
+            pass
 
     ws = temp_root / "ws"
     bb.init_workspace(ws, topology="ssh-federated", subscription="single-sub", host_alias="workstation", force=True)
@@ -86,7 +79,6 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     except ValueError:
         pass
 
-    # Exercise TOML fallback parser explicitly
     parsed_toml = bb.parse_toml_text('# c\nflag = true\ncount = 3\n[s]\nk = "v"\n[[arr]]\nx = 1\n')
     assert parsed_toml["flag"] is True and parsed_toml["count"] == 3
 
@@ -96,30 +88,18 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     )
     bb.dispatch_pointer(ws, from_seat="lead", to_seat="builder", summary="dup", event_id="evt-cov-1", now_ts=1005.0)
     bb.ack_pointer(ws, seat="builder", event_id="evt-cov-1", emit_reply_to="lead", priority="P1", now_ts=2000.0)
-    try:
-        bb.dispatch_pointer(ws, from_seat="builder", to_seat="lead", summary="echo", kind="ACK", event_id="evt-cov-ack2", now_ts=2010.0)
-    except ValueError:
-        pass
-    try:
-        bb.dispatch_pointer(ws, from_seat="bad seat!", to_seat="builder", summary="x", event_id="evt-x", now_ts=1000.0)
-    except ValueError:
-        pass
-    try:
-        bb.dispatch_pointer(ws, from_seat="lead", to_seat="builder", summary="x", kind="NOPE", event_id="evt-x", now_ts=1000.0)
-    except ValueError:
-        pass
-    try:
-        bb.dispatch_pointer(ws, from_seat="lead", to_seat="builder", summary="x", priority="P9", event_id="evt-x", now_ts=1000.0)
-    except ValueError:
-        pass
-    try:
-        bb.dispatch_pointer(ws, from_seat="lead", to_seat="builder", summary="x", hop=2, event_id="evt-x", now_ts=1000.0)
-    except ValueError:
-        pass
-    try:
-        bb.dispatch_pointer(ws, from_seat="lead", to_seat="builder", summary="x", event_id="bad!", now_ts=1000.0)
-    except ValueError:
-        pass
+    for call_kw in (
+        {"from_seat": "builder", "to_seat": "lead", "summary": "echo", "kind": "ACK", "event_id": "evt-cov-ack2", "now_ts": 2010.0},
+        {"from_seat": "bad seat!", "to_seat": "builder", "summary": "x", "event_id": "evt-x", "now_ts": 1000.0},
+        {"from_seat": "lead", "to_seat": "builder", "summary": "x", "kind": "NOPE", "event_id": "evt-x", "now_ts": 1000.0},
+        {"from_seat": "lead", "to_seat": "builder", "summary": "x", "priority": "P9", "event_id": "evt-x", "now_ts": 1000.0},
+        {"from_seat": "lead", "to_seat": "builder", "summary": "x", "hop": 2, "event_id": "evt-x", "now_ts": 1000.0},
+        {"from_seat": "lead", "to_seat": "builder", "summary": "x", "event_id": "bad!", "now_ts": 1000.0},
+    ):
+        try:
+            bb.dispatch_pointer(ws, **call_kw)
+        except ValueError:
+            pass
 
     for i in range(4):
         bb.dispatch_pointer(ws, from_seat="lead", to_seat="builder", summary=f"b{i}", event_id=f"evt-b-{i}", now_ts=9000.0 + i * 5)
@@ -128,7 +108,7 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     except ValueError:
         pass
 
-    _ = bb.build_ssh_peer_command("workstation", "/usr/local/bin/starcouncil")
+    _ = bb.build_ssh_peer_command("workstation", "/usr/local/bin/diffquorum")
     good_in = json.dumps(
         {
             "from_host": "workstation",
@@ -154,24 +134,46 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
 
     assert bb.run_with_lock(ws, "build", "lead", [sys.executable, "-c", "pass"]) == 0
 
-    # 3. Council plan, submit, verify (solo, duplicate, multi-seat, tamper) & pitfalls/fixes
+    # Preflight paths (writable, lock busy, missing CLI, symlink agy_state_dir)
+    agy_dir = temp_root / "agy_ok"
+    agy_dir.mkdir()
+    assert bb.run_preflight(ws, write_paths=[str(ws)], resource="build", cli_tools=["python3", ""], agy_state_dir=agy_dir)["ok"]
+    (ws / ".diffquorum" / "locks" / "build.holder.json").write_text('{"seat":"lead","pid":1}', encoding="utf-8")
+    assert not bb.run_preflight(ws, resource="bad!res", cli_tools=["bad cli!", "missing_dq_bin"])["ok"]
+    assert not bb.run_preflight(ws, resource="build")["ok"]
+    (ws / ".diffquorum" / "locks" / "build.holder.json").unlink(missing_ok=True)
+    agy_sym = temp_root / "agy_sym"
+    agy_sym.symlink_to(agy_dir)
+    assert not bb.run_preflight(ws, cli_tools=["agy"], agy_state_dir=agy_sym)["ok"]
+
+    # 3. Quorum plan, submit, blind packet, verify & pitfalls/fixes + runner presets
     gov.log_pitfall(ws, title="Cov pitfall", root_cause="edge race", guard="add lock")
     gov.log_fix(ws, title="Cov fix", fix_summary="locked", files="blackboard.py")
     gov.plan_council(ws, topic="优化 Skill 架构", tags_csv="", subscription="single-sub")
     gov.plan_council(ws, topic="Daily outreach", tags_csv="outreach", subscription="multi-sub")
     _ = gov.render_council_workflow("Check invariants", model_tier="pro")
 
-    gov.council_submit(ws, meeting_id="m-cov", author="lead", source_kind="local_seat", content="Option A")
-    assert gov.council_verify(ws, meeting_id="m-cov", require_multi_seat=True)["blocked"] is True
-    gov.council_submit(ws, meeting_id="m-cov", author="builder", source_kind="subagent", content="Option B verified")
-    assert gov.council_verify(ws, meeting_id="m-cov", require_multi_seat=True, resolution_summary="Agreed")["blocked"] is False
+    gov.quorum_submit(ws, meeting_id="m-cov", author="lead", source_kind="local_seat", content="Option A", diff_sha256="deadbeef01")
+    assert gov.quorum_verify(ws, meeting_id="m-cov", require_multi_seat=True)["blocked"] is True
+    gov.quorum_submit(ws, meeting_id="m-cov", author="builder", source_kind="subagent", content="Option B verified", diff_sha256="deadbeef01")
+    assert gov.quorum_verify(ws, meeting_id="m-cov", require_multi_seat=True, resolution_summary="Agreed")["blocked"] is False
+    blind = gov.quorum_render_blind_packet(ws, meeting_id="m-cov", seed=7)
+    assert blind["labels"] == ["Peer A", "Peer B"]
 
-    tamper_md = ws / ".starcouncil" / "meetings" / "m-cov" / "submissions" / "lead__local_seat.md"
+    tamper_md = ws / ".diffquorum" / "meetings" / "m-cov" / "submissions" / "lead__local_seat.md"
     tamper_md.write_text("tampered", encoding="utf-8")
     try:
-        gov.council_verify(ws, meeting_id="m-cov", require_multi_seat=True)
+        gov.quorum_verify(ws, meeting_id="m-cov", require_multi_seat=True)
     except ValueError:
         pass
+
+    for prof in ("agy-hydrogen", "claude-sub", "codex", "generic-ptr"):
+        assert gov.build_runner_preset(prof, task_pointer="artifacts/p.md")["ok"]
+    for bad_kw in ({"profile": "nope", "task_pointer": "p"}, {"profile": "codex", "task_pointer": " "}, {"profile": "codex", "task_pointer": "p", "model_override": "bad model!"}):
+        try:
+            gov.build_runner_preset(**bad_kw)
+        except ValueError:
+            pass
 
     # 4. Review gates, HMAC pseudonymization, plain-3line lint, doctor & archive
     gov.evaluate_review_gate(ws, level=0, content_tree_hash="abc12345")
@@ -192,18 +194,17 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     settings_p.write_text(json.dumps({"additionalDirectories": []}), encoding="utf-8")
     gov.run_doctor(ws, settings_path=settings_p, transcript_steps=200)
 
-    # Archive copy & verify in isolated clean mini repo
     mini_repo = temp_root / "mini_repo"
     mini_repo.mkdir()
-    (mini_repo / "hello.txt").write_text("hello starcouncil\n", encoding="utf-8")
+    (mini_repo / "hello.txt").write_text("hello diffquorum\n", encoding="utf-8")
     tgz_out = temp_root / "mini.tar.gz"
-    ar_res = gov.run_archive(mini_repo, output=tgz_out, prefix="starcouncil-test", verify=True)
+    ar_res = gov.run_archive(mini_repo, output=tgz_out, prefix="diffquorum-test", verify=True)
     assert ar_res["ok"] and tgz_out.is_file()
-    ar_chk = gov.run_archive(mini_repo, prefix="starcouncil-test", verify_file=tgz_out)
+    ar_chk = gov.run_archive(mini_repo, prefix="diffquorum-test", verify_file=tgz_out)
     assert ar_chk["ok"]
     gov.run_sanitize_lint(mini_repo, extra_forbid=("forbiddenword",))
 
-    # 5. Wake gates branches
+    # 5. Wake gates branches (including ANSI escapes, Unicode ellipsis, approval modals)
     base_snap = {
         "msg_id": "m1",
         "msg_text": "check",
@@ -214,7 +215,7 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
         "pane_fg": "agy",
         "agy_in_tree": True,
         "client_activity_ts": 100.0,
-        "capture_lines": [">   Ask anything..."],
+        "capture_lines": ["\x1b[32m>\x1b[0m   Ask anything..."],
         "cursor_x": 3,
         "transcript_last_type": "PLANNER_RESPONSE",
         "transcript_last_status": "DONE",
@@ -229,7 +230,8 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
         {"pane_in_mode": 1},
         {"pane_fg": "bash", "agy_in_tree": False},
         {"client_activity_ts": 995.0},
-        {"capture_lines": ["Working..."]},
+        {"capture_lines": ["Working…"]},
+        {"capture_lines": ["Yes, I trust this folder", ">   Ask anything..."]},
         {"transcript_last_status": "RUNNING"},
         {"running_tasks": [{"description": "job", "status": "running", "isDaemon": False}]},
         {"recent_seat_wakes": [980.0, 990.0]},
@@ -250,22 +252,25 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     with redirect_stdout(buf_out), redirect_stderr(buf_err):
         for cmd_argv in (
             ["init", "--root", str(cli_ws)],
+            ["preflight", "--root", str(cli_ws), "--write-path", str(cli_ws), "--cli", "python3"],
+            ["preset", "--profile", "agy-hydrogen", "--task-pointer", "artifacts/p.md"],
             ["board", "--root", str(cli_ws), "--set", "# CLI Board\n"],
             ["board", "--root", str(cli_ws), "--refresh"],
             ["board", "--root", str(cli_ws)],
             ["dispatch", "--root", str(cli_ws), "--from", "lead", "--to", "builder", "--summary", "task1", "--event-id", "evt-cli-1"],
-            ["dispatch", "--print-ssh-cmd", "workstation:/opt/bin/starcouncil"],
+            ["dispatch", "--print-ssh-cmd", "workstation:/opt/bin/diffquorum"],
             ["ack", "--root", str(cli_ws), "--seat", "builder", "--event-id", "evt-cli-1", "--reply-to", "lead"],
             ["lock", "--root", str(cli_ws), "--resource", "repo", "--seat", "lead", "--", sys.executable, "-c", "pass"],
             ["log-pitfall", "--root", str(cli_ws), "--title", "t1", "--root-cause", "rc1", "--guard", "g1"],
             ["log-fix", "--root", str(cli_ws), "--title", "f1", "--fix", "fx1", "--files", "cli.py"],
             ["doctor", "--root", str(cli_ws), "--settings-path", str(settings_p), "--transcript-steps", "100"],
             ["sanitize-lint", "--target", str(mini_repo)],
-            ["council", "--root", str(cli_ws), "--topic", "Test topic"],
-            ["council", "--topic", "Test topic", "--emit-workflow"],
-            ["council-submit", "--root", str(cli_ws), "--meeting-id", "mc-1", "--author", "lead", "--source-kind", "local_seat", "--content", "A"],
-            ["council-submit", "--root", str(cli_ws), "--meeting-id", "mc-1", "--author", "builder", "--source-kind", "subagent", "--content", "B"],
-            ["council-verify", "--root", str(cli_ws), "--meeting-id", "mc-1"],
+            ["quorum", "--root", str(cli_ws), "--topic", "Test topic"],
+            ["quorum", "--topic", "Test topic", "--emit-workflow"],
+            ["quorum-submit", "--root", str(cli_ws), "--meeting-id", "mc-1", "--author", "lead", "--source-kind", "local_seat", "--content", "A"],
+            ["quorum-submit", "--root", str(cli_ws), "--meeting-id", "mc-1", "--author", "builder", "--source-kind", "subagent", "--content", "B"],
+            ["quorum-blind", "--root", str(cli_ws), "--meeting-id", "mc-1", "--seed", "3"],
+            ["quorum-verify", "--root", str(cli_ws), "--meeting-id", "mc-1"],
             ["review", "--root", str(cli_ws), "--level", "0", "--tree-hash", "deadbeef01"],
             ["review", "--tree-hash", "deadbeef01", "--lint-text", "已完成任务"],
             ["review", "--tree-hash", "deadbeef01", "--pseudonymize-file", str(sample_file)],
@@ -273,21 +278,20 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
             ["archive", "--repo-root", str(mini_repo), "--verify"],
         ):
             assert cli.main(cmd_argv) == 0, f"CLI failed on {cmd_argv}"
-        # Error path in CLI main()
         assert cli.main(["dispatch", "--root", str(cli_ws)]) == 2
 
     shutil.rmtree(ws, ignore_errors=True)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="StarCouncil >=90% Statement Coverage Gate")
+    parser = argparse.ArgumentParser(description="DiffQuorum >=90% Statement Coverage Gate")
     parser.add_argument("--min-coverage", type=float, default=90.0)
     args = parser.parse_args()
 
     exec_by_file = {p: collect_executable_lines(p) for p in TARGET_FILES}
     tracer = trace.Trace(count=True, trace=False)
 
-    with tempfile.TemporaryDirectory(prefix="starcouncil_cov_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="diffquorum_cov_") as tmp:
         tracer.runfunc(exercise_suite, pathlib.Path(tmp))
 
     results = tracer.results()
@@ -313,7 +317,7 @@ def main() -> int:
         print(f"[INFO] [COVERAGE] {rel}: {f_hit}/{f_exec} ({fpct:.2f}%) | missed={missed[:15]}")
 
     print(
-        f"[INFO] [COVERAGE] Total src/starcouncil statement coverage: {total_hits}/{total_exec} ({pct:.2f}%, threshold >= {args.min_coverage:.1f}%)"
+        f"[INFO] [COVERAGE] Total src/diffquorum statement coverage: {total_hits}/{total_exec} ({pct:.2f}%, threshold >= {args.min_coverage:.1f}%)"
     )
     if pct < args.min_coverage:
         print(f"[FAIL] [COVERAGE] Below {args.min_coverage:.1f}% threshold!", file=sys.stderr)

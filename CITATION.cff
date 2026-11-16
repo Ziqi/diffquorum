@@ -1,14 +1,14 @@
 cff-version: 1.2.0
-message: "If you use StarCouncil in your engineering workflows or research, please cite it using this metadata."
-title: "StarCouncil: Pointer-Over-Blackboard Orchestration, Anti-Fake-Council Verifier & 6-Gate Wakeup Toolkit for AI Agents"
+message: "If you use DiffQuorum in your engineering workflows or research, please cite it using this metadata."
+title: "DiffQuorum: Multi-Agent Pointer Coordination, Blind Quorum Verifier & 6-Gate Wakeup Toolkit"
 type: software
 authors:
-  - name: "StarCouncil Contributors"
-version: 0.1.1
+  - name: "DiffQuorum Contributors"
+version: 0.2.0
 date-released: "2026-11-16"
 license: MIT
-repository-code: "https://github.com/Ziqi/starcouncil"
-url: "https://github.com/Ziqi/starcouncil"
+repository-code: "https://github.com/Ziqi/diffquorum"
+url: "https://github.com/Ziqi/diffquorum"
 keywords:
   - ai-agents
   - multi-agent-orchestration

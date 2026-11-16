@@ -1,9 +1,9 @@
 version = 1
-SPDX-PackageName = "starcouncil"
-SPDX-PackageDownloadLocation = "https://github.com/Ziqi/starcouncil"
+SPDX-PackageName = "diffquorum"
+SPDX-PackageDownloadLocation = "https://github.com/Ziqi/diffquorum"
 
 [[annotations]]
 path = "**"
 precedence = "aggregate"
-SPDX-FileCopyrightText = "2026 StarCouncil Contributors"
+SPDX-FileCopyrightText = "2026 DiffQuorum Contributors"
 SPDX-License-Identifier = "MIT"

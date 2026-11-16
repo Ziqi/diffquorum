@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 StarCouncil Contributors
+# SPDX-FileCopyrightText: 2026 DiffQuorum Contributors
 # SPDX-License-Identifier: MIT
 name: SLSA Build Level 3 & SBOM Attestation
 
@@ -35,28 +35,28 @@ jobs:
       - name: Build deterministic release archive & SPDX-2.3 SBOM
         run: |
           mkdir -p ./artifacts
-          python3 scripts/starcouncil.py archive --prefix "starcouncil-${GITHUB_REF_NAME:-main}" --output ./artifacts/starcouncil-bundle.tar.gz --verify
-          python3 scripts/generate-sbom.py --version "${GITHUB_REF_NAME:-main}" --output ./artifacts/starcouncil.spdx.json
-          sha256sum ./artifacts/starcouncil-bundle.tar.gz ./artifacts/starcouncil.spdx.json
+          python3 scripts/diffquorum.py archive --prefix "diffquorum-${GITHUB_REF_NAME:-main}" --output ./artifacts/diffquorum-bundle.tar.gz --verify
+          python3 scripts/generate-sbom.py --version "${GITHUB_REF_NAME:-main}" --output ./artifacts/diffquorum.spdx.json
+          sha256sum ./artifacts/diffquorum-bundle.tar.gz ./artifacts/diffquorum.spdx.json
 
       - name: Generate Sigstore / GitHub OIDC SLSA Build Level 3 Attestation
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            ./artifacts/starcouncil-bundle.tar.gz
-            ./artifacts/starcouncil.spdx.json
+            ./artifacts/diffquorum-bundle.tar.gz
+            ./artifacts/diffquorum.spdx.json
 
       - name: Generate Sigstore / GitHub OIDC SPDX-2.3 SBOM Attestation
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
-          subject-path: ./artifacts/starcouncil-bundle.tar.gz
-          sbom-path: ./artifacts/starcouncil.spdx.json
+          subject-path: ./artifacts/diffquorum-bundle.tar.gz
+          sbom-path: ./artifacts/diffquorum.spdx.json
 
       - name: Upload attested bundle & SPDX-2.3 SBOM
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: starcouncil-slsa3-attested-bundle
+          name: diffquorum-slsa3-attested-bundle
           path: |
-            ./artifacts/starcouncil-bundle.tar.gz
-            ./artifacts/starcouncil.spdx.json
+            ./artifacts/diffquorum-bundle.tar.gz
+            ./artifacts/diffquorum.spdx.json
           retention-days: 30

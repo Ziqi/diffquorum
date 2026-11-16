@@ -1,62 +1,63 @@
-# StarCouncil（星议 · 多智能体轻量协作与防假会套件）
+# DiffQuorum（多智能体轻量协作、盲审防假会与防膨胀门禁套件）
 
-[![CI](https://github.com/Ziqi/starcouncil/actions/workflows/ci.yml/badge.svg)](https://github.com/Ziqi/starcouncil/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/Ziqi/starcouncil/actions/workflows/codeql.yml/badge.svg)](https://github.com/Ziqi/starcouncil/actions/workflows/codeql.yml)
+[![CI](https://github.com/Ziqi/diffquorum/actions/workflows/ci.yml/badge.svg)](https://github.com/Ziqi/diffquorum/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Ziqi/diffquorum/actions/workflows/codeql.yml/badge.svg)](https://github.com/Ziqi/diffquorum/actions/workflows/codeql.yml)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16755/badge)](https://www.bestpractices.dev/projects/16755)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Ziqi/starcouncil/badge)](https://scorecard.dev/viewer/?uri=github.com/Ziqi/starcouncil)
-[![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://github.com/Ziqi/starcouncil/attestations)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Ziqi/diffquorum/badge)](https://scorecard.dev/viewer/?uri=github.com/Ziqi/diffquorum)
+[![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://github.com/Ziqi/diffquorum/attestations)
 [![REUSE 3.3](https://img.shields.io/badge/REUSE-3.3%20Compliant-brightgreen)](./REUSE.toml)
-[![Coverage](https://img.shields.io/badge/Coverage-91.06%25-brightgreen)](./tests/test_coverage_gate.py)
-[![Fuzzing](https://img.shields.io/badge/Fuzzing-10%2F10%20%282%2C000%20iters%29-brightgreen)](./tests/fuzz_starcouncil.py)
-[![Homebrew](https://img.shields.io/badge/Homebrew-Ziqi%2Ftap%2Fstarcouncil-FBB040?logo=homebrew&logoColor=white)](https://github.com/Ziqi/homebrew-tap)
+[![Coverage](https://img.shields.io/badge/Coverage-91.81%25-brightgreen)](./tests/test_coverage_gate.py)
+[![Fuzzing](https://img.shields.io/badge/Fuzzing-10%2F10%20%282%2C000%20iters%29-brightgreen)](./tests/fuzz_diffquorum.py)
+[![Homebrew](https://img.shields.io/badge/Homebrew-Ziqi%2Ftap%2Fdiffquorum-FBB040?logo=homebrew&logoColor=white)](https://github.com/Ziqi/homebrew-tap)
 [![SWHID](https://img.shields.io/badge/SWHID-swh%3A1%3Asnp%3A8ebe52ea-e20026.svg)](https://archive.softwareheritage.org/swh:1:snp:8ebe52eac91444368f75eeb4aa75324c40bb21f5)
 
-**零第三方依赖（纯 Python 3.10+ 标准库）的多智能体指针黑板调度、防假开会哈希校验、六门禁空闲唤醒与可选分级把关工具。**
+**零第三方依赖（纯 Python 3.10+ 标准库）的跨会话指针黑板协作、Stage-2 匿名盲审防假会、六门禁防误触唤醒与 `<1s` 派活前零消耗预检工具。**（原名 `StarCouncil`，向下兼容 `.starcouncil/` 工作区与 `starcouncil` CLI 入口。）
 
-语言：[English](./README.md) | **简体中文** | [实战踩坑与修复实录（6 大核心经验）](./docs/PITFALLS_AND_FIXES.md)
+语言：[English](./README.md) | **简体中文** | [实战踩坑与修复实录（8 大核心经验）](./docs/PITFALLS_AND_FIXES.md)
 
 ---
 
-## 为什么做 StarCouncil？（轻巧好用、不搞流程臃肿）
+## 为什么做 DiffQuorum？（保留多席真协作，砍掉官僚套娃审核）
 
-很多多智能体方案喜欢把几万字全文来回灌，或者搞“A 窗口审完 B 窗口审”的连环套娃审计，结果不仅烧额度还把对话拖成慢动作。**StarCouncil（1 个微内核 CLI + 3 个不到 120 行的薄 Skill）**只做省时间的事：
+很多多智能体方案喜欢在各个窗口里互灌几万字长文、把不同模型凑一起却让模型认出自家品牌互相吹捧，或者动不动拉起连环跨窗口审稿把整套机器拖慢。**DiffQuorum（1 个微内核 CLI + 3 个不到 100 行的薄 Skill）**只保留实战中真正救过命的机制：
 
-- **通吃四类环境（单机/多机 × 单订阅/多订阅）**：只有一个 Antigravity 订阅时，自动锁死单路串行三视角（避免触发 `429` 限流死锁）；多台电脑各自跑不同项目时**默认互不打扰、零日常交叉汇报**，只有聊到架构、Skill 构建或经验分享时才寄一张简短异步留言卡。
-- **硬核防假开会校验（`meetings/<id>/`）**：严禁单一模型自己扮演四个角色“演假会”。必须有 `>= 2` 份来自不同参会方且 SHA-256 哈希独立的原始发言文件，才准出具 `MULTI_SEAT_DECISION` 决议；否则强制标为 `SOLO_SYNTHESIS` 或直接拦截。
-- **两轮安灯拉闸（绝不带病放行）**：进外审前先跑本地单测修净同类问题；外部盲审最多 2 轮，第 2 轮仍有真问题立刻置为 `PITFALL_HALT` 停刷查根因，绝不修改测试或强行放水。
-- **汇报强制说人话**：统一输出 `【结果】/【原因】/【需您操作】` 三行直白大白话。
+- **跨会话指针黑板与单跳联邦（`.diffquorum/`）**：重正文落 `artifacts/`，`BOARD.md < 3KB`，`inbox/<seat>.jsonl` 严格限制 `< 400B` 短指针，配齐 `O_NOFOLLOW`、`fcntl.flock` 互斥锁、7 天去重、`60s` 对称静默窗与高频熔断；多机平时**默认互不打扰**，仅按话题标签触发轻量 `async_card`。
+- **防误触六门禁空闲唤醒（`wake-check`）**：剥离 ANSI 终端转义序列、识别 Unicode 省略号忙碌动画，并抢在 `> Ask anything...` 前截停“信任文件夹/审批选择”弹窗（`WAITING_MODAL_RE`）；死守 `#{client_activity} >= 15s`（保护中文输入法），忽略 `isDaemon` 守护任务，兼容 `agy`/`claude`/`codex`/`opencode`。
+- **Stage-2 匿名盲评防假开会（`quorum-submit` / `quorum-blind` / `quorum-verify`）**：单模型自导自演永远只能拿 `SOLO_SYNTHESIS`；至少 `>= 2` 份不同作者、不同来源且 SHA-256 哈希独立的原件（可选 `--diff-sha256` 绑定代码树）才准出 `MULTI_SEAT_DECISION`。互评前可一键生成隐去模型/席位名的 `Peer A/B/C` 盲审包。
+- **`<1s` 零消耗派活预检（`preflight`）+ 两轮安灯拉闸**：派活前先验目录可写性（提前拦截只读沙箱）、资源锁及目标 CLI 状态目录；平时小改动 `--level 0` 直接跑本地单测放行，外审最多两轮不过即触发 `PITFALL_HALT` 并记入 `pitfalls.md`，另附可选无头预设模板（含可选 `agy-hydrogen`）。
 
-## `.starcouncil/` 五类后台活档案
+## `.diffquorum/` 五类后台活档案
 
 | 档案路径 | 职责与核心限制 |
 | :--- | :--- |
 | **`BOARD.md`** | 共享黑板，实时展现各席任务与当前持锁状态（严控 `< 3KB`） |
-| **`logs/events.jsonl`** | 全自动追加的运行流水日志（记录每次 `init`、`dispatch`、`ack`、`lock`、`review`、`council`） |
+| **`logs/events.jsonl`** | 全自动追加的运行流水日志（记录每次 `init`、`dispatch`、`ack`、`lock`、`review`、`quorum`） |
 | **`pitfalls.md` 与 `fixes_log.md`** | 踩坑错题本与修复日志（`log-pitfall` / `log-fix`，开会与把关时自动带出近期踩坑提醒） |
-| **`meetings/<id>/`** | 多来源独立发言原件与哈希防伪校验（`council-submit` / `council-verify`） |
+| **`meetings/<id>/`** | 独立发言原件、`--diff-sha256` 指纹、`blind_packet.md`、`reveal_map.json` 与 `RESOLUTION.json` |
 | **`inbox/<seat>.jsonl` + `artifacts/` + `locks/`** | `< 400B` 短指针信封、完整磁盘正文与 `fcntl.flock` 互斥锁 |
 
 ## 30 秒本地开箱体验
 
 ```bash
 # 方式 A：通过官方 Homebrew 源一键安装（macOS / Linuxbrew）
-brew install Ziqi/tap/starcouncil
-starcouncil init --root /tmp/sc-demo && starcouncil doctor --root /tmp/sc-demo
+brew install Ziqi/tap/diffquorum
+diffquorum init --root /tmp/dq-demo && diffquorum preflight --root /tmp/dq-demo --cli python3
+diffquorum doctor --root /tmp/dq-demo
 
 # 方式 B：克隆即用（纯 Python 3.10+ 标准库，零 pip 依赖；国内读者可用 AtomGit 免代理镜像）
-# 国内镜像：git clone https://atomgit.com/sinoziqi/starcouncil.git && cd starcouncil
-git clone https://github.com/Ziqi/starcouncil.git && cd starcouncil
-python3 scripts/starcouncil.py init --root /tmp/sc-demo
-python3 scripts/starcouncil.py doctor --root /tmp/sc-demo
-python3 scripts/starcouncil.py council --root /tmp/sc-demo --topic "设计轻量多智能体协作工具"
+# 国内镜像：git clone https://atomgit.com/sinoziqi/starcouncil.git && cd diffquorum
+git clone https://github.com/Ziqi/diffquorum.git && cd diffquorum
+python3 scripts/diffquorum.py init --root /tmp/dq-demo
+python3 scripts/diffquorum.py preflight --root /tmp/dq-demo --write-path /tmp/dq-demo
+python3 scripts/diffquorum.py quorum --root /tmp/dq-demo --topic "设计盲审防假会机制"
 python3 -W error -m unittest discover -s tests -v
 python3 -W error tests/test_coverage_gate.py --min-coverage 90.0
-python3 -W error tests/fuzz_starcouncil.py --iterations 2000
-python3 -W error scripts/starcouncil.py sanitize-lint --target .
+python3 -W error tests/fuzz_diffquorum.py --iterations 2000
+python3 -W error scripts/diffquorum.py sanitize-lint --target .
 ```
 
-## 三个模块化薄 Skill（均 `< 120` 行）
+## 三个模块化薄 Skill（均 `< 100` 行，内置 `<SUBAGENT-STOP>` 防越界护栏）
 
-- [`skills/starcouncil-teamwork/SKILL.md`](./skills/starcouncil-teamwork/SKILL.md)：黑板指针协作、资源互斥锁与单跳跨机传信
-- [`skills/starcouncil-review/SKILL.md`](./skills/starcouncil-review/SKILL.md)：可选 `0/1/2` 档把关、两轮安灯拉闸与大白话输出
-- [`skills/starcouncil-council/SKILL.md`](./skills/starcouncil-council/SKILL.md)：按话题摇人、防假会多来源校验与单订阅防 `429` 模式
+- [`skills/diffquorum-coord/SKILL.md`](./skills/diffquorum-coord/SKILL.md)：`<1s` 派活前 `preflight`、指针黑板、`flock` 互斥锁、弹窗安全唤醒与可选预设模板
+- [`skills/diffquorum-quorum/SKILL.md`](./skills/diffquorum-quorum/SKILL.md)：Stage-2 `Peer A/B/C` 盲评脱敏、SHA-256 防假开会核验与单订阅防 `429` 护栏
+- [`skills/diffquorum-gate/SKILL.md`](./skills/diffquorum-gate/SKILL.md)：日常 `--level 0` 快通（防流程臃肿）、两轮安灯拉闸与大白话三行总结
