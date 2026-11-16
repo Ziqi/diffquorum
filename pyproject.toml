@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "starcouncil"
+version = "0.1.0"
+description = "Zero-dependency Pointer-Over-Blackboard orchestration, anti-fake-council verifier, 6-gate idle wakeup, and tiered review toolkit for AI coding agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Ziqi" }]
+dependencies = []
+
+[project.scripts]
+starcouncil = "starcouncil.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

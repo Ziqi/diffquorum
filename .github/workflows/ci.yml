@@ -1,0 +1,37 @@
+name: StarCouncil CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions: {}
+
+jobs:
+  verify:
+    name: Stdlib Tests & Clean-Room Sanitize Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Run zero-dependency unittest suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Enforce clean-room zero-leak sanitize-lint
+        run: python3 scripts/starcouncil.py sanitize-lint --target .
+
+      - name: Smoke test 30-second init and doctor workflow
+        run: |
+          python3 scripts/starcouncil.py init --root /tmp/sc-ci-demo
+          python3 scripts/starcouncil.py doctor --root /tmp/sc-ci-demo
