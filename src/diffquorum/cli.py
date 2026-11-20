@@ -33,6 +33,7 @@ from .governance import (
     log_fix,
     log_pitfall,
     plan_council,
+    probe_model_receipt,
     pseudonymize_text,
     quorum_render_blind_packet,
     quorum_submit,
@@ -41,6 +42,7 @@ from .governance import (
     run_archive,
     run_doctor,
     run_sanitize_lint,
+    verify_model_identity,
 )
 from .wake_gates import evaluate_six_gates
 
@@ -87,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         p_dp.add_argument("--hop", type=int, default=0)
         p_dp.add_argument("--event-id", default="")
         p_dp.add_argument("--in-reply-to", default="")
+        p_dp.add_argument("--strict-envelope", action="store_true")
         p_dp.add_argument("--print-ssh-cmd", default="")
 
     # 4. ack
@@ -161,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         p_cs.add_argument("--author", required=True)
         p_cs.add_argument("--source-kind", required=True, choices=("local_seat", "remote_node", "external_llm", "subagent"))
         p_cs.add_argument("--diff-sha256", default="")
+        p_cs.add_argument("--expected-model", default="")
+        p_cs.add_argument("--observed-model", default="")
         p_cs.add_argument("--content", default="")
         p_cs.add_argument("--file", default="")
 
@@ -169,7 +174,15 @@ def main(argv: list[str] | None = None) -> int:
         p_cv.add_argument("--root", default=".")
         p_cv.add_argument("--meeting-id", required=True)
         p_cv.add_argument("--allow-solo", action="store_true")
+        p_cv.add_argument("--require-model-match", action="store_true")
         p_cv.add_argument("--resolution", default="")
+
+    p_mp = sub.add_parser("model-probe", help="Fail-Closed 模型身份与静默降级探针（核验 expected == observed）", allow_abbrev=False)
+    p_mp.add_argument("--root", default="")
+    p_mp.add_argument("--expected", required=True)
+    p_mp.add_argument("--observed", default="")
+    p_mp.add_argument("--receipt", default="")
+    p_mp.add_argument("--actor", default="model-probe")
 
     p_qb = sub.add_parser("quorum-blind", help="导出 Peer A/B/C 匿名盲审数据包并生成解盲映射", allow_abbrev=False)
     p_qb.add_argument("--root", default=".")
@@ -252,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
                     hop=args.hop,
                     event_id=args.event_id,
                     in_reply_to=args.in_reply_to,
+                    strict_envelope=args.strict_envelope,
                 )
             )
             return 0
@@ -351,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
                     source_kind=args.source_kind,
                     content=body,
                     diff_sha256=args.diff_sha256,
+                    expected_model=args.expected_model,
+                    observed_model=args.observed_model,
                 )
             )
             return 0
@@ -360,8 +376,28 @@ def main(argv: list[str] | None = None) -> int:
                 pathlib.Path(args.root).resolve(),
                 meeting_id=args.meeting_id,
                 require_multi_seat=not args.allow_solo,
+                require_model_match=args.require_model_match,
                 resolution_summary=args.resolution,
             )
+            _out(rep)
+            return 2 if rep.get("blocked") else 0
+
+        if args.cmd == "model-probe":
+            root_opt = pathlib.Path(args.root).resolve() if args.root else None
+            if args.receipt:
+                rep = probe_model_receipt(
+                    pathlib.Path(args.receipt).resolve(),
+                    expected_model=args.expected,
+                    root=root_opt,
+                    actor=args.actor,
+                )
+            else:
+                rep = verify_model_identity(
+                    args.expected,
+                    args.observed,
+                    root=root_opt,
+                    actor=args.actor,
+                )
             _out(rep)
             return 2 if rep.get("blocked") else 0
 

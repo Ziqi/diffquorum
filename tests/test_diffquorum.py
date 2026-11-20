@@ -35,6 +35,7 @@ from diffquorum.blackboard import (  # noqa: E402
     run_preflight,
     run_with_lock,
     update_board,
+    verify_pointer_envelope,
 )
 from diffquorum.governance import (  # noqa: E402
     build_runner_preset,
@@ -44,6 +45,7 @@ from diffquorum.governance import (  # noqa: E402
     log_fix,
     log_pitfall,
     plan_council,
+    probe_model_receipt,
     pseudonymize_text,
     quorum_render_blind_packet,
     quorum_submit,
@@ -51,10 +53,13 @@ from diffquorum.governance import (  # noqa: E402
     render_council_workflow,
     run_doctor,
     run_sanitize_lint,
+    verify_model_identity,
 )
 from diffquorum.wake_gates import (  # noqa: E402
     apply_wake_attempt,
     evaluate_six_gates,
+    extract_user_request_text,
+    is_awaiting_human_approve,
     is_bare_idle_prompt,
     strip_terminal_escapes,
 )
@@ -501,7 +506,7 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
 
             shim_ver = self.run_cli("--version", script_path=LEGACY_SCRIPT)
             self.assertEqual(shim_ver.returncode, 0)
-            self.assertIn("0.2.0", shim_ver.stdout.decode("utf-8"))
+            self.assertIn("0.3.0.dev0", shim_ver.stdout.decode("utf-8"))
 
     def test_13_wake_gates_ansi_strip_unicode_ellipsis_and_modal_blocking(self) -> None:
         colored_prompt = "\x1b[32m>\x1b[0m\x1b[3CAsk anything..."
@@ -614,6 +619,238 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
 
         bad_cli = self.run_cli("preset", "--profile", "unknown-profile", "--task-pointer", "artifacts/x.md", check=False)
         self.assertEqual(bad_cli.returncode, 2)
+
+    def test_16_model_downgrade_fail_closed_probe_and_quorum_enforcement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            init_workspace(root)
+
+            ok = verify_model_identity("claude-opus-5-5-high", "claude-opus-5-5-high", root=root)
+            self.assertTrue(ok["ok"])
+            self.assertFalse(ok["blocked"])
+
+            down = verify_model_identity("claude-opus-5-5-high", "gemini-flash-lite", root=root)
+            self.assertFalse(down["ok"])
+            self.assertTrue(down["blocked"])
+            self.assertEqual(down["status"], "MODEL_DOWNGRADE_DETECTED")
+
+            miss = verify_model_identity("kimi-k3.1-pro", "", root=root)
+            self.assertTrue(miss["blocked"])
+            self.assertEqual(miss["status"], "MODEL_IDENTITY_MISSING")
+
+            bad_obs = verify_model_identity("kimi-k3.1-pro", "bad model!", root=root)
+            self.assertTrue(bad_obs["blocked"])
+            self.assertEqual(bad_obs["status"], "MODEL_IDENTITY_INVALID")
+
+            with self.assertRaises(ValueError):
+                verify_model_identity("bad slug!", "kimi-k3.1-pro")
+
+            # Receipt probe (top-level & nested usage.model)
+            rec_ok = root / "receipt_ok.json"
+            rec_ok.write_text(json.dumps({"usage": {"model": "kimi-k3.1-pro"}}), encoding="utf-8")
+            p_ok = probe_model_receipt(rec_ok, expected_model="kimi-k3.1-pro", root=root)
+            self.assertTrue(p_ok["ok"])
+
+            rec_bad = root / "receipt_bad.json"
+            rec_bad.write_text(json.dumps({"model": "cheap-mini"}), encoding="utf-8")
+            cli_bad = self.run_cli(
+                "model-probe",
+                "--root",
+                str(root),
+                "--expected",
+                "kimi-k3.1-pro",
+                "--receipt",
+                str(rec_bad),
+                check=False,
+            )
+            self.assertEqual(cli_bad.returncode, 2)
+            self.assertEqual(json.loads(cli_bad.stdout.decode("utf-8"))["status"], "MODEL_DOWNGRADE_DETECTED")
+
+            cli_ok = self.run_cli(
+                "model-probe",
+                "--expected",
+                "kimi-k3.1-pro",
+                "--observed",
+                "kimi-k3.1-pro",
+            )
+            self.assertEqual(cli_ok.returncode, 0)
+
+            # Quorum submit rejects silent downgrade fail-closed
+            with self.assertRaises(ValueError) as ctx_down:
+                quorum_submit(
+                    root,
+                    meeting_id="m-model",
+                    author="seat-a",
+                    source_kind="external_llm",
+                    content="Review findings A",
+                    expected_model="claude-opus-5-5-high",
+                    observed_model="cheap-flash",
+                )
+            self.assertIn("MODEL_DOWNGRADE_DETECTED", str(ctx_down.exception))
+
+            # Quorum verify with --require-model-match blocks unverified submissions
+            quorum_submit(root, meeting_id="m-strict", author="seat-a", source_kind="local_seat", content="Alpha view.")
+            quorum_submit(root, meeting_id="m-strict", author="seat-b", source_kind="external_llm", content="Beta view.")
+            unv = quorum_verify(root, meeting_id="m-strict", require_multi_seat=True, require_model_match=True)
+            self.assertTrue(unv["blocked"])
+            self.assertEqual(unv["reason"], "MODEL_DOWNGRADE_BLOCKED")
+
+            # Verified matching models pass strict quorum-verify
+            quorum_submit(
+                root,
+                meeting_id="m-verified",
+                author="seat-a",
+                source_kind="local_seat",
+                content="Verified alpha.",
+                expected_model="claude-opus-5-5-high",
+                observed_model="claude-opus-5-5-high",
+            )
+            quorum_submit(
+                root,
+                meeting_id="m-verified",
+                author="seat-b",
+                source_kind="external_llm",
+                content="Verified beta.",
+                expected_model="kimi-k3.1-pro",
+                observed_model="kimi-k3.1-pro",
+            )
+            cli_ver = self.run_cli(
+                "quorum-verify",
+                "--root",
+                str(root),
+                "--meeting-id",
+                "m-verified",
+                "--require-model-match",
+            )
+            self.assertEqual(cli_ver.returncode, 0)
+            self.assertEqual(json.loads(cli_ver.stdout.decode("utf-8"))["decision_grade"], "MULTI_SEAT_DECISION")
+
+            # Post-submission tampered metadata model mismatch fails closed
+            meta_fp = root / ".diffquorum" / "meetings" / "m-verified" / "submissions" / "seat-b__external_llm.json"
+            doc = json.loads(meta_fp.read_text(encoding="utf-8"))
+            doc["observed_model"] = "silent-flash"
+            meta_fp.write_text(json.dumps(doc), encoding="utf-8")
+            tampered_m = quorum_verify(root, meeting_id="m-verified", require_multi_seat=True)
+            self.assertTrue(tampered_m["blocked"])
+            self.assertEqual(tampered_m["reason"], "MODEL_DOWNGRADE_BLOCKED")
+
+    def test_17_pf016_timer_filter_pf017_xml_unwrap_and_gate4_newer_ticket_unblock(self) -> None:
+        # PF-017: Unwrap <USER_REQUEST> ignoring trailing XML wrappers & block nested tag smuggling
+        wrapped = (
+            "<USER_REQUEST>\nApprove\n</USER_REQUEST>"
+            "<ADDITIONAL_METADATA>timezone=UTC</ADDITIONAL_METADATA>"
+            "<USER_SETTINGS_CHANGE>theme=dark</USER_SETTINGS_CHANGE>"
+        )
+        self.assertEqual(extract_user_request_text(wrapped), "Approve")
+        plain_meta = "Ship it<ADDITIONAL_METADATA>x=1</ADDITIONAL_METADATA>"
+        self.assertEqual(extract_user_request_text(plain_meta), "Ship it")
+        with self.assertRaises(ValueError):
+            extract_user_request_text("<USER_REQUEST>hi <USER_REQUEST>nested</USER_REQUEST></USER_REQUEST>")
+        with self.assertRaises(ValueError):
+            extract_user_request_text("<USER_REQUEST>unclosed")
+
+        base_snap = {
+            "msg_id": "msg-v03",
+            "msg_text": "check",
+            "msg_status": "PENDING",
+            "msg_attempts": 0,
+            "last_attempt_ts": 0.0,
+            "pane_in_mode": 0,
+            "pane_fg": "agy",
+            "agy_in_tree": True,
+            "client_activity_ts": 100.0,
+            "capture_lines": [">   Ask anything..."],
+            "cursor_x": 4,
+            "transcript_last_type": "PLANNER_RESPONSE",
+            "transcript_last_status": "DONE",
+            "transcript_has_tool_calls": False,
+            "running_tasks": [],
+            "recent_seat_wakes": [],
+        }
+
+        # PF-016: Standing timers must NOT block idle wakeup, while foreground tasks still block
+        timer_snap = dict(
+            base_snap,
+            running_tasks=[
+                {"description": "1d 19h timer running", "status": "running", "isDaemon": False},
+                {"description": "Timer: periodic patrol", "status": "running", "isDaemon": False},
+                {"description": "background watch", "kind": "timer", "status": "running", "isDaemon": False},
+            ],
+        )
+        self.assertTrue(evaluate_six_gates(timer_snap, now_ts=1000.0)["wake"])
+
+        fg_snap = dict(
+            base_snap,
+            running_tasks=[{"description": "pytest unit suite", "status": "running", "isDaemon": False}],
+        )
+        fg_res = evaluate_six_gates(fg_snap, now_ts=1000.0)
+        self.assertFalse(fg_res["wake"])
+        self.assertEqual(fg_res["reason"], "NON_DAEMON_TASK_RUNNING")
+
+        # Gate 4: Stale awaiting-Approve blocks older/equal tickets, but newer ready ticket unblocks
+        self.assertTrue(is_awaiting_human_approve("请先审核上面的计划。回复“Approve”后执行"))
+        stale_blocked = dict(
+            base_snap,
+            transcript_last_text="请先审核上面的计划。回复“Approve”后我再开始执行",
+            transcript_mtime_ts=500.0,
+            newest_ready_ticket_ts=450.0,
+        )
+        r_blk = evaluate_six_gates(stale_blocked, now_ts=1000.0)
+        self.assertFalse(r_blk["wake"])
+        self.assertEqual(r_blk["reason"], "AWAITING_HUMAN_APPROVE")
+
+        newer_unblocked = dict(stale_blocked, newest_ready_ticket_ts=520.0)
+        r_ok = evaluate_six_gates(newer_unblocked, now_ts=1000.0)
+        self.assertTrue(r_ok["wake"])
+
+    def test_18_review_two_round_hard_cap_and_strict_400b_pointer_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            init_workspace(root)
+
+            # <= 2 review round hard cap triggers ROUND_CAP_HALT even with zero blockers
+            r3 = evaluate_review_gate(root, level=2, content_tree_hash="deadbeef1234", round_num=3, blockers=[])
+            self.assertEqual(r3["status"], "ROUND_CAP_HALT")
+            self.assertTrue(r3["blocked"])
+
+            r2_l1 = evaluate_review_gate(root, level=1, content_tree_hash="deadbeef1234", round_num=2, blockers=[])
+            self.assertEqual(r2_l1["status"], "ROUND_CAP_HALT")
+            self.assertTrue(r2_l1["blocked"])
+
+            with self.assertRaises(ValueError):
+                evaluate_review_gate(root, level=2, content_tree_hash="deadbeef1234", round_num=0)
+
+            # Strict <400B pointer envelope verification
+            ok_ptr = dispatch_pointer(
+                root,
+                from_seat="lead",
+                to_seat="builder",
+                summary="Short pointer summary",
+                event_id="evt-strict-ok",
+                strict_envelope=True,
+                now_ts=1000.0,
+            )
+            self.assertTrue(ok_ptr["ok"])
+            self.assertLess(ok_ptr["pointer_bytes"], MAX_ENVELOPE_BYTES)
+
+            with self.assertRaises(ValueError) as ctx_big:
+                dispatch_pointer(
+                    root,
+                    from_seat="lead",
+                    to_seat="builder",
+                    summary="X" * 380,
+                    event_id="evt-strict-big",
+                    strict_envelope=True,
+                    now_ts=1001.0,
+                )
+            self.assertIn("POINTER_ENVELOPE_OVERSIZED", str(ctx_big.exception))
+
+            with self.assertRaises(ValueError):
+                verify_pointer_envelope("line1\nline2")
+            with self.assertRaises(ValueError):
+                verify_pointer_envelope("[]")
+            with self.assertRaises(ValueError):
+                verify_pointer_envelope(json.dumps({"id": "e1"}))
 
 
 if __name__ == "__main__":

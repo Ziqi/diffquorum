@@ -159,6 +159,99 @@ def log_fix(root: pathlib.Path, *, title: str, fix_summary: str, files: str = ""
     return {"ok": True, "path": str(p), "entry": bullet.strip()}
 
 
+def verify_model_identity(
+    expected_model: str,
+    observed_model: str,
+    *,
+    root: pathlib.Path | None = None,
+    actor: str = "model-probe",
+) -> dict[str, Any]:
+    """Fail-closed guard against silent router model downgrade or missing observed model identity."""
+    exp_raw = expected_model.strip()
+    obs_raw = (observed_model or "").strip()
+    if not exp_raw or not MODEL_SLUG_RE.fullmatch(exp_raw):
+        raise ValueError(f"Invalid expected_model identifier: {expected_model}")
+
+    if not obs_raw:
+        res: dict[str, Any] = {
+            "ok": False,
+            "blocked": True,
+            "status": "MODEL_IDENTITY_MISSING",
+            "expected_model": exp_raw,
+            "observed_model": "",
+            "reason": "OBSERVED_MODEL_EMPTY",
+        }
+    elif not MODEL_SLUG_RE.fullmatch(obs_raw):
+        res = {
+            "ok": False,
+            "blocked": True,
+            "status": "MODEL_IDENTITY_INVALID",
+            "expected_model": exp_raw,
+            "observed_model": obs_raw,
+            "reason": "OBSERVED_MODEL_INVALID_SLUG",
+        }
+    elif obs_raw.lower() != exp_raw.lower():
+        res = {
+            "ok": False,
+            "blocked": True,
+            "status": "MODEL_DOWNGRADE_DETECTED",
+            "expected_model": exp_raw,
+            "observed_model": obs_raw,
+            "reason": "EXPECTED_OBSERVED_MISMATCH",
+        }
+    else:
+        res = {
+            "ok": True,
+            "blocked": False,
+            "status": "MODEL_IDENTITY_VERIFIED",
+            "expected_model": exp_raw,
+            "observed_model": obs_raw,
+            "reason": "EXACT_MATCH",
+        }
+
+    if root is not None:
+        if res["blocked"]:
+            log_pitfall(
+                root,
+                title=f"Model Identity Guard Blocked ({exp_raw})",
+                root_cause=f"expected={exp_raw}, observed={obs_raw or '<empty>'} ({res['status']})",
+                guard="Fail closed on silent router model downgrade or missing model receipt",
+                actor=actor,
+            )
+            append_event_log(
+                root,
+                action="MODEL_PROBE",
+                actor=actor,
+                status="blocked",
+                detail={"expected": exp_raw, "observed": obs_raw, "reason": res["status"]},
+            )
+        else:
+            append_event_log(
+                root,
+                action="MODEL_PROBE",
+                actor=actor,
+                status="ok",
+                detail={"expected": exp_raw, "observed": obs_raw},
+            )
+    return res
+
+
+def probe_model_receipt(
+    receipt_path: pathlib.Path,
+    *,
+    expected_model: str,
+    root: pathlib.Path | None = None,
+    actor: str = "model-probe",
+) -> dict[str, Any]:
+    """Reads a runner JSON receipt safely (no symlinks) and enforces exact expected==observed model identity."""
+    doc = read_json_nofollow(receipt_path)
+    usage = doc.get("usage") if isinstance(doc.get("usage"), dict) else {}
+    observed = str(doc.get("observed_model") or doc.get("model") or usage.get("model") or "")
+    res = verify_model_identity(expected_model, observed, root=root, actor=actor)
+    res["receipt_path"] = str(receipt_path)
+    return res
+
+
 def quorum_submit(
     root: pathlib.Path,
     *,
@@ -167,8 +260,10 @@ def quorum_submit(
     source_kind: str,
     content: str,
     diff_sha256: str = "",
+    expected_model: str = "",
+    observed_model: str = "",
 ) -> dict[str, Any]:
-    """Stores an independent participant's raw submission, optional git diff hash, and SHA-256 fingerprint."""
+    """Stores an independent participant's raw submission, optional git diff hash, model verification, and SHA-256."""
     if not MEETING_ID_RE.fullmatch(meeting_id):
         raise ValueError(f"Invalid meeting_id: {meeting_id}")
     if not SEAT_NAME_RE.fullmatch(author):
@@ -181,6 +276,17 @@ def quorum_submit(
     body = content.strip()
     if not body:
         raise ValueError("Submission content must be non-empty")
+
+    exp_model = expected_model.strip()
+    obs_model = observed_model.strip()
+    model_verified = False
+    if exp_model:
+        probe = verify_model_identity(exp_model, obs_model, root=root, actor=author)
+        if probe["blocked"]:
+            raise ValueError(f"{probe['status']}: expected={exp_model}, observed={obs_model or '<empty>'}")
+        model_verified = True
+    elif obs_model and not MODEL_SLUG_RE.fullmatch(obs_model):
+        raise ValueError(f"Invalid observed_model identifier: {obs_model}")
 
     sub_dir = dq_dir(root) / "meetings" / meeting_id / "submissions"
     ensure_safe_dir(sub_dir)
@@ -197,6 +303,9 @@ def quorum_submit(
         "submitted_at": utc_iso(),
         "content_sha256": digest,
         "diff_sha256": clean_diff,
+        "expected_model": exp_model,
+        "observed_model": obs_model,
+        "model_verified": model_verified,
         "rel_file": f"submissions/{stem}.md",
     }
     atomic_write_json(meta_path, meta)
@@ -214,6 +323,9 @@ def quorum_submit(
         "source_kind": source_kind,
         "content_sha256": digest,
         "diff_sha256": clean_diff,
+        "expected_model": exp_model,
+        "observed_model": obs_model,
+        "model_verified": model_verified,
     }
 
 
@@ -225,6 +337,7 @@ def quorum_verify(
     *,
     meeting_id: str,
     require_multi_seat: bool = True,
+    require_model_match: bool = False,
     resolution_summary: str = "",
 ) -> dict[str, Any]:
     """Verifies anti-fake-quorum integrity: >=2 distinct authors, source_kinds, and SHA-256 hashes."""
@@ -261,8 +374,23 @@ def quorum_verify(
     diff_hashes = sorted({str(r.get("diff_sha256") or "") for r in verified_subs if str(r.get("diff_sha256") or "").strip()})
 
     is_multi = len(authors) >= 2 and len(sources) >= 2 and len(hashes) >= 2
+    model_mismatches: list[str] = []
+    for rec in verified_subs:
+        exp_m = str(rec.get("expected_model") or "").strip()
+        obs_m = str(rec.get("observed_model") or "").strip()
+        if exp_m and obs_m.lower() != exp_m.lower():
+            model_mismatches.append(f"{rec['author']}:expected={exp_m},observed={obs_m or '<empty>'}")
+        elif require_model_match and (not exp_m or not obs_m or not bool(rec.get("model_verified"))):
+            model_mismatches.append(f"{rec['author']}:unverified_model")
+
     decision_grade = "MULTI_SEAT_DECISION" if is_multi else "SOLO_SYNTHESIS"
-    blocked = require_multi_seat and not is_multi
+    blocked = (require_multi_seat and not is_multi) or bool(model_mismatches)
+    if model_mismatches:
+        reason = "MODEL_DOWNGRADE_BLOCKED"
+    elif is_multi:
+        reason = "MULTI_SEAT_VERIFIED"
+    else:
+        reason = "INSUFFICIENT_INDEPENDENT_SUBMISSIONS"
 
     resolution = {
         "meeting_id": meeting_id,
@@ -273,25 +401,36 @@ def quorum_verify(
         "distinct_authors": authors,
         "distinct_content_hashes": len(hashes),
         "bound_diff_hashes": diff_hashes,
-        "reason": "MULTI_SEAT_VERIFIED" if is_multi else "INSUFFICIENT_INDEPENDENT_SUBMISSIONS",
+        "model_mismatches": model_mismatches,
+        "reason": reason,
         "summary": resolution_summary.strip(),
     }
     atomic_write_json(meet_dir / "RESOLUTION.json", resolution)
 
     if blocked:
+        pitfall_title = (
+            f"Model-Identity Guard Blocked ({meeting_id})"
+            if model_mismatches
+            else f"Fake-Quorum Guard Blocked ({meeting_id})"
+        )
+        pitfall_cause = (
+            f"model_mismatches={model_mismatches}"
+            if model_mismatches
+            else f"authors={authors}, distinct_hashes={len(hashes)} (<2 independent submissions)"
+        )
         log_pitfall(
             root,
-            title=f"Fake-Quorum Guard Blocked ({meeting_id})",
-            root_cause=f"authors={authors}, distinct_hashes={len(hashes)} (<2 independent submissions)",
-            guard="Require >=2 distinct author/source_kind/SHA-256 submissions before MULTI_SEAT_DECISION",
+            title=pitfall_title,
+            root_cause=pitfall_cause,
+            guard="Require >=2 distinct author/source_kind/SHA-256 submissions and exact expected==observed model match",
             actor="quorum-verify",
         )
         append_event_log(
             root,
             action="QUORUM_VERIFY",
             actor="cli",
-            status="blocked_fake_quorum",
-            detail={"meeting_id": meeting_id, "grade": decision_grade},
+            status="blocked_model_mismatch" if model_mismatches else "blocked_fake_quorum",
+            detail={"meeting_id": meeting_id, "grade": decision_grade, "reason": reason},
         )
     else:
         append_event_log(
@@ -517,6 +656,8 @@ def evaluate_review_gate(
 ) -> dict[str, Any]:
     if level not in (0, 1, 2):
         raise ValueError(f"Unsupported review level: {level} (allowed: 0, 1, 2)")
+    if isinstance(round_num, bool) or not isinstance(round_num, int) or round_num < 1:
+        raise ValueError(f"Invalid round_num: {round_num!r} (must be integer >= 1)")
 
     blocker_list = [b.strip() for b in (blockers or []) if b.strip()]
     recent = read_recent_pitfalls(root)
@@ -569,6 +710,35 @@ def evaluate_review_gate(
         }
 
     max_rounds = 1 if level == 1 else 2
+    if round_num > max_rounds:
+        log_pitfall(
+            root,
+            title=f"ROUND_CAP_HALT ({content_tree_hash[:12]} r{round_num})",
+            root_cause=f"round={round_num} exceeded hard cap max_rounds={max_rounds} (level={level})",
+            guard=f"rule={rule_version}; enforce <=2 review rounds hard stop (1+1 cap)",
+            actor="review",
+        )
+        append_event_log(
+            root,
+            action="REVIEW",
+            actor="cli",
+            status="round_cap_halt",
+            detail={"hash": content_tree_hash[:12], "round": round_num, "max_rounds": max_rounds},
+        )
+        return {
+            "status": "ROUND_CAP_HALT",
+            "level": level,
+            "round": round_num,
+            "max_rounds": max_rounds,
+            "blocked": True,
+            "blockers": blocker_list,
+            "recent_pitfalls": read_recent_pitfalls(root),
+            "summary": format_plain_3line(
+                f"第 {round_num} 轮已超出硬封顶上限（最多 {max_rounds} 轮），系统直接拉闸拦截",
+                f"同一改动严禁无限空转审稿（level={level}, max_rounds={max_rounds}）",
+                "汇总未闭环问题并交由人工拍板，勿再加开新轮次",
+            ),
+        }
     if blocker_list:
         if round_num >= max_rounds:
             log_pitfall(

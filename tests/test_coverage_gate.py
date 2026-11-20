@@ -86,6 +86,18 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     bb.dispatch_pointer(
         ws, from_seat="lead", to_seat="builder", summary="D" * 500, artifact_text="spec", event_id="evt-cov-1", now_ts=1000.0
     )
+    bb.dispatch_pointer(
+        ws, from_seat="lead", to_seat="builder", summary="strict ok", event_id="evt-cov-strict", strict_envelope=True, now_ts=1001.0
+    )
+    for bad_env in ("a\nb", "[]", json.dumps({"id": "x"}), json.dumps({"id": "x", "from": "a", "kind": "K", "ref": "r", "sum": "Z" * 400})):
+        try:
+            bb.verify_pointer_envelope(bad_env)
+        except ValueError:
+            pass
+    try:
+        bb.dispatch_pointer(ws, from_seat="lead", to_seat="builder", summary="Z" * 380, event_id="evt-cov-big", strict_envelope=True, now_ts=1002.0)
+    except ValueError:
+        pass
     bb.dispatch_pointer(ws, from_seat="lead", to_seat="builder", summary="dup", event_id="evt-cov-1", now_ts=1005.0)
     bb.ack_pointer(ws, seat="builder", event_id="evt-cov-1", emit_reply_to="lead", priority="P1", now_ts=2000.0)
     for call_kw in (
@@ -167,6 +179,36 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     except ValueError:
         pass
 
+    # 3b. v0.3 Model-identity fail-closed probe + strict quorum model matching
+    assert gov.verify_model_identity("kimi-k3.1-pro", "kimi-k3.1-pro", root=ws)["ok"] is True
+    assert gov.verify_model_identity("kimi-k3.1-pro", "cheap-flash", root=ws)["blocked"] is True
+    assert gov.verify_model_identity("kimi-k3.1-pro", "", root=ws)["blocked"] is True
+    assert gov.verify_model_identity("kimi-k3.1-pro", "bad slug!", root=ws)["blocked"] is True
+    try:
+        gov.verify_model_identity("bad slug!", "kimi-k3.1-pro")
+    except ValueError:
+        pass
+    rec_cov = temp_root / "rec_cov.json"
+    rec_cov.write_text(json.dumps({"model": "kimi-k3.1-pro"}), encoding="utf-8")
+    assert gov.probe_model_receipt(rec_cov, expected_model="kimi-k3.1-pro", root=ws)["ok"] is True
+
+    try:
+        gov.quorum_submit(ws, meeting_id="m-cov-m", author="lead", source_kind="local_seat", content="M", expected_model="kimi-k3.1-pro", observed_model="mini")
+    except ValueError:
+        pass
+    try:
+        gov.quorum_submit(ws, meeting_id="m-cov-m", author="lead", source_kind="local_seat", content="M", observed_model="bad model!")
+    except ValueError:
+        pass
+    gov.quorum_submit(ws, meeting_id="m-cov-m", author="lead", source_kind="local_seat", content="M1", expected_model="kimi-k3.1-pro", observed_model="kimi-k3.1-pro")
+    gov.quorum_submit(ws, meeting_id="m-cov-m", author="builder", source_kind="external_llm", content="M2")
+    assert gov.quorum_verify(ws, meeting_id="m-cov-m", require_multi_seat=True, require_model_match=True)["blocked"] is True
+    meta_m = ws / ".diffquorum" / "meetings" / "m-cov-m" / "submissions" / "lead__local_seat.json"
+    mdoc = json.loads(meta_m.read_text(encoding="utf-8"))
+    mdoc["observed_model"] = "downgraded-mini"
+    meta_m.write_text(json.dumps(mdoc), encoding="utf-8")
+    assert gov.quorum_verify(ws, meeting_id="m-cov-m", require_multi_seat=True)["blocked"] is True
+
     for prof in ("agy-hydrogen", "claude-sub", "codex", "generic-ptr"):
         assert gov.build_runner_preset(prof, task_pointer="artifacts/p.md")["ok"]
     for bad_kw in ({"profile": "nope", "task_pointer": "p"}, {"profile": "codex", "task_pointer": " "}, {"profile": "codex", "task_pointer": "p", "model_override": "bad model!"}):
@@ -182,7 +224,12 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     gov.evaluate_review_gate(ws, level=2, content_tree_hash="abc12345", external_status="timeout")
     gov.evaluate_review_gate(ws, level=2, content_tree_hash="abc12345", round_num=1, blockers=["race"])
     gov.evaluate_review_gate(ws, level=2, content_tree_hash="abc12345", round_num=2, blockers=["race"])
+    gov.evaluate_review_gate(ws, level=2, content_tree_hash="abc12345", round_num=3, blockers=[])
     gov.evaluate_review_gate(ws, level=2, content_tree_hash="abc12345", round_num=2, blockers=[], record_fix="Fixed")
+    try:
+        gov.evaluate_review_gate(ws, level=2, content_tree_hash="abc12345", round_num=0)
+    except ValueError:
+        pass
     probe_home = "/".join(["", "Users", "alice", "x"])
     probe_ip = ".".join(["192", "168", "1", "50"])
     probe_vol = "/".join(["", "Volumes", "Disk", "y"])
@@ -240,6 +287,25 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     ):
         snap = dict(base_snap, **mut)
         assert wg.evaluate_six_gates(snap, now_ts=1000.0)["wake"] is False
+    assert wg.extract_user_request_text("<USER_REQUEST>Approve</USER_REQUEST><ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>") == "Approve"
+    assert wg.extract_user_request_text("Ok<USER_SETTINGS_CHANGE>k</USER_SETTINGS_CHANGE>") == "Ok"
+    for bad_xml in ("<USER_REQUEST><USER_REQUEST>x</USER_REQUEST></USER_REQUEST>", "<USER_REQUEST>open", "</USER_REQUEST><USER_REQUEST>"):
+        try:
+            wg.extract_user_request_text(bad_xml)
+        except ValueError:
+            pass
+    assert wg.evaluate_six_gates(
+        dict(base_snap, running_tasks=[{"description": "1d 19h timer running", "status": "running", "isDaemon": False}, {"kind": "timer", "status": "running"}]),
+        now_ts=1000.0,
+    )["wake"] is True
+    assert wg.evaluate_six_gates(
+        dict(base_snap, transcript_last_text="请先审核上面的计划", transcript_mtime_ts=500.0, newest_ready_ticket_ts=400.0),
+        now_ts=1000.0,
+    )["wake"] is False
+    assert wg.evaluate_six_gates(
+        dict(base_snap, transcript_last_text="请先审核上面的计划", transcript_mtime_ts=500.0, newest_ready_ticket_ts=600.0),
+        now_ts=1000.0,
+    )["wake"] is True
     wstate: dict = {}
     wg.apply_wake_attempt(wstate, seat="lead", msg_id="m1", frame1_ok=True, frame2_ok=False, now_ts=1000.0)
     wg.apply_wake_attempt(wstate, seat="lead", msg_id="m1", frame1_ok=True, frame2_ok=True, now_ts=1040.0)
@@ -271,6 +337,8 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
             ["quorum-submit", "--root", str(cli_ws), "--meeting-id", "mc-1", "--author", "builder", "--source-kind", "subagent", "--content", "B"],
             ["quorum-blind", "--root", str(cli_ws), "--meeting-id", "mc-1", "--seed", "3"],
             ["quorum-verify", "--root", str(cli_ws), "--meeting-id", "mc-1"],
+            ["model-probe", "--expected", "kimi-k3.1-pro", "--observed", "kimi-k3.1-pro"],
+            ["model-probe", "--root", str(cli_ws), "--expected", "kimi-k3.1-pro", "--receipt", str(rec_cov)],
             ["review", "--root", str(cli_ws), "--level", "0", "--tree-hash", "deadbeef01"],
             ["review", "--tree-hash", "deadbeef01", "--lint-text", "已完成任务"],
             ["review", "--tree-hash", "deadbeef01", "--pseudonymize-file", str(sample_file)],

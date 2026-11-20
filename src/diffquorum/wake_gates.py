@@ -55,6 +55,52 @@ WAITING_MODAL_RE = re.compile(
 # Supports bare `>`, Codex `›`, and fresh-session placeholder hints such as `>   Ask anything...`
 IDLE_PROMPT_LINE_RE = re.compile(r"^\s*[>›]\s*(?:$|Ask\b|Try\b|Type\b)")
 
+# PF-016: standing timers & cron schedules are background daemons and must not block idle wakeups.
+SCHEDULE_TASK_DESC_RE = re.compile(
+    r"(?:^cron\s*\(|\btimer\s+running\b|^timer\s*:|\bone-shot\s+timer\b|\bscheduled\s+timer\b)",
+    re.IGNORECASE,
+)
+
+# PF-017: runtime trailing XML metadata wrappers appended after </USER_REQUEST>.
+_USER_REQ_OPEN_RE = re.compile(r"<USER_REQUEST>", re.IGNORECASE)
+_USER_REQ_CLOSE_RE = re.compile(r"</USER_REQUEST>", re.IGNORECASE)
+_USER_REQ_BODY_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.IGNORECASE | re.DOTALL)
+_TRAILING_META_RE = re.compile(
+    r"<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>.*?</(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Gate 4 stale awaiting-human-approval markers (can be bypassed only by a strictly newer ready ticket).
+AWAITING_APPROVE_MARKERS = (
+    "请先审核上面的计划",
+    "回复“approve”",
+    '回复"approve"',
+    "awaiting human approval",
+    'reply "approve"',
+)
+
+
+def extract_user_request_text(raw: str) -> str:
+    """Unwraps <USER_REQUEST> safely while stripping trailing runtime XML metadata and blocking nested tags (PF-017)."""
+    text = str(raw or "")
+    opens = len(_USER_REQ_OPEN_RE.findall(text))
+    closes = len(_USER_REQ_CLOSE_RE.findall(text))
+    if opens > 1 or closes > 1 or opens != closes:
+        raise ValueError("NESTED_OR_UNBALANCED_USER_REQUEST_TAG")
+    if opens == 1:
+        match = _USER_REQ_BODY_RE.search(text)
+        if not match:
+            raise ValueError("NESTED_OR_UNBALANCED_USER_REQUEST_TAG")
+        return match.group(1).strip()
+    cleaned = _TRAILING_META_RE.sub("", text)
+    return cleaned.strip()
+
+
+def is_awaiting_human_approve(text: str) -> bool:
+    """Detects whether a transcript tail is parked waiting for explicit human plan approval."""
+    low = str(text or "").lower()
+    return any(marker in low for marker in AWAITING_APPROVE_MARKERS)
+
 
 def strip_terminal_escapes(text: str) -> str:
     """Strips ANSI CSI/OSC escapes and normalizes terminal cursor moves cleanly."""
@@ -98,8 +144,10 @@ def _has_active_foreground_tasks(tasks: list[dict[str, Any]]) -> bool:
             continue
         if t.get("isDaemon") is True:
             continue
-        desc = str(t.get("description") or "").strip().lower()
-        if desc.startswith("cron ("):
+        if str(t.get("kind") or "").strip().lower() in ("timer", "cron", "schedule"):
+            continue
+        desc = str(t.get("description") or "").strip()
+        if SCHEDULE_TASK_DESC_RE.search(desc):
             continue
         if str(t.get("status") or "").lower() in ("running", "in_progress", "pending"):
             return True
@@ -149,6 +197,14 @@ def evaluate_six_gates(snapshot: dict[str, Any], now_ts: float | None = None) ->
         return {"wake": False, "gate": "gate4", "reason": "TRANSCRIPT_NOT_IDLE"}
     if _has_active_foreground_tasks(list(snapshot.get("running_tasks") or [])):
         return {"wake": False, "gate": "gate4", "reason": "NON_DAEMON_TASK_RUNNING"}
+    awaiting_approve = bool(snapshot.get("transcript_awaiting_human_approve")) or is_awaiting_human_approve(
+        str(snapshot.get("transcript_last_text") or "")
+    )
+    if awaiting_approve:
+        tx_mtime = float(snapshot.get("transcript_mtime_ts") or 0.0)
+        newest_ticket_ts = float(snapshot.get("newest_ready_ticket_ts") or 0.0)
+        if newest_ticket_ts <= 0.0 or newest_ticket_ts <= tx_mtime:
+            return {"wake": False, "gate": "gate4", "reason": "AWAITING_HUMAN_APPROVE"}
 
     # Gate 5: Per-seat sliding 120s rate limit
     recent_wakes = [

@@ -423,6 +423,23 @@ def _prune_bridge_state(state: dict[str, Any], now_ts: float) -> None:
         ack_map.pop(peer, None)
 
 
+def verify_pointer_envelope(raw_line: str) -> dict[str, Any]:
+    """Validates that a single-line pointer envelope is valid JSON, carries required keys, and is strictly <400B."""
+    if "\n" in raw_line or "\r" in raw_line:
+        raise ValueError("POINTER_ENVELOPE_MULTILINE")
+    byte_len = len(raw_line.encode("utf-8"))
+    if byte_len >= MAX_ENVELOPE_BYTES:
+        raise ValueError(f"POINTER_ENVELOPE_OVERSIZED: {byte_len}B >= {MAX_ENVELOPE_BYTES}B")
+    doc = json.loads(raw_line)
+    if not isinstance(doc, dict):
+        raise ValueError("POINTER_ENVELOPE_NOT_OBJECT")
+    required = ("id", "from", "kind", "ref", "sum")
+    missing = [k for k in required if not str(doc.get(k) or "").strip()]
+    if missing:
+        raise ValueError(f"POINTER_ENVELOPE_MISSING_FIELDS: {missing}")
+    return {"ok": True, "bytes": byte_len, "envelope": doc}
+
+
 def dispatch_pointer(
     root: pathlib.Path,
     *,
@@ -435,6 +452,7 @@ def dispatch_pointer(
     hop: int = 0,
     event_id: str = "",
     in_reply_to: str = "",
+    strict_envelope: bool = False,
     now_ts: float | None = None,
 ) -> dict[str, Any]:
     if not SEAT_NAME_RE.fullmatch(from_seat) or not SEAT_NAME_RE.fullmatch(to_seat):
@@ -485,6 +503,7 @@ def dispatch_pointer(
             f"# {eid} ({kind} | {from_seat} -> {to_seat})\n\n- Timestamp: {utc_iso(now_ep)}\n\n{full_body}\n",
         )
 
+        raw_sum = summary.strip()
         envelope = {
             "id": eid,
             "ts": int(now_ep),
@@ -494,14 +513,17 @@ def dispatch_pointer(
             "hop": hop,
             "ack_prohibited": kind == "ACK",
             "ref": rel_artifact,
-            "sum": summary.strip()[:120],
+            "sum": raw_sum if strict_envelope else raw_sum[:120],
         }
         line = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
-        while len(line.encode("utf-8")) >= MAX_ENVELOPE_BYTES and len(envelope["sum"]) > 8:
-            envelope["sum"] = envelope["sum"][:-8]
-            line = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
-        if len(line.encode("utf-8")) >= MAX_ENVELOPE_BYTES:
-            raise ValueError(f"Pointer envelope exceeds {MAX_ENVELOPE_BYTES}B limit")
+        if strict_envelope:
+            verify_pointer_envelope(line)
+        else:
+            while len(line.encode("utf-8")) >= MAX_ENVELOPE_BYTES and len(envelope["sum"]) > 8:
+                envelope["sum"] = envelope["sum"][:-8]
+                line = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+            if len(line.encode("utf-8")) >= MAX_ENVELOPE_BYTES:
+                raise ValueError(f"Pointer envelope exceeds {MAX_ENVELOPE_BYTES}B limit")
 
         append_jsonl_nofollow(base / "inbox" / f"{to_seat}.jsonl", line)
         state["seen_event_ids"][eid] = now_ep
