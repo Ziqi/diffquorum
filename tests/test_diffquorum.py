@@ -55,12 +55,25 @@ from diffquorum.governance import (  # noqa: E402
     run_sanitize_lint,
     verify_model_identity,
 )
+from diffquorum.ops import (  # noqa: E402
+    _disp_width,
+    collect_ast_imports,
+    curate_ledger,
+    render_dual_hud,
+    run_readonly_probe,
+    scrub_probe_env,
+)
 from diffquorum.wake_gates import (  # noqa: E402
     apply_wake_attempt,
+    classify_seat_state,
     evaluate_six_gates,
     extract_user_request_text,
     is_awaiting_human_approve,
     is_bare_idle_prompt,
+    is_explicit_approval_text,
+    is_idle_cli_footer,
+    is_pane_tail_busy,
+    revocation_applies_to_scope,
     strip_terminal_escapes,
 )
 
@@ -851,6 +864,236 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
                 verify_pointer_envelope("[]")
             with self.assertRaises(ValueError):
                 verify_pointer_envelope(json.dumps({"id": "e1"}))
+
+    def test_19_wave_b_wake_gates_narrow_footer_deep_thinking_ttl_and_fail_closed_approval(self) -> None:
+        # PF-018: narrow mobile idle footer allowed; busy/modal footers blocked
+        self.assertTrue(is_idle_cli_footer("? for shortcuts"))
+        self.assertTrue(is_idle_cli_footer("auto · Gemini 4 ... · /tasks"))
+        self.assertFalse(is_idle_cli_footer("auto · Gemini 4 ... · esc to interrupt"))
+        self.assertFalse(is_idle_cli_footer("Allow once (y/n)"))
+        self.assertFalse(is_idle_cli_footer("Random prose line"))
+
+        # PF-025: deep-thinking pane tail busy detection without prose false positives
+        self.assertTrue(is_pane_tail_busy(["line", "⡿ Thinking…", "auto · esc to cancel"]))
+        self.assertTrue(is_pane_tail_busy("Generating…"))
+        self.assertFalse(is_pane_tail_busy(["Summary: WORKING / IDLE verified.", ">", "? for shortcuts"]))
+
+        # PF-022: exact <=8-char dual-state classifier (WAIT+CPY / WORK+CPY / DAEMON / OFFLINE)
+        self.assertEqual(classify_seat_state(online=False), "OFFLINE")
+        self.assertEqual(classify_seat_state(online=True, is_daemon=True), "DAEMON")
+        self.assertEqual(classify_seat_state(online=True, pane_busy=True, copy_mode=True), "WORK+CPY")
+        self.assertEqual(classify_seat_state(online=True, pane_busy=True, awaiting_approve=True), "WORKING")
+        self.assertEqual(classify_seat_state(online=True, awaiting_approve=True, copy_mode=True), "WAIT+CPY")
+        self.assertEqual(classify_seat_state(online=True, awaiting_approve=True, copy_mode=False), "WAIT_APP")
+        self.assertEqual(classify_seat_state(online=True, transcript_busy=True, copy_mode=True), "WORK+CPY")
+        self.assertEqual(classify_seat_state(online=True, copy_mode=True), "COPY-MOD")
+        self.assertEqual(classify_seat_state(online=True), "IDLE")
+
+        # PF-021: decoupled wakeup TTL (2h plain message vs 24h blocked PENDING ticket)
+        base_snap = {
+            "msg_id": "m-ttl",
+            "msg_text": "check",
+            "msg_status": "PENDING",
+            "msg_attempts": 0,
+            "last_attempt_ts": 0.0,
+            "pane_in_mode": 0,
+            "pane_fg": "agy",
+            "agy_in_tree": True,
+            "client_activity_ts": 100.0,
+            "capture_lines": ["auto · Gemini 4 ... · /tasks"],
+            "cursor_x": 3,
+            "transcript_last_type": "PLANNER_RESPONSE",
+            "transcript_last_status": "DONE",
+            "transcript_has_tool_calls": False,
+            "running_tasks": [],
+            "recent_seat_wakes": [],
+        }
+        r_msg_old = evaluate_six_gates(dict(base_snap, item_kind="msg", item_age_sec=10800.0), now_ts=1000.0)
+        self.assertFalse(r_msg_old["wake"])
+        self.assertEqual(r_msg_old["reason"], "MESSAGE_WAKE_TTL_EXPIRED")
+
+        r_tkt_6h = evaluate_six_gates(dict(base_snap, item_kind="ticket", item_age_sec=21600.0), now_ts=1000.0)
+        self.assertTrue(r_tkt_6h["wake"])
+
+        r_tkt_25h = evaluate_six_gates(dict(base_snap, item_kind="ticket", item_age_sec=90000.0), now_ts=1000.0)
+        self.assertFalse(r_tkt_25h["wake"])
+        self.assertEqual(r_tkt_25h["reason"], "TICKET_WAKE_TTL_EXPIRED")
+
+        # PF-023: conservative multilingual approvals + fail-closed cross-seat revocation scoping
+        for ok_txt in ("approve", "我都同意", "都同意", "全同意", "好嘞，我都同意", "按这个执行"):
+            self.assertTrue(is_explicit_approval_text(ok_txt), ok_txt)
+        for bad_txt in (
+            "我都同意？",
+            "我都同意，但是先别改",
+            "不要按这个执行",
+            "我不同意",
+            "全同意，只改第一个",
+            "qapprove",
+            "approve. cancel it later",
+        ):
+            self.assertFalse(is_explicit_approval_text(bad_txt), bad_txt)
+
+        seats = {
+            "coord": ("coord", "00"),
+            "builder": ("builder", "02"),
+            "audit": ("audit", "99"),
+        }
+        self.assertFalse(
+            revocation_applies_to_scope("这个99 的就先不用管了", from_seat="coord", to_seat="builder", known_seats=seats)
+        )
+        self.assertTrue(
+            revocation_applies_to_scope("这个99 的就先不用管了", from_seat="coord", to_seat="audit", known_seats=seats)
+        )
+        for must_revoke in ("不用执行了", "02 先不用管了", "99 和全部都不用管了", "99% 不用管了", "99 不用管了，算了"):
+            self.assertTrue(
+                revocation_applies_to_scope(must_revoke, from_seat="coord", to_seat="builder", known_seats=seats),
+                must_revoke,
+            )
+
+        seats_json = json.dumps(seats)
+        cli_ok = self.run_cli(
+            "approve-check",
+            "--text", "我都同意",
+            "--later-text", "99 不用管了",
+            "--from", "coord", "--to", "builder",
+            "--seats-json", seats_json,
+        )
+        self.assertEqual(cli_ok.returncode, 0)
+        cli_rev = self.run_cli(
+            "approve-check",
+            "--text", "我都同意",
+            "--later-text", "99 不用管了，算了",
+            "--from", "coord", "--to", "builder",
+            "--seats-json", seats_json,
+            check=False,
+        )
+        self.assertEqual(cli_rev.returncode, 2)
+
+    def test_20_wave_b_ops_hud_curate_routine_and_ast_bundler(self) -> None:
+        ops_path = SRC_DIR / "diffquorum" / "ops.py"
+        ops_tree = ast.parse(ops_path.read_text(encoding="utf-8"))
+        # Zero delete paths & zero tmux mutating strings inside ops.py
+        for stmt in ops_tree.body[1:]:
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Attribute):
+                    self.assertNotIn(node.attr, ("unlink", "rmtree", "remove"))
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    self.assertNotIn("send-keys", node.value)
+                    self.assertNotIn("switch-client", node.value)
+
+        # 1) Dual-table 50-col HUD (WAIT+CPY, WORK+CPY, DAEMON, active tasks, OFFLINE fallback)
+        hud_snap = {
+            "clock": "15:40:00",
+            "watcher_tag": "WD:OK(2s)",
+            "lock_tag": "LOCK:FREE",
+            "local_hw": "memF:25% dsk:48G",
+            "local_seats": [
+                {"short": "00-coord", "state": "IDLE", "tkt": 0, "size": "50x40"},
+                {"short": "01-build", "pane_busy": True, "copy_mode": True, "tkt": 1, "size": "80x55"},
+                {"short": "02-audit", "awaiting_approve": True, "copy_mode": True, "wait_sec": 180, "snippet": "Plan waiting", "tkt": 1, "size": "80x55"},
+            ],
+            "remote": {
+                "online": True,
+                "rtt_ms": 22,
+                "health": "px/wd:OK",
+                "cache_age_sec": 15,
+                "hw": "mem:40/96G dsk:18% ld:1.4",
+                "seats": [
+                    {"short": "00-hub 总控", "awaiting_approve": True, "wait_sec": 60, "snippet": "Remote plan", "tkt": None, "size": "50x40"},
+                    {"short": "04-gw 网关", "is_daemon": True, "tkt": None, "size": "120x40"},
+                ],
+            },
+            "active_tasks": [
+                {"status": "IN_PROGRESS", "seat": "01", "num": "#020", "updated_ts": 200, "title": "【Approved】Refactor pipeline"},
+                {"status": "PENDING", "seat": "02", "num": "#021", "updated_ts": 300, "title": "Review audit bundle"},
+            ],
+        }
+        rendered = render_dual_hud(hud_snap, width=50, color=False)
+        self.assertIn("[!] WAIT APPROVE (2)", rendered)
+        self.assertIn("LOC 02-audit 3m [CPY] Plan waiting", rendered)
+        self.assertIn("REM 00-hub 总控 1m Remote plan", rendered)
+        self.assertIn("01-build     WORK+CPY t:1  80x55", rendered)
+        self.assertIn("02-audit     WAIT+CPY t:1  80x55   <--!", rendered)
+        self.assertIn("04-gw 网关   DAEMON   t:-  120x40", rendered)
+        self.assertIn("[ACTIVE TASKS] (2)", rendered)
+        self.assertIn("RUN 01 #020 Refactor pipeline", rendered)
+        self.assertLess(rendered.index("#020"), rendered.index("#021"))
+        for ln in rendered.splitlines():
+            self.assertLessEqual(_disp_width(ln), 50, f"HUD line overflowed 50 cols: {ln!r}")
+
+        off_hud = render_dual_hud(
+            {"local_seats": [], "remote": {"online": False, "consecutive_failures": 2, "error": "timeout>8s"}},
+            width=50,
+            color=False,
+        )
+        self.assertIn("[REMOTE] OFFLINE fail=2 (timeout>8s)", off_hud)
+        self.assertNotIn("WAIT APPROVE", off_hud)
+        self.assertNotIn("[ACTIVE TASKS]", off_hud)
+
+        # 2) Routine probe: secret scrubbing, timeout fail-closed, healthy JSON, symlink rejection
+        clean_env = scrub_probe_env({"PATH": "/usr/bin", "OPENAI_API_KEY": "sk-1", "KIMI_TOKEN": "tok", "XDG_CONFIG_HOME": "/tmp"})
+        self.assertIn("PATH", clean_env)
+        self.assertNotIn("OPENAI_API_KEY", clean_env)
+        self.assertNotIn("KIMI_TOKEN", clean_env)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            out_p = root / "probe.json"
+            r_to = run_readonly_probe([sys.executable, "-c", "import time; time.sleep(5)"], output_path=out_p, timeout_sec=0.2)
+            self.assertFalse(r_to["online"])
+            self.assertEqual(r_to["consecutive_failures"], 1)
+            r_ok = run_readonly_probe([sys.executable, "-c", 'print(\'{"host":"node-a","ok":true}\')'], output_path=out_p, timeout_sec=2.0)
+            self.assertTrue(r_ok["online"])
+            self.assertEqual(r_ok["consecutive_failures"], 0)
+            sym_p = root / "sym.json"
+            sym_p.symlink_to(out_p)
+            with self.assertRaises(ValueError):
+                run_readonly_probe([sys.executable, "-c", "print('{}')"], output_path=sym_p)
+
+            # 3) Zero-delete ledger curator: PIN preserved + whole-file SHA-256 snapshot + MANIFEST.tsv
+            ledger = root / "PROJECT_LEDGER.md"
+            entries = [f"## [2026-11-{day:02d}] Entry {day}\n\n" + ("detail " * 80) for day in range(20, 5, -1)]
+            ledger.write_text("# Ledger\n\n<!-- PIN -->\nPinned invariant\n<!-- /PIN -->\n\n" + "\n\n".join(entries) + "\n", encoding="utf-8")
+            orig_bytes = ledger.read_bytes()
+            dry = curate_ledger(ledger, max_bytes=2000, keep_entries=3, dry_run=True)
+            self.assertEqual(dry["action"], "DRY_RUN")
+            self.assertEqual(ledger.read_bytes(), orig_bytes)
+            cur = curate_ledger(ledger, max_bytes=2000, keep_entries=3, dry_run=False)
+            self.assertEqual(cur["action"], "CURATED")
+            self.assertLessEqual(cur["hot_bytes"], 2000)
+            self.assertIn("Pinned invariant", ledger.read_text(encoding="utf-8"))
+            snap_file = root / cur["snapshot"]
+            self.assertEqual(snap_file.read_bytes(), orig_bytes)
+            self.assertIn(cur["orig_sha256"], (root / "archive" / "MANIFEST.tsv").read_text(encoding="utf-8"))
+            for bad_l in ("", ".", "..", "/"):
+                with self.assertRaises(ValueError):
+                    curate_ledger(bad_l)
+
+            # 4) AST import bundler: traces local relative imports & rejects symlink/path escapes
+            pkg = root / "demo_repo" / "pkg"
+            pkg.mkdir(parents=True)
+            (pkg / "__init__.py").write_text("", encoding="utf-8")
+            (pkg / "helper.py").write_text("def val():\n    return 42\n", encoding="utf-8")
+            (pkg / "app.py").write_text("from .helper import val\nimport json\n", encoding="utf-8")
+            bundled = collect_ast_imports(["pkg/app.py"], repo_root=root / "demo_repo", max_depth=2)
+            self.assertTrue(bundled["ok"])
+            paths = {f["path"] for f in bundled["files"]}
+            self.assertEqual(paths, {"pkg/app.py", "pkg/helper.py"})
+            self.assertEqual(bundled["edges"], [{"from": "pkg/app.py", "to": "pkg/helper.py"}])
+
+            outside = root / "outside.py"
+            outside.write_text("x = 1\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                collect_ast_imports([str(outside)], repo_root=root / "demo_repo")
+
+            # 5) CLI smoke check on hud / curate / routine / bundle-ast
+            self.assertEqual(self.run_cli("hud", "--snapshot-json", json.dumps(hud_snap), "--width", "50").returncode, 0)
+            self.assertEqual(self.run_cli("curate", str(ledger), "--max-bytes", "999999").returncode, 0)
+            self.assertEqual(
+                self.run_cli("routine", "--output", str(out_p), "--", sys.executable, "-c", 'print(\'{"ok":true}\')').returncode,
+                0,
+            )
+            self.assertEqual(self.run_cli("bundle-ast", "--repo-root", str(root / "demo_repo"), "--entry", "pkg/app.py").returncode, 0)
 
 
 if __name__ == "__main__":

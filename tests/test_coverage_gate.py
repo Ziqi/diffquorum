@@ -29,6 +29,7 @@ TARGET_FILES = (
     (SRC_DIR / "diffquorum" / "blackboard.py").resolve(),
     (SRC_DIR / "diffquorum" / "governance.py").resolve(),
     (SRC_DIR / "diffquorum" / "wake_gates.py").resolve(),
+    (SRC_DIR / "diffquorum" / "ops.py").resolve(),
     (SRC_DIR / "diffquorum" / "cli.py").resolve(),
 )
 
@@ -60,6 +61,7 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     import diffquorum.blackboard as bb
     import diffquorum.cli as cli
     import diffquorum.governance as gov
+    import diffquorum.ops as ops
     import diffquorum.wake_gates as wg
 
     # 1. Init, TOML error branches, and board refresh / overflow branches
@@ -310,6 +312,77 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     wg.apply_wake_attempt(wstate, seat="lead", msg_id="m1", frame1_ok=True, frame2_ok=False, now_ts=1000.0)
     wg.apply_wake_attempt(wstate, seat="lead", msg_id="m1", frame1_ok=True, frame2_ok=True, now_ts=1040.0)
 
+    # 5b. Wave B wake_gates & ops coverage (narrow footer, deep-thinking busy, dual-state, TTL, approval scoping, HUD, curate, routine, AST bundler)
+    assert wg.is_idle_cli_footer("? for shortcuts") and wg.is_idle_cli_footer("auto · Gemini 4 ... · /tasks")
+    assert not wg.is_idle_cli_footer("") and not wg.is_idle_cli_footer("esc to cancel")
+    assert wg.is_pane_tail_busy("⡿ Thinking…") and not wg.is_pane_tail_busy("normal prose")
+    for kw in (
+        {"online": False},
+        {"online": True, "is_daemon": True},
+        {"online": True, "pane_busy": True, "copy_mode": True},
+        {"online": True, "awaiting_approve": True, "copy_mode": True},
+        {"online": True, "transcript_busy": True},
+        {"online": True, "copy_mode": True},
+        {"online": True},
+    ):
+        _ = wg.classify_seat_state(**kw)
+    assert not wg.evaluate_six_gates(dict(base_snap, item_kind="msg", item_age_sec=9000.0), now_ts=1000.0)["wake"]
+    assert wg.evaluate_six_gates(dict(base_snap, item_kind="ticket", item_age_sec=9000.0), now_ts=1000.0)["wake"]
+    assert not wg.evaluate_six_gates(dict(base_snap, item_kind="ticket", item_age_sec=90000.0), now_ts=1000.0)["wake"]
+    assert wg.is_explicit_approval_text("我都同意") and not wg.is_explicit_approval_text("我都同意？")
+    assert not wg.is_explicit_approval_text("") and not wg.is_explicit_approval_text("approve。但是先别改")
+    cov_seats = {"coord": ("coord", "00"), "builder": ("builder", "02"), "audit": ("audit", "99")}
+    assert not wg.revocation_applies_to_scope("99 不用管了", from_seat="coord", to_seat="builder", known_seats=cov_seats)
+    assert wg.revocation_applies_to_scope("99 和全部都不用管了", from_seat="coord", to_seat="builder", known_seats=cov_seats)
+    assert wg.revocation_applies_to_scope("不用执行了", from_seat="coord", to_seat="builder", known_seats=cov_seats)
+    assert not wg.revocation_applies_to_scope("一切正常", from_seat="coord", to_seat="builder", known_seats=cov_seats)
+
+    cov_hud_snap = {
+        "clock": "12:00:00",
+        "local_hw": "memF:30% dsk:50G",
+        "local_seats": [
+            {"short": "00-lead", "state": "IDLE", "tkt": 0, "size": "50x40"},
+            {"short": "01-work", "pane_busy": True, "copy_mode": True, "tkt": 1, "size": "80x55"},
+            {"short": "02-wait", "awaiting_approve": True, "copy_mode": True, "wait_sec": 3700, "snippet": "A very long approval plan snippet to exercise CJK width truncation 很长的中文计划标题", "tkt": 2, "size": "80x55"},
+            {"short": "03-run", "state": "WORKING", "tkt": 0, "size": "80x55"},
+            {"short": "04-off", "online": False, "tkt": 0, "size": "-"},
+        ],
+        "remote": {
+            "online": True, "rtt_ms": 15, "hw": "mem:40/96G",
+            "seats": [
+                {"short": "00-hub 总控", "awaiting_approve": True, "wait_sec": 45, "snippet": "Rem plan", "tkt": None, "size": "50x40"},
+                {"short": "04-gw", "is_daemon": True, "tkt": None, "size": "120x40"},
+            ],
+        },
+        "active_tasks": [
+            {"status": "IN_PROGRESS", "seat": "01", "num": "#01", "updated_ts": 10, "title": "【Tag】Active task"},
+            {"status": "PENDING", "seat": "02", "num": "#02", "updated_ts": 9, "title": "Pending task"},
+        ],
+    }
+    _ = ops.render_dual_hud(cov_hud_snap, width=50, color=True)
+    _ = ops.render_dual_hud({"local_seats": [], "remote": {"online": False, "error": "down"}}, width=50, color=False)
+    _ = ops.render_dual_hud({"local_seats": [], "remote": {}}, width=50, color=False)
+
+    cov_probe_out = temp_root / "cov_probe.json"
+    _ = ops.scrub_probe_env({"PATH": "/usr/bin", "API_KEY": "secret", "XDG_CACHE_HOME": "/tmp"})
+    ops.run_readonly_probe([sys.executable, "-c", "import sys; sys.exit(1)"], output_path=cov_probe_out, timeout_sec=1.0)
+    ops.run_readonly_probe([sys.executable, "-c", "import time; time.sleep(2)"], output_path=cov_probe_out, timeout_sec=0.15)
+    ops.run_readonly_probe([sys.executable, "-c", "print('[]')"], output_path=cov_probe_out, timeout_sec=1.0)
+    ops.run_readonly_probe([sys.executable, "-c", 'print(\'{"host":"h1"}\')'], output_path=cov_probe_out, timeout_sec=1.0)
+
+    cov_ledger = temp_root / "LEDGER.md"
+    cov_ledger.write_text("# L\n\n<!-- PIN -->\nKeep\n<!-- /PIN -->\n\n" + "\n\n".join(f"## 2026-11-{d:02d} E{d}\n" + ("word " * 70) for d in range(15, 5, -1)), encoding="utf-8")
+    ops.curate_ledger(cov_ledger, max_bytes=1200, keep_entries=3, dry_run=True)
+    ops.curate_ledger(cov_ledger, max_bytes=1200, keep_entries=3, dry_run=False)
+    ops.curate_ledger(cov_ledger, max_bytes=999999)
+
+    cov_ast_repo = temp_root / "ast_repo"
+    (cov_ast_repo / "pkg").mkdir(parents=True)
+    (cov_ast_repo / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (cov_ast_repo / "pkg" / "b.py").write_text("X = 1\n", encoding="utf-8")
+    (cov_ast_repo / "pkg" / "a.py").write_text("from . import b\nimport pkg.b\n", encoding="utf-8")
+    ops.collect_ast_imports(["pkg/a.py"], repo_root=cov_ast_repo, max_depth=2)
+
     # 6. Exercise CLI subcommands cleanly
     cli_ws = temp_root / "cli_ws"
     buf_out, buf_err = io.StringIO(), io.StringIO()
@@ -343,6 +416,11 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
             ["review", "--tree-hash", "deadbeef01", "--lint-text", "已完成任务"],
             ["review", "--tree-hash", "deadbeef01", "--pseudonymize-file", str(sample_file)],
             ["wake-check", "--snapshot-json", json.dumps(base_snap)],
+            ["hud", "--snapshot-json", json.dumps(cov_hud_snap), "--width", "50"],
+            ["curate", str(cov_ledger), "--max-bytes", "999999"],
+            ["routine", "--output", str(cov_probe_out), "--", sys.executable, "-c", 'print(\'{"host":"h1"}\')'],
+            ["bundle-ast", "--repo-root", str(cov_ast_repo), "--entry", "pkg/a.py"],
+            ["approve-check", "--text", "我都同意", "--later-text", "99 不用管了", "--from", "coord", "--to", "builder", "--seats-json", json.dumps(cov_seats)],
             ["archive", "--repo-root", str(mini_repo), "--verify"],
         ):
             assert cli.main(cmd_argv) == 0, f"CLI failed on {cmd_argv}"

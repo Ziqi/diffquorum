@@ -44,7 +44,8 @@ from .governance import (
     run_sanitize_lint,
     verify_model_identity,
 )
-from .wake_gates import evaluate_six_gates
+from .ops import collect_ast_imports, curate_ledger, render_dual_hud, run_readonly_probe
+from .wake_gates import evaluate_six_gates, is_explicit_approval_text, revocation_applies_to_scope
 
 
 def _out(obj: Any) -> None:
@@ -215,6 +216,37 @@ def main(argv: list[str] | None = None) -> int:
     p_ar.add_argument("--prefix", default="diffquorum")
     p_ar.add_argument("--verify", action="store_true")
     p_ar.add_argument("--verify-file", default="")
+
+    # 12. Wave B 0-Token operational primitives: hud, curate, routine, bundle-ast, approve-check
+    p_hud = sub.add_parser("hud", help="渲染纯只读 50 列窄屏双机统一战情看板", allow_abbrev=False)
+    p_hud.add_argument("--snapshot-json", default="")
+    p_hud.add_argument("--width", type=int, default=50)
+    p_hud.add_argument("--color", action="store_true")
+
+    p_cur = sub.add_parser("curate", help="零删除整文件 SHA-256 快照长账本折叠器", allow_abbrev=False)
+    p_cur.add_argument("ledger")
+    p_cur.add_argument("--max-bytes", type=int, default=15360)
+    p_cur.add_argument("--keep-entries", type=int, default=5)
+    p_cur.add_argument("--dry-run", action="store_true")
+
+    p_rtn = sub.add_parser("routine", help="剥离密钥的单向只读定时探针 (0-Token)", allow_abbrev=False)
+    p_rtn.add_argument("--output", required=True)
+    p_rtn.add_argument("--host-label", default="remote")
+    p_rtn.add_argument("--timeout", type=float, default=8.0)
+    p_rtn.add_argument("cmd_args", nargs=argparse.REMAINDER)
+
+    p_ast = sub.add_parser("bundle-ast", help="基于 Python AST 静态追踪本地依赖生成盲审文件清单", allow_abbrev=False)
+    p_ast.add_argument("--repo-root", default=".")
+    p_ast.add_argument("--entry", action="append", required=True)
+    p_ast.add_argument("--max-depth", type=int, default=2)
+    p_ast.add_argument("--max-files", type=int, default=32)
+
+    p_app = sub.add_parser("approve-check", help="Fail-Closed 审批短语与跨席撤回作用域核验", allow_abbrev=False)
+    p_app.add_argument("--text", required=True)
+    p_app.add_argument("--later-text", default="")
+    p_app.add_argument("--from", dest="from_seat", default="coord")
+    p_app.add_argument("--to", dest="to_seat", default="worker")
+    p_app.add_argument("--seats-json", default="")
 
     args = parser.parse_args(argv)
     try:
@@ -453,6 +485,63 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+
+        if args.cmd == "hud":
+            snap_raw = args.snapshot_json or sys.stdin.read()
+            snap = json.loads(snap_raw)
+            sys.stdout.write(render_dual_hud(snap, width=args.width, color=args.color))
+            return 0
+
+        if args.cmd == "curate":
+            _out(
+                curate_ledger(
+                    args.ledger,
+                    max_bytes=args.max_bytes,
+                    keep_entries=args.keep_entries,
+                    dry_run=args.dry_run,
+                )
+            )
+            return 0
+
+        if args.cmd == "routine":
+            cmd_argv = list(args.cmd_args)
+            if cmd_argv and cmd_argv[0] == "--":
+                cmd_argv = cmd_argv[1:]
+            res = run_readonly_probe(
+                cmd_argv,
+                output_path=pathlib.Path(args.output),
+                timeout_sec=args.timeout,
+                host_label=args.host_label,
+            )
+            _out(res)
+            return 0 if res.get("online") else 1
+
+        if args.cmd == "bundle-ast":
+            _out(
+                collect_ast_imports(
+                    args.entry,
+                    repo_root=args.repo_root,
+                    max_depth=args.max_depth,
+                    max_files=args.max_files,
+                )
+            )
+            return 0
+
+        if args.cmd == "approve-check":
+            approved = is_explicit_approval_text(args.text)
+            revoked = False
+            if args.later_text:
+                raw_seats = json.loads(args.seats_json) if args.seats_json else {}
+                known = {str(k): tuple(str(x) for x in v) for k, v in raw_seats.items()}
+                revoked = revocation_applies_to_scope(
+                    args.later_text,
+                    from_seat=args.from_seat,
+                    to_seat=args.to_seat,
+                    known_seats=known,
+                )
+            ok = approved and not revoked
+            _out({"ok": ok, "approved": approved, "revoked": revoked})
+            return 0 if ok else 2
     except Exception as exc:
         _out({"ok": False, "error": str(exc)})
         return 2

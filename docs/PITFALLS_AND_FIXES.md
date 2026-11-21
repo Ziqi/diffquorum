@@ -65,3 +65,43 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
 - **Root-cause fix (`quorum-blind` + `strip_terminal_escapes` + `WAITING_MODAL_RE`)**:
   - `quorum-blind` anonymizes Stage-2 submissions into `Peer A / Peer B / Peer C` (`blind_packet.md`) while keeping `reveal_map.json` local until scoring finishes.
   - `wake_gates.py` runs `strip_terminal_escapes()`, matches Unicode `…` spinners, and scans the bottom 10 lines for `WAITING_MODAL_RE` **before** allowing any idle prompt match (`WAITING_USER_ANSWER`).
+
+## 9. Mobile Narrow-Screen Status Bars & Deep-Thinking >30s False `IDLE` (`PF-018` / `PF-025`)
+
+- **What broke**:
+  1. On ~50–55 column mobile terminals, `? for shortcuts` was truncated from the left, leaving only `auto · Model ... · /tasks`, which caused idle-prompt gates to miss wakeups.
+  2. Fleet dashboards relying solely on `transcript.jsonl` mtime `< 30s` mislabeled agents deep-thinking for >30s as `IDLE` even while the live TUI footer clearly displayed `esc to cancel` and braille spinners (`⡿`).
+- **Root-cause fix (`is_idle_cli_footer` + `is_pane_tail_busy`)**:
+  - Recognize structured narrow-screen CLI footers while still rejecting busy markers and interactive modals.
+  - Inspect the last 8 non-empty stripped lines of active CLI panes (`capture-pane -p -S -8`) for live chrome (`esc to cancel`, `esc to interrupt`, braille spinners `U+2800..U+28FF`, or active status lines) without false-triggering on ordinary prose.
+
+## 10. Copy-Mode Masking `WAIT_APP` & Blocked Pending Tickets Expiring After 2h (`PF-021` / `PF-022`)
+
+- **What broke**:
+  1. When a pane was parked on an approval prompt AND scrolled into tmux `copy-mode`, mutually exclusive state labels hid `copy-mode` behind `WAIT_APP`.
+  2. Sharing a 2-hour wakeup TTL between transient chat messages and persistent `PENDING` tickets caused tickets blocked overnight by `copy-mode` or unsent prompt drafts to go permanently dormant once 2 hours elapsed.
+- **Root-cause fix (`classify_seat_state` + Decoupled Wake TTLs)**:
+  - Render strict 8-character compound states (`WAIT+CPY`, `WORK+CPY`) alongside `[CPY]` alert tags so mobile dashboards stay aligned at 50 columns without hiding lock causes.
+  - Decouple `MAX_MESSAGE_WAKE_AGE_SECONDS = 7200` (2h) from `MAX_TICKET_WAKE_AGE_SECONDS = 86400` (24h), preserving `MAX_WAKE_ATTEMPTS_PER_MSG = 2` and zero-cost skips while blocked by Gate 1–3.
+
+## 11. Secret-Scrubbed 0-Token Probes, Zero-Delete Ledger Folding & AST Blind Bundles (`PF-019` / `PF-020`)
+
+- **What broke**:
+  1. External CLI probes inheriting `*_API_KEY` / `*_TOKEN` or lacking `stdin=DEVNULL` + hard timeouts could stall agents or risk unintended paid calls.
+  2. Unbounded append-only ledgers grew past `100KB+`, inflating every session's cache reads, while naive cleanup scripts risked empty-path deletion (`Path(".")`).
+  3. Blind reviewers auditing a single modified file missed subtle bugs in local imported helpers.
+- **Root-cause fix (`ops.py`: `routine`, `curate`, `hud`, `bundle-ast`)**:
+  - `diffquorum routine` strips all secret/API-key env vars, enforces `stdin=DEVNULL` + strict timeout, and writes atomic `O_NOFOLLOW` `0600` JSON.
+  - `diffquorum curate` contains **zero delete/unlink code paths** (AST-enforced), writes a SHA-256 read-back-verified whole-file `.snapshot.txt` + append-only `MANIFEST.tsv`, and preserves `<!-- PIN -->` blocks plus newest entries under budget.
+  - `diffquorum hud` enforces zero `send-keys` / `switch-client` (eliminating mobile mis-taps), aligned dual-host tables, and auto-collapsing `[ACTIVE TASKS]` in `<=50` columns.
+  - `diffquorum bundle-ast` statically resolves local Python imports via `ast.parse()` (zero code execution, symlink/escape blocked) so blind reviewers receive complete context.
+
+## 12. Fail-Closed Spoken Approvals & Cross-Seat Revocation Scoping (`PF-023` / `PF-024`)
+
+- **What broke**:
+  1. Overly narrow English-only approval regexes missed unambiguous spoken confirmations, while global revocation regexes let a directive cancelling an unrelated seat (e.g., shelving seat `99`) falsely revoke an approved ticket targeting seat `02`.
+  2. Restarting multi-account CLI sessions without checking the active OS Keychain account risked cross-account quota bleed, and remote headless nodes without independent Wi-Fi self-healing could drop offline for hours.
+- **Root-cause fix (`is_explicit_approval_text` + `revocation_applies_to_scope` + Ops Guardrails)**:
+  - Keep approval matching strictly Fail-Closed (blocking questions, negations, conditionals, hedges, and follow-up restrictions).
+  - Evaluate later revocations clause-by-clause: **revoke by default** unless every revoking clause has zero global-scope words (`all`/`全部`/`其余`) AND explicitly names only unrelated seats (excluding unit-suffixed numbers like `99%`).
+  - Isolate remote node Wi-Fi recovery in a Keychain-backed root watchdog (zero plaintext passwords) and always verify the active OS Keychain account before cold-restarting cross-account agent seats.
