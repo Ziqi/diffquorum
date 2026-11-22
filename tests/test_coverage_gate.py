@@ -375,6 +375,9 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     ops.curate_ledger(cov_ledger, max_bytes=1200, keep_entries=3, dry_run=True)
     ops.curate_ledger(cov_ledger, max_bytes=1200, keep_entries=3, dry_run=False)
     ops.curate_ledger(cov_ledger, max_bytes=999999)
+    cov_tl = temp_root / "TIMELINE.md"
+    cov_tl.write_text("# Truth\n```markdown\n<!-- timeline -->\n```\n<!-- timeline -->\n\n" + "\n\n".join(f"## 2026-11-{d:02d} T{d}\n" + ("item " * 70) for d in range(15, 5, -1)), encoding="utf-8")
+    ops.curate_ledger(cov_tl, max_bytes=1200, keep_entries=2, dry_run=False)
 
     cov_ast_repo = temp_root / "ast_repo"
     (cov_ast_repo / "pkg").mkdir(parents=True)

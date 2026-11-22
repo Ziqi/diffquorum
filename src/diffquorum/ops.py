@@ -41,6 +41,8 @@ SAFE_ENV_ALLOW = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL",
 
 # --- Curator patterns (PF-020) ---
 PIN_BLOCK_RE = re.compile(r"<!--\s*PIN\s*-->.*?<!--\s*/PIN\s*-->", re.DOTALL)
+TIMELINE_LINE_RE = re.compile(r"^[ \t]*<!--\s*timeline\s*-->[ \t]*$", re.IGNORECASE)
+FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
 ENTRY_SPLIT_RE = re.compile(r"(?m)^(?=## `?\[?20\d{2}-)")
 TITLE_PREFIX_STRIP_RE = re.compile(r"^(?:\s*(?:【[^】]{1,42}】|\[[^\]]{1,42}\])\s*)+")
 
@@ -354,14 +356,43 @@ def _validate_ledger_path(raw: str | pathlib.Path) -> pathlib.Path:
     return p.resolve()
 
 
-def _split_ledger_parts(text: str) -> tuple[str, str, list[str]]:
+def _find_unfenced_timeline_split(text: str) -> tuple[str, str] | None:
+    """Splits on the first standalone `<!-- timeline -->` sentinel outside Markdown code fences."""
+    fence_char = ""
+    fence_len = 0
+    offset = 0
+    for raw_ln in text.splitlines(keepends=True):
+        m_f = FENCE_OPEN_RE.match(raw_ln)
+        if m_f:
+            tok = m_f.group(1)
+            if not fence_char:
+                fence_char, fence_len = tok[0], len(tok)
+            elif tok[0] == fence_char and len(tok) >= fence_len and raw_ln.strip() == tok:
+                fence_char, fence_len = "", 0
+        elif not fence_char and TIMELINE_LINE_RE.match(raw_ln.rstrip("\r\n")):
+            end_pos = offset + len(raw_ln)
+            return text[:end_pos].rstrip("\r\n"), text[end_pos:].lstrip("\r\n")
+        offset += len(raw_ln)
+    return None
+
+
+def _split_ledger_parts(text: str) -> tuple[str, str, list[str], bool]:
+    tl_split = _find_unfenced_timeline_split(text)
+    if tl_split is not None:
+        compiled_head, tail_raw = tl_split
+        m_first = ENTRY_SPLIT_RE.search(tail_raw)
+        if not m_first:
+            return compiled_head, "", [], True
+        entries = [c.strip() for c in ENTRY_SPLIT_RE.split(tail_raw[m_first.start() :]) if c.strip()]
+        return compiled_head, "", entries, True
+
     pin_m = PIN_BLOCK_RE.search(text)
     pin_block = pin_m.group(0).strip() if pin_m else ""
     body = PIN_BLOCK_RE.sub("", text, count=1) if pin_m else text
     chunks = ENTRY_SPLIT_RE.split(body)
     if len(chunks) <= 1:
-        return body.strip(), pin_block, []
-    return chunks[0].strip(), pin_block, [c.strip() for c in chunks[1:] if c.strip()]
+        return body.strip(), pin_block, [], False
+    return chunks[0].strip(), pin_block, [c.strip() for c in chunks[1:] if c.strip()], False
 
 
 def curate_ledger(
@@ -371,7 +402,7 @@ def curate_ledger(
     keep_entries: int = 5,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Zero-delete whole-file SHA-256 snapshot ledger folder preserving PIN block & newest entries (PF-020)."""
+    """Zero-delete whole-file SHA-256 snapshot ledger folder preserving Compiled Truth (`<!-- timeline -->`) or PIN block & newest entries (PF-020)."""
     target = _validate_ledger_path(ledger_path)
     orig_bytes = target.read_bytes()
     orig_sha = hashlib.sha256(orig_bytes).hexdigest()
@@ -387,7 +418,7 @@ def curate_ledger(
         }
 
     text = orig_bytes.decode("utf-8", errors="replace")
-    preamble, pin_block, entries = _split_ledger_parts(text)
+    preamble, pin_block, entries, has_timeline_sentinel = _split_ledger_parts(text)
     if not entries:
         raise ValueError("No dated `## 20YY-...` entries found; refusing lossy rewrite")
 
@@ -407,6 +438,7 @@ def curate_ledger(
     result: dict[str, Any] = {
         "ok": True,
         "action": "DRY_RUN" if dry_run else "CURATED",
+        "mode": "compiled_truth_timeline" if has_timeline_sentinel else "pin_or_header",
         "orig_bytes": orig_size,
         "hot_bytes": hot_bytes,
         "orig_sha256": orig_sha,

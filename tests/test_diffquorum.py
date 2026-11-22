@@ -1065,6 +1065,31 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
             snap_file = root / cur["snapshot"]
             self.assertEqual(snap_file.read_bytes(), orig_bytes)
             self.assertIn(cur["orig_sha256"], (root / "archive" / "MANIFEST.tsv").read_text(encoding="utf-8"))
+
+            # 3b) Compiled Truth + <!-- timeline --> split: upper truth preserved byte-for-byte (ignores fenced demo sentinel)
+            tl_ledger = root / "STATE_TIMELINE.md"
+            compiled_head = (
+                "# Project Compiled Truth\n\n"
+                "## [2026-11-22] Active Architecture State\n"
+                "| Claim | valid_from | valid_until |\n"
+                "| :--- | :--- | :--- |\n"
+                "| Pointer envelope <=400B | 2026-11-01 | null |\n\n"
+                "```markdown\n"
+                "<!-- timeline -->\n"
+                "```\n\n"
+                "<!-- timeline -->"
+            )
+            tl_orig = (compiled_head + "\n\n" + "\n\n".join(entries) + "\n").encode("utf-8")
+            tl_ledger.write_bytes(tl_orig)
+            tl_cur = curate_ledger(tl_ledger, max_bytes=2400, keep_entries=3, dry_run=False)
+            self.assertEqual(tl_cur["action"], "CURATED")
+            self.assertEqual(tl_cur["mode"], "compiled_truth_timeline")
+            tl_hot_txt = tl_ledger.read_text(encoding="utf-8")
+            self.assertTrue(tl_hot_txt.startswith(compiled_head + "\n\n> **Lossless Snapshot**:"))
+            self.assertIn("Entry 20", tl_hot_txt)
+            self.assertNotIn("Entry 6", tl_hot_txt)
+            self.assertEqual((root / tl_cur["snapshot"]).read_bytes(), tl_orig)
+
             for bad_l in ("", ".", "..", "/"):
                 with self.assertRaises(ValueError):
                     curate_ledger(bad_l)
