@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 import gzip
 import hashlib
 import hmac
@@ -15,6 +16,7 @@ import pathlib
 import random
 import re
 import tarfile
+import tokenize
 from typing import Any
 
 from .blackboard import (
@@ -71,6 +73,25 @@ ROBOTIC_JARGON_PATTERNS: tuple[tuple[str, str], ...] = (
 
 DEFAULT_CLEAN_PLACEHOLDER_USERS = frozenset({"example", "user", "dev", "tester", "demo"})
 DEFAULT_FORBID_ENV_KEYS = ("DIFFQUORUM_FORBID_WORDS", "STARCOUNCIL_FORBID_WORDS")
+
+OBJECTIVE_BLOCKER_CLASSES: tuple[str, ...] = (
+    "install_or_packaging",
+    "test_or_runtime_or_security",
+    "ci_workflow",
+    "doc_truth_or_secret_leak",
+)
+DEFAULT_FORBIDDEN_TEST_CODENAMES: tuple[str, ...] = ("kimi", "opus", "grok", "egm")
+_REL_SEMVER_RE = re.compile(r"^v?(\d+\.\d+\.\d+(?:\.(?:dev|post)\d+|(?:a|b|rc)\d+)?)$")
+_REL_PYPROJ_VER_RE = re.compile(r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']\s*$')
+_REL_CFF_VER_RE = re.compile(r'(?m)^version:\s*["\']?([^"\'\s#]+)["\']?\s*$')
+_REL_INIT_VER_RE = re.compile(r'(?m)^\s*__version__\s*=\s*["\']([^"\']+)["\']\s*$')
+_REL_WF_VER_RE = re.compile(r'(?:--version\s+|RELEASE_VERSION\s*[:=]\s*)["\']?v?(\d+\.\d+\.\d+)["\']?(?![.\d])')
+_REL_PKGINFO_UNK_RE = re.compile(r"(?m)^(?:Name|Version|Summary|Home-page|Author|License):\s*UNKNOWN\s*$")
+_REL_PKGINFO_VER_RE = re.compile(r"(?m)^Version:\s*(\S+)\s*$")
+_WALL_CLOCK_NAMES = frozenset(
+    {"elapsed", "elapsed_s", "elapsed_sec", "dt", "dt_s", "dur", "duration", "took", "wall", "wall_s", "latency", "latency_s"}
+)
+_WALL_CLOCK_ATTRS = frozenset({"monotonic", "perf_counter", "process_time", "time"})
 
 RUNNER_PRESETS: dict[str, dict[str, Any]] = {
     "agy-hydrogen": {
@@ -648,6 +669,7 @@ def evaluate_review_gate(
     rule_version: str = "1",
     round_num: int = 1,
     blockers: list[str] | None = None,
+    blocker_classes: list[str] | None = None,
     nits_only: bool = False,
     external_status: str = "ok",
     requires_local_sampling: bool = False,
@@ -659,7 +681,19 @@ def evaluate_review_gate(
     if isinstance(round_num, bool) or not isinstance(round_num, int) or round_num < 1:
         raise ValueError(f"Invalid round_num: {round_num!r} (must be integer >= 1)")
 
-    blocker_list = [b.strip() for b in (blockers or []) if b.strip()]
+    raw_blockers = [b.strip() for b in (blockers or []) if b.strip()]
+    demoted_notes: list[str] = []
+    if blocker_classes is not None and raw_blockers:
+        objective_only: list[str] = []
+        for idx, b_txt in enumerate(raw_blockers):
+            cls_name = blocker_classes[idx].strip().lower() if idx < len(blocker_classes) else ""
+            if cls_name in OBJECTIVE_BLOCKER_CLASSES:
+                objective_only.append(b_txt)
+            else:
+                demoted_notes.append(f"[{cls_name or 'subjective'}] {b_txt}")
+        blocker_list = objective_only
+    else:
+        blocker_list = raw_blockers
     recent = read_recent_pitfalls(root)
 
     if level == 0:
@@ -799,6 +833,7 @@ def evaluate_review_gate(
         "round": round_num,
         "max_rounds": max_rounds,
         "blocked": False,
+        "non_blocking_notes": demoted_notes,
         "recent_pitfalls": recent,
         "summary": format_plain_3line("本轮核查全部通过（0 个阻塞缺陷）", f"内容指纹 `{content_tree_hash[:12]}` 已达成零缺陷闭环", "无"),
     }
@@ -1018,3 +1053,141 @@ def run_archive(
         return {"ok": True, "output": str(out_path), "sha256": sha_a, "files": file_count, "verified": verify}
 
     return {"ok": True, "sha256": sha_a, "files": file_count, "verified": verify}
+
+
+def _expr_uses_wall_clock(expr: ast.AST) -> bool:
+    for sub in ast.walk(expr):
+        if isinstance(sub, ast.Name) and sub.id.lower() in _WALL_CLOCK_NAMES:
+            return True
+        if isinstance(sub, ast.Attribute) and sub.attr.lower() in _WALL_CLOCK_ATTRS:
+            return True
+    return False
+
+
+def _narrow_clock_bound(node: ast.AST, min_sec: float) -> float | None:
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
+        op, rhs = node.ops[0], node.comparators[0]
+        if (
+            isinstance(op, (ast.Lt, ast.LtE))
+            and _expr_uses_wall_clock(node.left)
+            and isinstance(rhs, ast.Constant)
+            and isinstance(rhs.value, (int, float))
+            and not isinstance(rhs.value, bool)
+            and 0 < float(rhs.value) < min_sec
+        ):
+            return float(rhs.value)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("assertLess", "assertLessEqual")
+        and len(node.args) >= 2
+        and _expr_uses_wall_clock(node.args[0])
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[1].value, (int, float))
+        and not isinstance(node.args[1].value, bool)
+        and 0 < float(node.args[1].value) < min_sec
+    ):
+        return float(node.args[1].value)
+    return None
+
+
+def run_release_preflight(
+    repo_root: pathlib.Path,
+    *,
+    expected_version: str = "",
+    min_clock_assert_sec: float = 0.5,
+    forbidden_test_codenames: tuple[str, ...] = DEFAULT_FORBIDDEN_TEST_CODENAMES,
+    sdist_tar: pathlib.Path | None = None,
+) -> dict[str, Any]:
+    """Static 0-Token release preflight: cross-file version alignment, PKG-INFO/sdist closure & test hygiene."""
+    issues: list[str] = []
+    m_sem = _REL_SEMVER_RE.match((expected_version or "").strip())
+    norm_ver = m_sem.group(1) if m_sem else ""
+
+    pyproj = repo_root / "pyproject.toml"
+    pyproj_txt = pyproj.read_text(encoding="utf-8") if pyproj.is_file() else ""
+    if pyproj_txt:
+        m_pv = _REL_PYPROJ_VER_RE.search(pyproj_txt)
+        if m_pv:
+            pv = m_pv.group(1).lstrip("v")
+            if not norm_ver:
+                norm_ver = pv
+            elif pv != norm_ver:
+                issues.append(f"pyproject.toml: version={pv!r} != expected {norm_ver!r}")
+
+    if norm_ver:
+        cff = repo_root / "CITATION.cff"
+        if cff.is_file():
+            m_cff = _REL_CFF_VER_RE.search(cff.read_text(encoding="utf-8"))
+            if not m_cff or m_cff.group(1).lstrip("v") != norm_ver:
+                issues.append(f"CITATION.cff: version={(m_cff.group(1) if m_cff else '<missing>')!r} != expected {norm_ver!r}")
+
+        src_dir = repo_root / "src"
+        if src_dir.is_dir():
+            for child in sorted(src_dir.iterdir()):
+                init_fp = child / "__init__.py"
+                if child.is_dir() and init_fp.is_file():
+                    m_iv = _REL_INIT_VER_RE.search(init_fp.read_text(encoding="utf-8"))
+                    if m_iv and m_iv.group(1).lstrip("v") != norm_ver:
+                        issues.append(f"{init_fp.relative_to(repo_root)}: __version__={m_iv.group(1)!r} != expected {norm_ver!r}")
+
+        wf_dir = repo_root / ".github" / "workflows"
+        if wf_dir.is_dir():
+            for wf in sorted(wf_dir.iterdir()):
+                if wf.suffix in {".yml", ".yaml"} and wf.is_file():
+                    for lineno, ln in enumerate(wf.read_text(encoding="utf-8").splitlines(), start=1):
+                        for m_wv in _REL_WF_VER_RE.finditer(ln):
+                            if m_wv.group(1) != norm_ver:
+                                issues.append(f".github/workflows/{wf.name}:{lineno}: hardcoded version {m_wv.group(1)!r} != {norm_ver!r}")
+
+    clean_tokens = [re.escape(t.strip()) for t in forbidden_test_codenames if t.strip()]
+    ident_re = re.compile(rf"(?:^|_)(?:{'|'.join(clean_tokens)})(?:_|$|[0-9])", re.IGNORECASE) if clean_tokens else None
+    cmt_re = re.compile(rf"\b(?:{'|'.join(clean_tokens)})\b", re.IGNORECASE) if clean_tokens else None
+
+    tests_dir = repo_root / "tests"
+    tests_need_samples = False
+    if tests_dir.is_dir():
+        for r_t, dirs_t, files_t in os.walk(tests_dir, followlinks=False):
+            dirs_t[:] = [d for d in dirs_t if d != "__pycache__"]
+            for fn_t in sorted(files_t):
+                if not fn_t.endswith(".py"):
+                    continue
+                tfp = pathlib.Path(r_t) / fn_t
+                rel_tf = tfp.relative_to(repo_root).as_posix()
+                src_t = tfp.read_text(encoding="utf-8")
+                if re.search(r'["\']samples/|/\s*["\']samples["\']', src_t):
+                    tests_need_samples = True
+                tree_t = ast.parse(src_t, filename=str(tfp))
+                for node in ast.walk(tree_t):
+                    if ident_re and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        if ident_re.search(node.name):
+                            issues.append(f"{rel_tf}:{node.lineno}: test identifier {node.name!r} leaks reviewer codename")
+                    bound = _narrow_clock_bound(node, min_clock_assert_sec)
+                    if bound is not None:
+                        issues.append(f"{rel_tf}:{getattr(node, 'lineno', 0)}: narrow wall-clock bound (<{bound}s < {min_clock_assert_sec}s)")
+                if cmt_re:
+                    for tok in tokenize.generate_tokens(io.StringIO(src_t).readline):
+                        if tok.type == tokenize.COMMENT and cmt_re.search(tok.string):
+                            issues.append(f"{rel_tf}:{tok.start[0]}: test comment leaks reviewer codename")
+
+    if pyproj_txt and (repo_root / "samples").is_dir() and tests_need_samples and sdist_tar is None:
+        manifest_txt = (repo_root / "MANIFEST.in").read_text(encoding="utf-8") if (repo_root / "MANIFEST.in").is_file() else ""
+        if "samples" not in manifest_txt and "samples" not in pyproj_txt:
+            issues.append("MANIFEST.in/pyproject.toml: tests reference 'samples/' but manifest omits 'samples/'")
+
+    if sdist_tar is not None:
+        with tarfile.open(sdist_tar, "r:*") as tf_arc:
+            pkg_members = [m for m in tf_arc.getmembers() if m.name.endswith("/PKG-INFO") or m.name == "PKG-INFO"]
+            if not pkg_members:
+                issues.append(f"sdist ({sdist_tar.name}): missing PKG-INFO")
+            else:
+                f_pkg = tf_arc.extractfile(pkg_members[0])
+                pkg_txt = f_pkg.read().decode("utf-8", errors="replace") if f_pkg else ""
+                if _REL_PKGINFO_UNK_RE.search(pkg_txt):
+                    issues.append(f"sdist ({sdist_tar.name}): PKG-INFO contains UNKNOWN metadata")
+                if norm_ver:
+                    m_pv = _REL_PKGINFO_VER_RE.search(pkg_txt)
+                    if not m_pv or m_pv.group(1).lstrip("v") != norm_ver:
+                        issues.append(f"sdist ({sdist_tar.name}): PKG-INFO Version mismatch vs {norm_ver!r}")
+
+    return {"ok": len(issues) == 0, "version": norm_ver, "issue_count": len(issues), "issues": issues}

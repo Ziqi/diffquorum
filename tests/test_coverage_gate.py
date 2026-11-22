@@ -386,6 +386,40 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     (cov_ast_repo / "pkg" / "a.py").write_text("from . import b\nimport pkg.b\n", encoding="utf-8")
     ops.collect_ast_imports(["pkg/a.py"], repo_root=cov_ast_repo, max_depth=2)
 
+    # 5b. Release preflight & objective blocker class convergence
+    gov.evaluate_review_gate(
+        ws,
+        level=2,
+        content_tree_hash="covhash01",
+        round_num=1,
+        blockers=["Style preference", "Missing PKG-INFO"],
+        blocker_classes=["prose_style", "install_or_packaging"],
+    )
+    gov.run_release_preflight(REPO_ROOT)
+    cov_rel_bad = temp_root / "rel_bad"
+    (cov_rel_bad / "src" / "p").mkdir(parents=True)
+    (cov_rel_bad / ".github" / "workflows").mkdir(parents=True)
+    (cov_rel_bad / "tests").mkdir(parents=True)
+    (cov_rel_bad / "samples").mkdir(parents=True)
+    (cov_rel_bad / "pyproject.toml").write_text('version = "0.1.0"\n', encoding="utf-8")
+    (cov_rel_bad / "CITATION.cff").write_text("version: 0.1.0\n", encoding="utf-8")
+    (cov_rel_bad / "src" / "p" / "__init__.py").write_text('__version__ = "0.1.0"\n', encoding="utf-8")
+    (cov_rel_bad / ".github" / "workflows" / "w.yml").write_text("run: x --version 0.1.0\n", encoding="utf-8")
+    rev_tok = "ki" + "mi"
+    (cov_rel_bad / "tests" / "test_x.py").write_text(
+        f"# {rev_tok}\ndef test_{rev_tok}(self):\n    x = 'samples/a'\n    self.assertLess(dt.monotonic(), 0.2)\n    assert elapsed < 0.2\n",
+        encoding="utf-8",
+    )
+    gov.run_release_preflight(cov_rel_bad, expected_version="0.2.0")
+    import tarfile as _tf
+    cov_sdist = temp_root / "bad.tar.gz"
+    with _tf.open(cov_sdist, "w:gz") as _t:
+        _b = b"Metadata-Version: 2.1\nName: UNKNOWN\nVersion: 0.1.0\n"
+        _ti = _tf.TarInfo("p-0.2.0/PKG-INFO")
+        _ti.size = len(_b)
+        _t.addfile(_ti, io.BytesIO(_b))
+    gov.run_release_preflight(cov_rel_bad, expected_version="0.2.0", sdist_tar=cov_sdist)
+
     # 6. Exercise CLI subcommands cleanly
     cli_ws = temp_root / "cli_ws"
     buf_out, buf_err = io.StringIO(), io.StringIO()
@@ -424,6 +458,8 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
             ["routine", "--output", str(cov_probe_out), "--", sys.executable, "-c", 'print(\'{"host":"h1"}\')'],
             ["bundle-ast", "--repo-root", str(cov_ast_repo), "--entry", "pkg/a.py"],
             ["approve-check", "--text", "我都同意", "--later-text", "99 不用管了", "--from", "coord", "--to", "builder", "--seats-json", json.dumps(cov_seats)],
+            ["release-preflight", "--repo-root", str(REPO_ROOT)],
+            ["review", "--root", str(cli_ws), "--level", "2", "--tree-hash", "deadbeef02", "--blocker", "Tone nit", "--blocker-class", "style"],
             ["archive", "--repo-root", str(mini_repo), "--verify"],
         ):
             assert cli.main(cmd_argv) == 0, f"CLI failed on {cmd_argv}"

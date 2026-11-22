@@ -52,6 +52,7 @@ from diffquorum.governance import (  # noqa: E402
     quorum_verify,
     render_council_workflow,
     run_doctor,
+    run_release_preflight,
     run_sanitize_lint,
     verify_model_identity,
 )
@@ -1119,6 +1120,92 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
                 0,
             )
             self.assertEqual(self.run_cli("bundle-ast", "--repo-root", str(root / "demo_repo"), "--entry", "pkg/app.py").returncode, 0)
+
+    def test_21_release_preflight_and_objective_blocker_convergence(self) -> None:
+        import io
+        import tarfile
+
+        import diffquorum
+
+        # 1) DiffQuorum repo itself passes release-preflight cleanly
+        self_rep = run_release_preflight(PKG_ROOT, expected_version=diffquorum.__version__)
+        self.assertTrue(self_rep["ok"], self_rep["issues"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            init_workspace(root / "ws")
+
+            # 2) Subjective style / wishlist findings demoted to non_blocking_notes -> PASS
+            r_demote = evaluate_review_gate(
+                root / "ws",
+                level=2,
+                content_tree_hash="abc123456789",
+                round_num=1,
+                blockers=["Prefer punchier intro tone", "Add optional graph export plugin"],
+                blocker_classes=["prose_style", "scope_wishlist"],
+            )
+            self.assertEqual(r_demote["status"], "PASS")
+            self.assertFalse(r_demote["blocked"])
+            self.assertEqual(len(r_demote["non_blocking_notes"]), 2)
+
+            # Objective defect class continues to block cleanly
+            r_obj = evaluate_review_gate(
+                root / "ws",
+                level=2,
+                content_tree_hash="abc123456789",
+                round_num=1,
+                blockers=["sdist omits sample fixture", "Optional wording tweak"],
+                blocker_classes=["install_or_packaging", "prose_style"],
+            )
+            self.assertEqual(r_obj["status"], "FIX_DEFECT_FAMILY")
+            self.assertTrue(r_obj["blocked"])
+            self.assertEqual(r_obj["blockers"], ["sdist omits sample fixture"])
+
+            # 3) Synthetic repo with version mismatch, narrow clock assertion, reviewer codename & UNKNOWN PKG-INFO
+            bad_repo = root / "bad_repo"
+            (bad_repo / "src" / "demo").mkdir(parents=True)
+            (bad_repo / ".github" / "workflows").mkdir(parents=True)
+            (bad_repo / "tests").mkdir(parents=True)
+            (bad_repo / "samples").mkdir(parents=True)
+            (bad_repo / "samples" / "case.json").write_text("{}", encoding="utf-8")
+            (bad_repo / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0.3.8"\n', encoding="utf-8")
+            (bad_repo / "CITATION.cff").write_text("cff-version: 1.2.0\nversion: 0.3.8\n", encoding="utf-8")
+            (bad_repo / "src" / "demo" / "__init__.py").write_text('__version__ = "0.3.8"\n', encoding="utf-8")
+            (bad_repo / ".github" / "workflows" / "ci.yml").write_text("run: gen-sbom --version 0.3.8\n", encoding="utf-8")
+            tok_reviewer = "ki" + "mi"
+            (bad_repo / "tests" / "test_app.py").write_text(
+                f"# Regression from {tok_reviewer} round 2\n"
+                f"def test_{tok_reviewer}_round(self):\n"
+                "    p = 'samples/case.json'\n"
+                "    assert elapsed < 0.2\n",
+                encoding="utf-8",
+            )
+            rep_bad = run_release_preflight(bad_repo, expected_version="0.3.9")
+            self.assertFalse(rep_bad["ok"])
+            joined = "\n".join(rep_bad["issues"])
+            self.assertIn("pyproject.toml", joined)
+            self.assertIn("CITATION.cff", joined)
+            self.assertIn("__init__.py", joined)
+            self.assertIn("ci.yml", joined)
+            self.assertIn("narrow wall-clock", joined)
+            self.assertIn("test identifier", joined)
+            self.assertIn("test comment", joined)
+            self.assertIn("MANIFEST.in", joined)
+
+            sdist_bad = root / "demo-0.3.9.tar.gz"
+            with tarfile.open(sdist_bad, "w:gz") as tf:
+                pkg_bytes = b"Metadata-Version: 2.1\nName: UNKNOWN\nVersion: 0.3.8\n"
+                ti = tarfile.TarInfo("demo-0.3.9/PKG-INFO")
+                ti.size = len(pkg_bytes)
+                tf.addfile(ti, io.BytesIO(pkg_bytes))
+            rep_sdist = run_release_preflight(bad_repo, expected_version="0.3.9", sdist_tar=sdist_bad)
+            self.assertIn("UNKNOWN", "\n".join(rep_sdist["issues"]))
+
+            self.assertEqual(
+                self.run_cli("release-preflight", "--repo-root", str(PKG_ROOT), "--expected-version", diffquorum.__version__).returncode,
+                0,
+            )
+            self.assertEqual(self.run_cli("release-preflight", "--repo-root", str(bad_repo), "--expected-version", "0.3.9", check=False).returncode, 2)
 
 
 if __name__ == "__main__":

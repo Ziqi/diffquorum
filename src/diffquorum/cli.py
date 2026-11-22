@@ -41,6 +41,7 @@ from .governance import (
     render_council_workflow,
     run_archive,
     run_doctor,
+    run_release_preflight,
     run_sanitize_lint,
     verify_model_identity,
 )
@@ -198,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rv.add_argument("--rule-version", default="1")
     p_rv.add_argument("--round", dest="round_num", type=int, default=1)
     p_rv.add_argument("--blocker", action="append", default=[])
+    p_rv.add_argument("--blocker-class", dest="blocker_class", action="append", default=[])
     p_rv.add_argument("--nits-only", action="store_true")
     p_rv.add_argument("--external-status", default="ok")
     p_rv.add_argument("--requires-local-sampling", action="store_true")
@@ -247,6 +249,11 @@ def main(argv: list[str] | None = None) -> int:
     p_app.add_argument("--from", dest="from_seat", default="coord")
     p_app.add_argument("--to", dest="to_seat", default="worker")
     p_app.add_argument("--seats-json", default="")
+
+    p_rpf = sub.add_parser("release-preflight", help="发版前 0-Token 跨文件版本号、sdist PKG-INFO 与单测卫生检查", allow_abbrev=False)
+    p_rpf.add_argument("--repo-root", default=".")
+    p_rpf.add_argument("--expected-version", default="")
+    p_rpf.add_argument("--sdist-tar", default="")
 
     args = parser.parse_args(argv)
     try:
@@ -459,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
                 rule_version=args.rule_version,
                 round_num=args.round_num,
                 blockers=args.blocker,
+                blocker_classes=args.blocker_class if args.blocker_class else None,
                 nits_only=args.nits_only,
                 external_status=args.external_status,
                 requires_local_sampling=args.requires_local_sampling,
@@ -542,6 +550,16 @@ def main(argv: list[str] | None = None) -> int:
             ok = approved and not revoked
             _out({"ok": ok, "approved": approved, "revoked": revoked})
             return 0 if ok else 2
+
+        if args.cmd == "release-preflight":
+            s_tar = pathlib.Path(args.sdist_tar).resolve() if args.sdist_tar else None
+            rep = run_release_preflight(
+                pathlib.Path(args.repo_root).resolve(),
+                expected_version=args.expected_version,
+                sdist_tar=s_tar,
+            )
+            _out(rep)
+            return 0 if rep["ok"] else 2
     except Exception as exc:
         _out({"ok": False, "error": str(exc)})
         return 2
