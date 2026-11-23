@@ -1207,6 +1207,28 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
             )
             self.assertEqual(self.run_cli("release-preflight", "--repo-root", str(bad_repo), "--expected-version", "0.3.9", check=False).returncode, 2)
 
+    def test_cold_interrupted_error_message_recovery(self) -> None:
+        from diffquorum.wake_gates import evaluate_six_gates
+        base = {
+            "msg_text": "TKT-20261124-001 ready",
+            "msg_status": "PENDING",
+            "pane_in_mode": 0,
+            "pane_fg": "agy",
+            "client_activity_ts": 100.0,
+            "capture_lines": [">   Ask anything..."],
+            "cursor_x": 2,
+            "transcript_last_type": "ERROR_MESSAGE",
+            "transcript_last_status": "DONE",
+            "transcript_has_tool_calls": False,
+            "running_tasks": [],
+        }
+        fresh = evaluate_six_gates({**base, "transcript_mtime_ts": 190.0}, now_ts=200.0)
+        self.assertFalse(fresh["wake"])
+        self.assertEqual(fresh["reason"], "TRANSCRIPT_NOT_IDLE")
+        settled = evaluate_six_gates({**base, "transcript_mtime_ts": 150.0}, now_ts=200.0)
+        self.assertTrue(settled["wake"])
+        self.assertEqual(settled["gate"], "all_6_passed")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ RATE_LIMIT_MAX_WAKES = 2
 RETRY_COOLDOWN_SECONDS = 30.0
 MAX_MESSAGE_WAKE_AGE_SECONDS = 7200.0   # PF-021: 2h cap for plain chat messages
 MAX_TICKET_WAKE_AGE_SECONDS = 86400.0   # PF-021: 24h cap for blocked PENDING tickets
+COLD_INTERRUPTED_QUIESCENCE_SECONDS = 30.0
 
 SILENT_FIRST_LINE_PREFIXES = ("【TERMINAL-ACK】", "【INFO-SYNC")
 SUPPORTED_AGENT_COMMANDS = frozenset({"agy", "antigravity", "claude", "codex", "opencode"})
@@ -318,6 +319,23 @@ def _has_active_foreground_tasks(tasks: list[dict[str, Any]]) -> bool:
     return False
 
 
+def is_cold_interrupted_idle(
+    last_type: str,
+    last_status: str,
+    transcript_age_sec: float | None,
+) -> bool:
+    """Allows safe auto-recovery when a stream disconnect (`ERROR_MESSAGE`) or cold restart settles >=30s."""
+    if transcript_age_sec is None or float(transcript_age_sec) < COLD_INTERRUPTED_QUIESCENCE_SECONDS:
+        return False
+    t_up = str(last_type or "").strip().upper()
+    s_up = str(last_status or "").strip().upper()
+    if s_up in ("CANCELED", "CANCELLED", "INTERRUPTED", "ABORTED", "ERROR", "FAILED"):
+        return True
+    if t_up in ("GENERIC", "USER_INPUT", "SYSTEM_MESSAGE", "ERROR_MESSAGE") and s_up == "DONE":
+        return True
+    return False
+
+
 def evaluate_six_gates(snapshot: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
     """Evaluates all 6 fail-closed wakeup safety gates against a pane + transcript snapshot."""
     now_ep = time.time() if now_ts is None else float(now_ts)
@@ -361,12 +379,17 @@ def evaluate_six_gates(snapshot: dict[str, Any], now_ts: float | None = None) ->
     if not is_bare_idle_prompt(cap_lines, cursor_x=int(cx) if cx is not None else None):
         return {"wake": False, "gate": "gate3", "reason": "PROMPT_BUSY_OR_MISSING"}
 
-    # Gate 4: Transcript last step idle PLANNER_RESPONSE (no tool calls) & no non-daemon tasks
-    if (
-        str(snapshot.get("transcript_last_type") or "") != "PLANNER_RESPONSE"
-        or str(snapshot.get("transcript_last_status") or "") != "DONE"
-        or bool(snapshot.get("transcript_has_tool_calls"))
-    ):
+    # Gate 4: Transcript last step idle PLANNER_RESPONSE (or quiescent interrupted/ERROR_MESSAGE) & no non-daemon tasks
+    last_type = str(snapshot.get("transcript_last_type") or "")
+    last_status = str(snapshot.get("transcript_last_status") or "")
+    tx_mtime_val = snapshot.get("transcript_mtime_ts")
+    tx_age = (now_ep - float(tx_mtime_val)) if tx_mtime_val is not None else snapshot.get("transcript_age_sec")
+    normal_idle = (
+        last_type == "PLANNER_RESPONSE"
+        and last_status == "DONE"
+        and not bool(snapshot.get("transcript_has_tool_calls"))
+    )
+    if not normal_idle and not is_cold_interrupted_idle(last_type, last_status, tx_age):
         return {"wake": False, "gate": "gate4", "reason": "TRANSCRIPT_NOT_IDLE"}
     if _has_active_foreground_tasks(list(snapshot.get("running_tasks") or [])):
         return {"wake": False, "gate": "gate4", "reason": "NON_DAEMON_TASK_RUNNING"}

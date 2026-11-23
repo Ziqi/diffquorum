@@ -8,9 +8,9 @@ from __future__ import annotations
 import pathlib
 import sys
 
-SRC_DIR = pathlib.Path(__file__).resolve().parents[1] / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+SCRIPT_DIR = str(pathlib.Path(__file__).resolve().parent)
+SRC_DIR = str(pathlib.Path(__file__).resolve().parents[1] / "src")
+sys.path[:] = [SRC_DIR] + [p for p in sys.path if p not in (SCRIPT_DIR, SRC_DIR)]
 
 from diffquorum.cli import main  # noqa: E402
 
