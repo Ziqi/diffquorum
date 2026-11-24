@@ -105,3 +105,9 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
   - Keep approval matching strictly Fail-Closed (blocking questions, negations, conditionals, hedges, and follow-up restrictions).
   - Evaluate later revocations clause-by-clause: **revoke by default** unless every revoking clause has zero global-scope words (`all`/`全部`/`其余`) AND explicitly names only unrelated seats (excluding unit-suffixed numbers like `99%`).
   - Isolate remote node Wi-Fi recovery in a Keychain-backed root watchdog (zero plaintext passwords) and always verify the active OS Keychain account before cold-restarting cross-account agent seats.
+
+## Wave C Operational Safeguards (`v0.3.0-dev`)
+
+- **Pending-Plan Collision Lock (`diffquorum plan`)**: Prevents competing approval drafts on the same logical `scope` via an atomic `0600` + `flock` ledger (`WAITING_APPROVE` -> `APPROVED | SUPERSEDED | CANCELLED`).
+- **Leading-Prefix Silent Tags & Orthogonal `REPORT-NO-REPLY`**: Matches `TERMINAL-ACK` / `INFO-SYNC` strictly at the start of the first non-empty line (never mid-sentence), exempts `P0` emergencies from silence, and caps `REPORT-NO-REPLY` handoffs at a single wakeup while guaranteeing terminal ticket (`WAITING_REVIEW | DONE | BLOCKED`) receipt delivery.
+- **Anti-Stall Mobile & Daemon Hardening**: Recognizes ultra-narrow mobile status footers (`⏵⏵ auto mode`, `? for short…`), string/bool `isDaemon` tasks, bounded `P0/P1` ticket backoff `(30s, 60s, 180s)`, stale `copy-mode` auto-exit (`>=180s` idle on unprotected sessions), and multi-sentence trailing approvals.

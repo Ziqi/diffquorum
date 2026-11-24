@@ -597,3 +597,133 @@ def collect_ast_imports(
         "files": ordered_files,
         "edges": [{"from": a, "to": b} for a, b in unique_edges],
     }
+
+
+# --- v0.3 Wave C: Read-Only Q&A Directory, 0600 Meeting Ledger & 2-Cap Alert Latch ---
+SELF_CHECK_NOISE_RE = re.compile(
+    r"(?:^\[BUS-WAKE\]$|\bportfolio-doctor\.py\b|\bstar-bus\s+(?:inbox|plan\s+list)\b|\bair-bus\s+inbox\b)",
+    re.IGNORECASE,
+)
+
+
+def summarize_qa_directory(
+    seat_records: list[dict[str, Any]],
+    *,
+    max_chars: int = 80,
+) -> list[dict[str, str]]:
+    """Builds a 1-line-per-seat read-only Q&A summary while skipping `[BUS-WAKE]` & self-check noise."""
+    out: list[dict[str, str]] = []
+    cap = max(24, int(max_chars))
+    for rec in seat_records:
+        seat = str(rec.get("seat") or "").strip()
+        if not seat:
+            continue
+        last_q = ""
+        for cand in reversed(list(rec.get("user_inputs") or [])):
+            txt = " ".join(str(cand or "").split())
+            if txt and not SELF_CHECK_NOISE_RE.search(txt):
+                last_q = _trunc(txt, cap)
+                break
+        last_a = _trunc(" ".join(str(rec.get("last_reply") or "").split()), cap)
+        out.append({"seat": seat, "last_question": last_q or "(none)", "last_answer": last_a or "(none)"})
+    return out
+
+
+def record_meeting(
+    ledger_path: str | pathlib.Path,
+    *,
+    title: str,
+    topic: str,
+    participants: list[str],
+    decision: str,
+    status: str = "CLOSED",
+) -> dict[str, Any]:
+    """Appends a structured meeting entry to an atomic `0600` JSONL ledger."""
+    clean_title = str(title or "").strip()
+    clean_topic = str(topic or "").strip()
+    if not clean_title or not clean_topic:
+        raise ValueError("Meeting title and topic must be non-empty")
+    p = pathlib.Path(ledger_path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.parent.is_symlink() or p.is_symlink():
+        raise ValueError(f"Refusing symlinked meeting ledger path: {p}")
+    ts = utc_iso()
+    entry = {
+        "meeting_id": f"MTG-{ts[:10].replace('-', '')}-{hashlib.sha256((ts + clean_title).encode('utf-8')).hexdigest()[:6]}",
+        "created_at": ts,
+        "status": str(status or "CLOSED").strip().upper(),
+        "title": clean_title,
+        "topic": clean_topic,
+        "participants": [str(x).strip() for x in participants if str(x).strip()],
+        "decision": str(decision or "").strip(),
+    }
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(p), os.O_CREAT | os.O_WRONLY | os.O_APPEND | nofollow, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.write(fd, (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8"))
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+    return {"ok": True, "ledger_path": str(p), "meeting": entry}
+
+
+def list_meetings(
+    ledger_path: str | pathlib.Path,
+    *,
+    limit: int = 20,
+    digest_only: bool = False,
+) -> dict[str, Any]:
+    """Reads recent meetings from JSONL ledger; `digest_only=True` emits empty digest when zero meetings exist."""
+    p = pathlib.Path(ledger_path).expanduser().resolve()
+    if p.is_symlink():
+        raise ValueError(f"Refusing symlinked meeting ledger path: {p}")
+    if not p.is_file():
+        return {"ok": True, "count": 0, "meetings": [], "digest": ""}
+    rows: list[dict[str, Any]] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s:
+            rows.append(json.loads(s))
+    recent = rows[-max(1, int(limit)) :]
+    digest = ""
+    if recent and digest_only:
+        digest = " | ".join(f"{r['meeting_id']}:{r['title']}({r['status']})" for r in recent)
+    return {"ok": True, "count": len(recent), "meetings": recent, "digest": digest}
+
+
+def evaluate_two_cap_alert_latch(
+    prev_counts: dict[str, int],
+    active_keys: list[str],
+    *,
+    hour_local: int = 12,
+    quiet_hours: tuple[int, int] = (0, 8),
+    max_pushes: int = 2,
+) -> dict[str, Any]:
+    """Edge-triggered alert latch: pushes at most `max_pushes` per active anomaly key and suppresses quiet hours."""
+    q_start, q_end = quiet_hours
+    in_quiet = q_start <= int(hour_local) < q_end
+    next_counts: dict[str, int] = {}
+    to_notify: list[str] = []
+    for key in active_keys:
+        k = str(key or "").strip()
+        if not k:
+            continue
+        seen = int(prev_counts.get(k) or 0)
+        if in_quiet:
+            next_counts[k] = seen
+            continue
+        if seen < int(max_pushes):
+            to_notify.append(k)
+            next_counts[k] = seen + 1
+        else:
+            next_counts[k] = seen
+    return {
+        "in_quiet_hours": in_quiet,
+        "notify_keys": to_notify,
+        "counts": next_counts,
+    }

@@ -50,7 +50,8 @@ from diffquorum.governance import (  # noqa: E402
     quorum_verify,
     run_sanitize_lint,
 )
-from diffquorum.wake_gates import evaluate_six_gates, strip_terminal_escapes  # noqa: E402
+from diffquorum.plan_lock import close_pending_plan, open_pending_plan  # noqa: E402
+from diffquorum.wake_gates import evaluate_six_gates, is_explicit_approval_text, is_silent_sync_message, strip_terminal_escapes  # noqa: E402
 
 
 def _rand_text(rng: random.Random, min_len: int = 1, max_len: int = 600) -> str:
@@ -68,6 +69,8 @@ def fuzz_one_bytes(data: bytes) -> None:
     if probe_home in text and probe_home in scrubbed:
         raise AssertionError("pseudonymize_text failed to scrub home path")
     _ = lint_plain_summary(text)
+    _ = is_explicit_approval_text(text)
+    _ = is_silent_sync_message(text)
 
     try:
         snap = json.loads(text)
@@ -172,6 +175,12 @@ def run_stdlib_campaign(iterations: int, seed: int) -> int:
                 fake_user = "/".join(["", "Users", f"dev{i}", "work"])
                 assert fake_ip not in pseudonymize_text(f"{fake_user} {fake_ip}", f"k-{i}")
                 assert trap_outside.read_text(encoding="utf-8") == ""
+                p_fuzz = root / "fuzz_plans.json"
+                r_open = open_pending_plan(p_fuzz, seat="lead", scope=f"scope-{i % 7}", title=f"Plan {i}")
+                if not r_open["collision"]:
+                    r_comp = open_pending_plan(p_fuzz, seat="builder", scope=f"scope-{i % 7}", title="Competing")
+                    assert r_comp["collision"] is True
+                    close_pending_plan(p_fuzz, seat="lead", plan_id=r_open["plan"]["plan_id"], status="APPROVED")
 
     assert run_sanitize_lint(REPO_ROOT)["ok"] is True
     print(

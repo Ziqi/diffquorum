@@ -1229,6 +1229,113 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
         self.assertTrue(settled["wake"])
         self.assertEqual(settled["gate"], "all_6_passed")
 
+    def test_wave_c_plan_lock_anti_stall_and_receipts(self) -> None:
+        import os
+        from diffquorum.ops import evaluate_two_cap_alert_latch, list_meetings, record_meeting, summarize_qa_directory
+        from diffquorum.plan_lock import close_pending_plan, list_pending_plans, open_pending_plan, supersede_plans_for_scope
+        from diffquorum.wake_gates import (
+            classify_wake_block_code,
+            collect_terminal_ticket_receipts,
+            evaluate_six_gates,
+            is_explicit_approval_text,
+            is_idle_cli_footer,
+            is_report_no_reply_message,
+            is_silent_sync_message,
+            should_auto_exit_stale_copy_mode,
+            should_defer_low_priority_wake,
+            verify_cached_host_approval,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pfile = pathlib.Path(tmp) / "pending_plans.json"
+            r1 = open_pending_plan(pfile, seat="lead", scope="Core Bus", title="Initial draft")
+            self.assertTrue(r1["ok"])
+            self.assertFalse(r1["collision"])
+            self.assertEqual(os.stat(pfile).st_mode & 0o777, 0o600)
+
+            r_col = open_pending_plan(pfile, seat="worker", scope="core-bus", title="Competing draft")
+            self.assertFalse(r_col["ok"])
+            self.assertTrue(r_col["collision"])
+            self.assertEqual(len(r_col["conflicts"]), 1)
+
+            r_close = close_pending_plan(pfile, seat="lead", plan_id=r1["plan"]["plan_id"], status="APPROVED")
+            self.assertEqual(r_close["plan"]["status"], "APPROVED")
+            self.assertEqual(list_pending_plans(pfile)["count"], 0)
+
+            r2 = open_pending_plan(pfile, seat="worker", scope="core-bus", title="Follow-up draft")
+            self.assertFalse(r2["collision"])
+            self.assertEqual(supersede_plans_for_scope(pfile, "core-bus", superseded_by="TKT-900"), [r2["plan"]["plan_id"]])
+
+            # Leading-only silent tag + P0 never silent + orthogonal report-no-reply single-wake
+            self.assertTrue(is_silent_sync_message("【TERMINAL-ACK】 finished", priority="P1"))
+            self.assertFalse(is_silent_sync_message("【TERMINAL-ACK】 emergency", priority="P0"))
+            self.assertFalse(is_silent_sync_message("Reply with 【TERMINAL-ACK】 after check", priority="P2"))
+            self.assertTrue(is_report_no_reply_message("【交卷免回】 summary ready"))
+
+            base_snap = {
+                "msg_text": "【交卷免回】 summary ready",
+                "msg_status": "PENDING",
+                "pane_in_mode": 0,
+                "pane_fg": "agy",
+                "client_activity_ts": 100.0,
+                "capture_lines": [">", "⏵⏵ auto mode"],
+                "cursor_x": 2,
+                "transcript_last_type": "PLANNER_RESPONSE",
+                "transcript_last_status": "DONE",
+                "transcript_has_tool_calls": False,
+                "running_tasks": [{"status": "running", "isDaemon": "true", "description": "Dev server"}],
+            }
+            w_first = evaluate_six_gates({**base_snap, "msg_attempts": 0}, now_ts=200.0)
+            self.assertTrue(w_first["wake"])
+            w_second = evaluate_six_gates({**base_snap, "msg_attempts": 1, "last_attempt_ts": 120.0}, now_ts=200.0)
+            self.assertFalse(w_second["wake"])
+            self.assertEqual(w_second["reason"], "MAX_ATTEMPTS_SEEN_AWAITING_HUMAN")
+
+            # P0/P1 ticket backoff survives past 2 attempts instead of dying
+            hi_snap = {
+                **base_snap,
+                "msg_text": "TKT-100 urgent",
+                "item_kind": "ticket",
+                "priority": "P1",
+                "msg_attempts": 3,
+                "last_attempt_ts": 10.0,
+            }
+            self.assertTrue(evaluate_six_gates(hi_snap, now_ts=300.0)["wake"])
+
+            # Trailing multi-sentence approval & standalone Chinese words
+            self.assertTrue(is_explicit_approval_text("好嘞我先去休息了。approve"))
+            self.assertTrue(is_explicit_approval_text("通过"))
+            self.assertFalse(is_explicit_approval_text("先不通过"))
+            self.assertTrue(is_idle_cli_footer("? for short…"))
+            self.assertTrue(should_auto_exit_stale_copy_mode(pane_in_mode=True, min_client_idle_sec=190.0))
+            self.assertEqual(classify_wake_block_code("gate1_copy_mode"), "COPY_MODE")
+            self.assertTrue(should_defer_low_priority_wake(human_reply_age_sec=45.0, priority="P2"))
+
+            # Terminal ticket receipt wake & host approval cache verification
+            receipts = collect_terminal_ticket_receipts(
+                [{"ticket_id": "TKT-77", "status": "DONE", "from_seat": "lead", "updated_epoch": 500.0}],
+                {},
+                watermark_ts=100.0,
+            )
+            self.assertEqual(len(receipts), 1)
+            ok_cache, _ = verify_cached_host_approval(
+                {"ok": True, "verified_epoch": 195.0, "conv_id": "u1", "step_index": 3, "content_sha256": "abc"},
+                {"conv_id": "u1", "step_index": 3, "content_sha256": "abc"},
+                now_ts=200.0,
+            )
+            self.assertTrue(ok_cache)
+
+            # Read-only Q&A directory, 0600 meeting ledger & 2-cap alert latch
+            qa = summarize_qa_directory([{"seat": "lead", "user_inputs": ["[BUS-WAKE]", "Status?"], "last_reply": "Ready"}])
+            self.assertEqual(qa[0]["last_question"], "Status?")
+            mpath = pathlib.Path(tmp) / "meetings.jsonl"
+            self.assertEqual(list_meetings(mpath, digest_only=True)["digest"], "")
+            record_meeting(mpath, title="Arch Sync", topic="Plan Lock", participants=["lead", "worker"], decision="Approved")
+            self.assertEqual(os.stat(mpath).st_mode & 0o777, 0o600)
+            self.assertIn("Arch Sync", list_meetings(mpath, digest_only=True)["digest"])
+            latch = evaluate_two_cap_alert_latch({"s1": 2}, ["s1"], hour_local=14)
+            self.assertEqual(latch["notify_keys"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

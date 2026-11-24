@@ -45,7 +45,8 @@ from .governance import (
     run_sanitize_lint,
     verify_model_identity,
 )
-from .ops import collect_ast_imports, curate_ledger, render_dual_hud, run_readonly_probe
+from .ops import collect_ast_imports, curate_ledger, list_meetings, record_meeting, render_dual_hud, run_readonly_probe, summarize_qa_directory
+from .plan_lock import close_pending_plan, list_pending_plans, open_pending_plan
 from .wake_gates import evaluate_six_gates, is_explicit_approval_text, revocation_applies_to_scope
 
 
@@ -254,6 +255,52 @@ def main(argv: list[str] | None = None) -> int:
     p_rpf.add_argument("--repo-root", default=".")
     p_rpf.add_argument("--expected-version", default="")
     p_rpf.add_argument("--sdist-tar", default="")
+
+    # 13. Wave C: Single-approval pending-plan collision lock (`plan`), read-only `qa`, and `meetings` ledger
+    p_pln = sub.add_parser("plan", help="0-Token 待批方案撞车锁 (open | list | close)", allow_abbrev=False)
+    pln_sub = p_pln.add_subparsers(dest="plan_action", required=True)
+
+    p_pln_open = pln_sub.add_parser("open", help="登记待批方案并在同 scope 已存在他席草稿时返回 collision:true", allow_abbrev=False)
+    p_pln_open.add_argument("--plans-file", required=True)
+    p_pln_open.add_argument("--seat", required=True)
+    p_pln_open.add_argument("--scope", required=True)
+    p_pln_open.add_argument("--title", required=True)
+    p_pln_open.add_argument("--owner-seat", default="lead")
+
+    p_pln_list = pln_sub.add_parser("list", help="查询当前 WAITING_APPROVE 待批方案清单", allow_abbrev=False)
+    p_pln_list.add_argument("--plans-file", required=True)
+    p_pln_list.add_argument("--scope", default="")
+    p_pln_list.add_argument("--seat", default="")
+    p_pln_list.add_argument("--status", default="")
+    p_pln_list.add_argument("--all", action="store_true")
+
+    p_pln_close = pln_sub.add_parser("close", help="关闭待批方案 (APPROVED | SUPERSEDED | CANCELLED)", allow_abbrev=False)
+    p_pln_close.add_argument("--plans-file", required=True)
+    p_pln_close.add_argument("--seat", required=True)
+    p_pln_close.add_argument("--plan-id", default="")
+    p_pln_close.add_argument("--scope", default="")
+    p_pln_close.add_argument("--status", default="APPROVED", choices=("APPROVED", "SUPERSEDED", "CANCELLED"))
+    p_pln_close.add_argument("--note", default="")
+
+    p_qa = sub.add_parser("qa", help="纯只读席位最近一问一答目录摘要 (过滤 BUS-WAKE 与自检杂讯)", allow_abbrev=False)
+    p_qa.add_argument("--records-json", required=True)
+    p_qa.add_argument("--max-chars", type=int, default=80)
+
+    p_mtg = sub.add_parser("meetings", help="0600 权限跨席会议结论 JSONL 台账 (record | list)", allow_abbrev=False)
+    mtg_sub = p_mtg.add_subparsers(dest="mtg_action", required=True)
+
+    p_mtg_rec = mtg_sub.add_parser("record", help="追加记录一次会议结论", allow_abbrev=False)
+    p_mtg_rec.add_argument("--ledger", required=True)
+    p_mtg_rec.add_argument("--title", required=True)
+    p_mtg_rec.add_argument("--topic", required=True)
+    p_mtg_rec.add_argument("--participant", action="append", default=[])
+    p_mtg_rec.add_argument("--decision", default="")
+    p_mtg_rec.add_argument("--status", default="CLOSED")
+
+    p_mtg_ls = mtg_sub.add_parser("list", help="查询最近会议记录或输出单行摘要", allow_abbrev=False)
+    p_mtg_ls.add_argument("--ledger", required=True)
+    p_mtg_ls.add_argument("--limit", type=int, default=20)
+    p_mtg_ls.add_argument("--digest", action="store_true")
 
     args = parser.parse_args(argv)
     try:
@@ -560,6 +607,64 @@ def main(argv: list[str] | None = None) -> int:
             )
             _out(rep)
             return 0 if rep["ok"] else 2
+
+        if args.cmd == "plan":
+            if args.plan_action == "open":
+                _out(
+                    open_pending_plan(
+                        args.plans_file,
+                        seat=args.seat,
+                        scope=args.scope,
+                        title=args.title,
+                        owner_seat=args.owner_seat,
+                    )
+                )
+                return 0
+            if args.plan_action == "list":
+                _out(
+                    list_pending_plans(
+                        args.plans_file,
+                        scope=args.scope,
+                        seat=args.seat,
+                        status=args.status,
+                        include_all=args.all,
+                    )
+                )
+                return 0
+            if args.plan_action == "close":
+                _out(
+                    close_pending_plan(
+                        args.plans_file,
+                        seat=args.seat,
+                        plan_id=args.plan_id,
+                        scope=args.scope,
+                        status=args.status,
+                        note=args.note,
+                    )
+                )
+                return 0
+
+        if args.cmd == "qa":
+            rows = json.loads(args.records_json)
+            _out({"ok": True, "directory": summarize_qa_directory(rows, max_chars=args.max_chars)})
+            return 0
+
+        if args.cmd == "meetings":
+            if args.mtg_action == "record":
+                _out(
+                    record_meeting(
+                        args.ledger,
+                        title=args.title,
+                        topic=args.topic,
+                        participants=args.participant,
+                        decision=args.decision,
+                        status=args.status,
+                    )
+                )
+                return 0
+            if args.mtg_action == "list":
+                _out(list_meetings(args.ledger, limit=args.limit, digest_only=args.digest))
+                return 0
     except Exception as exc:
         _out({"ok": False, "error": str(exc)})
         return 2

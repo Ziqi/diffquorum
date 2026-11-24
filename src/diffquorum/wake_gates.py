@@ -51,7 +51,7 @@ EXPLICIT_APPROVAL_SENTENCE_RE = re.compile(
     r"(?:按(?:照)?(?:你(?:的)?|上述|上面(?:的)?|这个|该|本)?(?:推荐|建议|方案|计划)(?:的)?[\s,，:：—-]*)?"
     r"(?:我(?:们)?[\s,，]*)?"
     r"(?:(?:一起|一并|一块|全部|全都|全|都)[\s,，:：—-]*)?"
-    r"(?:approve(?:d)?|同意(?:执行|了)?|批准(?:执行|了)?|确认执行)"
+    r"(?:approve(?:d)?|同意(?:执行|了)?|批准(?:执行|了)?|确认执行|通过|可以)"
     r"(?:[\s,，:：—-]+"
     r"(?:please|go\s+ahead|proceed|(?:请)?(?:按(?:照)?(?:你(?:的)?|上述|上面(?:的)?|这个|该|本)?(?:推荐|建议|方案|计划))?(?:一起|一并)?(?:开始|继续|直接|立即)?执行(?:吧)?|开始(?:执行)?(?:吧)?))?"
     r"|(?:请)?(?:按(?:照)?|照)(?:这个|该|本|上述|上面(?:的)?|你(?:的)?)(?:推荐|建议|方案|计划)?(?:一起|一并)?(?:直接|立即|开始)?执行(?:吧|了)?"
@@ -61,7 +61,7 @@ EXPLICIT_APPROVAL_SENTENCE_RE = re.compile(
 )
 NEGATED_OR_QUESTION_APPROVAL_RE = re.compile(
     r"(?:\b(?:not|no|never|don'?t|do\s+not|cannot|can'?t|disapprov\w*|unapprov\w*|cancel\w*|abort\w*|revoke\w*|but|however|except|unless|only|wait|hold|stop|pause)\b"
-    r"|不(?:同意|批准|准|予批准|要|行|可以|能)|暂不(?:同意|批准|执行)?|先不(?:批|同意|执行)|拒绝|驳回|但是|但|不过|除非|除了|只改|只做|[?？])",
+    r"|不(?:同意|批准|准|予批准|通过|要|行|可以|能)|暂不(?:同意|批准|通过|执行)?|先不(?:批|同意|通过|执行)|拒绝|驳回|但是|但|不过|除非|除了|只改|只做|[?？])",
     re.IGNORECASE,
 )
 FOLLOWUP_RESTRICTION_RE = re.compile(
@@ -169,12 +169,14 @@ def strip_terminal_escapes(text: str) -> str:
     return normalized.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def is_silent_sync_message(text: str) -> bool:
-    """Matches terminal/info-sync prefixes ONLY on the first non-empty line to prevent body false-positives."""
+def is_silent_sync_message(text: str, *, priority: str = "P2") -> bool:
+    """Matches terminal/info-sync prefixes ONLY at start of first non-empty line; P0 is never silent (PF-036)."""
+    if str(priority or "").strip().upper() == "P0":
+        return False
     for line in str(text or "").splitlines():
         s = line.strip()
         if s:
-            return any(tag in s for tag in SILENT_FIRST_LINE_PREFIXES)
+            return bool(SILENT_LEADING_PREFIX_RE.match(s))
     return False
 
 
@@ -185,9 +187,9 @@ def is_idle_cli_footer(footer: str) -> bool:
         return False
     if any(m in s for m in BUSY_UI_MARKERS) or WAITING_MODAL_RE.search(s):
         return False
-    if "? for shortcuts" in s:
+    if "? for shortcuts" in s or PARTIAL_SHORTCUTS_FOOTER_RE.search(s):
         return True
-    return bool(NARROW_IDLE_FOOTER_RE.match(s))
+    return bool(NARROW_IDLE_FOOTER_RE.match(s) or ULTRA_NARROW_FOOTER_RE.match(s))
 
 
 def is_pane_tail_busy(capture_lines: list[str] | str) -> bool:
@@ -226,22 +228,37 @@ def classify_seat_state(
 
 
 def is_explicit_approval_text(text: str) -> bool:
-    """Fail-closed check for unambiguous explicit human approval utterances (PF-023)."""
+    """Fail-closed check supporting both leading and multi-sentence trailing human approvals (PF-023 & PF-031)."""
     cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip().strip("\"'“”‘’`").strip()
     if not cleaned or len(cleaned) > 600:
         return False
     if REVOCATION_RE.search(cleaned):
         return False
-    sentences = [s.strip().strip("\"'“”‘’`").strip() for s in re.split(r"[。.!！\n]+", cleaned) if s.strip()]
+    sentences = [
+        s.strip().strip("\"'“”‘’`").strip()
+        for s in re.findall(r"[^。.!！?？;；\n]+[?？]*", cleaned)
+        if s.strip().strip("\"'“”‘’`").strip()
+    ]
     if not sentences:
         return False
-    first_sent = sentences[0]
-    if NEGATED_OR_QUESTION_APPROVAL_RE.search(first_sent):
+    approval_indices = [
+        idx
+        for idx, sent in enumerate(sentences)
+        if not NEGATED_OR_QUESTION_APPROVAL_RE.search(sent) and EXPLICIT_APPROVAL_SENTENCE_RE.fullmatch(sent)
+    ]
+    if not approval_indices:
         return False
-    if not EXPLICIT_APPROVAL_SENTENCE_RE.fullmatch(first_sent):
-        return False
-    if len(sentences) > 1 and FOLLOWUP_RESTRICTION_RE.search(" ".join(sentences[1:])):
-        return False
+    first_idx = approval_indices[0]
+    app_set = set(approval_indices)
+    for idx, sent in enumerate(sentences):
+        if idx in app_set:
+            continue
+        if FOLLOWUP_RESTRICTION_RE.search(sent):
+            return False
+        if idx < first_idx and NEGATED_OR_QUESTION_APPROVAL_RE.search(sent):
+            return False
+        if idx > first_idx and ("?" in sent or "？" in sent) and not POST_APPROVAL_CONFIRM_Q_RE.search(sent):
+            return False
     return True
 
 
@@ -307,12 +324,14 @@ def _has_active_foreground_tasks(tasks: list[dict[str, Any]]) -> bool:
     for t in tasks:
         if not isinstance(t, dict):
             continue
-        if t.get("isDaemon") is True:
+        raw_daemon = t.get("isDaemon")
+        if raw_daemon is True or str(raw_daemon or "").strip().lower() == "true":
             continue
-        if str(t.get("kind") or "").strip().lower() in ("timer", "cron", "schedule"):
+        if str(t.get("kind") or "").strip().lower() in ("timer", "cron", "schedule", "daemon"):
             continue
         desc = str(t.get("description") or "").strip()
-        if SCHEDULE_TASK_DESC_RE.search(desc):
+        out_tail = str(t.get("output_tail") or "")
+        if SCHEDULE_TASK_DESC_RE.search(desc) or DAEMON_READY_OUTPUT_RE.search(out_tail):
             continue
         if str(t.get("status") or "").lower() in ("running", "in_progress", "pending"):
             return True
@@ -341,8 +360,10 @@ def evaluate_six_gates(snapshot: dict[str, Any], now_ts: float | None = None) ->
     now_ep = time.time() if now_ts is None else float(now_ts)
     msg_text = str(snapshot.get("msg_text") or "")
     msg_status = str(snapshot.get("msg_status") or "PENDING").upper()
+    priority = str(snapshot.get("priority") or "P2").strip().upper()
+    item_kind = str(snapshot.get("item_kind") or "msg").strip().lower()
 
-    if is_silent_sync_message(msg_text):
+    if is_silent_sync_message(msg_text, priority=priority):
         return {"wake": False, "gate": "prefix", "reason": "SILENT_FIRST_LINE_PREFIX"}
 
     if msg_status == "SEEN_AWAITING_HUMAN":
@@ -409,18 +430,25 @@ def evaluate_six_gates(snapshot: dict[str, Any], now_ts: float | None = None) ->
     if len(recent_wakes) >= RATE_LIMIT_MAX_WAKES:
         return {"wake": False, "gate": "gate5", "reason": "SEAT_RATE_LIMIT_REACHED"}
 
-    # Gate 6: Per-message retry cap + cooldown; transition to SEEN_AWAITING_HUMAN after 2 attempts
+    # Gate 6: Per-message retry cap + P0/P1 ticket backoff + report-no-reply single-wake cap (PF-030 & PF-036)
     attempts = int(snapshot.get("msg_attempts") or 0)
     last_ts = float(snapshot.get("last_attempt_ts") or 0.0)
-    if attempts >= MAX_WAKE_ATTEMPTS_PER_MSG:
-        return {
-            "wake": False,
-            "gate": "gate6",
-            "reason": "MAX_ATTEMPTS_SEEN_AWAITING_HUMAN",
-            "next_msg_status": "SEEN_AWAITING_HUMAN",
-        }
-    if attempts >= 1 and (now_ep - last_ts) < RETRY_COOLDOWN_SECONDS:
-        return {"wake": False, "gate": "gate6", "reason": "RETRY_COOLDOWN_ACTIVE"}
+    is_high_prio_tkt = item_kind == "ticket" and priority in ("P0", "P1")
+    max_attempts = 1 if (bool(snapshot.get("is_report_no_reply")) or is_report_no_reply_message(msg_text)) else MAX_WAKE_ATTEMPTS_PER_MSG
+    if is_high_prio_tkt:
+        cooldown_req = compute_high_prio_ticket_backoff(attempts)
+        if attempts >= 1 and (now_ep - last_ts) < cooldown_req:
+            return {"wake": False, "gate": "gate6", "reason": "RETRY_COOLDOWN_ACTIVE"}
+    else:
+        if attempts >= max_attempts:
+            return {
+                "wake": False,
+                "gate": "gate6",
+                "reason": "MAX_ATTEMPTS_SEEN_AWAITING_HUMAN",
+                "next_msg_status": "SEEN_AWAITING_HUMAN",
+            }
+        if attempts >= 1 and (now_ep - last_ts) < RETRY_COOLDOWN_SECONDS:
+            return {"wake": False, "gate": "gate6", "reason": "RETRY_COOLDOWN_ACTIVE"}
 
     return {
         "wake": True,
@@ -469,3 +497,159 @@ def apply_wake_attempt(
         "cooldown_until": (now_ep + RETRY_COOLDOWN_SECONDS) if frame1_ok else 0.0,
         "cleanup_keys": cleanup_keys,
     }
+
+
+# --- v0.3 Wave C: Anti-Stall, Orthogonal Report-No-Reply, Receipt Wake & Cache Guards ---
+HIGH_PRIO_BACKOFF_SCHEDULE = (30.0, 60.0, 180.0)
+STALE_COPY_MODE_AUTO_EXIT_SECONDS = 180.0
+HUMAN_REPLY_SCROLL_GUARD_SECONDS = 300.0
+HOST_APPROVAL_CACHE_MAX_AGE_SECONDS = 30.0
+
+SILENT_LEADING_PREFIX_RE = re.compile(
+    r"^\s*(?:【TERMINAL-ACK】|【INFO-SYNC\b|\[TERMINAL-ACK\]|\[INFO-SYNC\b)",
+    re.IGNORECASE,
+)
+REPORT_NO_REPLY_PREFIX_RE = re.compile(
+    r"^\s*(?:【交卷免回】|【REPORT-NO-REPLY】|\[REPORT-NO-REPLY\])",
+    re.IGNORECASE,
+)
+PARTIAL_SHORTCUTS_FOOTER_RE = re.compile(
+    r"(?:\?\s+for\s+short\w*|(?:…|\.{2,3})\s*for\s+shortcuts\b)",
+    re.IGNORECASE,
+)
+ULTRA_NARROW_FOOTER_RE = re.compile(
+    r"^(?:[⏵▸▶>]+\s*)?(?:"
+    r"(?:auto|ask|plan|safe|default|fast)(?:\s+mode)?(?:\s*$|\s*(?:…|\.{2,3})\s*$|\s*[·•|—-]\s*\S.*$)"
+    r"|(?:…|\.{2,3}|\S.*?)?\s*[·•|]\s*/tasks(?:\s*\(\d+\)|\s*(?:…|\.{2,3}))?\s*$"
+    r")",
+    re.IGNORECASE,
+)
+DAEMON_READY_OUTPUT_RE = re.compile(
+    r"(?:Ready\s+on\s+https?://|Listening\s+on\s+https?://|serving\s+at\s+https?://)",
+    re.IGNORECASE,
+)
+POST_APPROVAL_CONFIRM_Q_RE = re.compile(
+    r"(?:对吧|是吧|好吧|行吧|没问题吧|可以吧|\bright\s*\?)[?？]*$",
+    re.IGNORECASE,
+)
+
+
+def is_report_no_reply_message(text: str) -> bool:
+    """Returns True when the first non-empty line carries orthogonal `【交卷免回】` / `【REPORT-NO-REPLY】`."""
+    for line in str(text or "").splitlines():
+        s = line.strip()
+        if s:
+            return bool(REPORT_NO_REPLY_PREFIX_RE.match(s))
+    return False
+
+
+def compute_high_prio_ticket_backoff(attempts: int) -> float:
+    """Returns bounded exponential retry cooldown `(30s, 60s, 180s)` for `P0/P1` tickets without 2-attempt death."""
+    if attempts <= 0:
+        return 0.0
+    idx = min(int(attempts) - 1, len(HIGH_PRIO_BACKOFF_SCHEDULE) - 1)
+    return HIGH_PRIO_BACKOFF_SCHEDULE[idx]
+
+
+def should_auto_exit_stale_copy_mode(
+    *,
+    pane_in_mode: bool,
+    min_client_idle_sec: float,
+    threshold_sec: float = STALE_COPY_MODE_AUTO_EXIT_SECONDS,
+    protected_session: bool = False,
+) -> bool:
+    """Safely clears forgotten tmux `copy-mode` only when session is unprotected and all clients are idle >= threshold."""
+    if not pane_in_mode or protected_session:
+        return False
+    return float(min_client_idle_sec) >= float(threshold_sec)
+
+
+def classify_wake_block_code(reason: str) -> str:
+    """Maps a low-level gate rejection reason string into a compact observable HUD diagnostic code."""
+    r = str(reason or "").lower()
+    if "copy_mode" in r or "copy-mode" in r:
+        return "COPY_MODE"
+    if "client" in r or "typing" in r:
+        return "CLIENT_ACTIVE"
+    if "modal" in r or "user_answer" in r:
+        return "MODAL_WAIT"
+    if "spinner" in r or "chrome_busy" in r:
+        return "SPINNER_ACTIVE"
+    if "footer" in r or "prompt" in r:
+        return "PROMPT_OR_FOOTER"
+    if "awaiting_human_approve" in r:
+        return "WAIT_APPROVE"
+    if "daemon" in r or "task_running" in r:
+        return "FG_TASK_BUSY"
+    if "transcript" in r:
+        return "TRANSCRIPT_BUSY"
+    if "rate_limit" in r:
+        return "RATE_LIMIT"
+    return "GATE_BLOCKED"
+
+
+def should_defer_low_priority_wake(
+    *,
+    human_reply_age_sec: float | None,
+    priority: str = "P2",
+    approved_passthrough: bool = False,
+    primary_seat_sender: bool = False,
+    window_sec: float = HUMAN_REPLY_SCROLL_GUARD_SECONDS,
+) -> bool:
+    """Defers P2/P3 background wakes within `window_sec` of a fresh reply to the user to prevent scroll-off."""
+    if human_reply_age_sec is None or float(human_reply_age_sec) < 0.0:
+        return False
+    prio = str(priority or "P2").strip().upper()
+    if prio in ("P0", "P1") or approved_passthrough or primary_seat_sender:
+        return False
+    return float(human_reply_age_sec) < float(window_sec)
+
+
+def collect_terminal_ticket_receipts(
+    tickets: list[dict[str, Any]],
+    woken_receipts: dict[str, float],
+    *,
+    watermark_ts: float = 0.0,
+) -> list[dict[str, str]]:
+    """Returns orthogonal single-shot receipt wakeups `(ticket_id, status)` for `WAITING_REVIEW | DONE | BLOCKED`."""
+    ready: list[dict[str, str]] = []
+    for tdoc in tickets:
+        if not isinstance(tdoc, dict):
+            continue
+        tid = str(tdoc.get("ticket_id") or "").strip()
+        status = str(tdoc.get("status") or "").strip().upper()
+        from_seat = str(tdoc.get("from_seat") or "").strip()
+        updated_ts = float(tdoc.get("updated_epoch") or 0.0)
+        if not tid or not from_seat or status not in ("WAITING_REVIEW", "DONE", "BLOCKED"):
+            continue
+        if bool(tdoc.get("receipt_notified_to_sender")):
+            continue
+        if watermark_ts > 0.0 and updated_ts > 0.0 and updated_ts < watermark_ts:
+            continue
+        rkey = f"{tid}:{status}"
+        if rkey in woken_receipts:
+            continue
+        ready.append({"receipt_key": rkey, "ticket_id": tid, "status": status, "to_seat": from_seat})
+    return ready
+
+
+def verify_cached_host_approval(
+    cache_doc: dict[str, Any] | None,
+    anchor: dict[str, Any] | None,
+    *,
+    now_ts: float,
+    max_age_sec: float = HOST_APPROVAL_CACHE_MAX_AGE_SECONDS,
+) -> tuple[bool, str]:
+    """Fail-closed verifier for host-side pre-verified approval cache (protects sandboxed seats)."""
+    if not isinstance(cache_doc, dict) or not isinstance(anchor, dict):
+        return False, "MISSING_CACHE_OR_ANCHOR"
+    if cache_doc.get("ok") is not True:
+        return False, "CACHE_NOT_OK"
+    verified_ep = float(cache_doc.get("verified_epoch") or 0.0)
+    age = float(now_ts) - verified_ep
+    if verified_ep <= 0.0 or age < -5.0 or age > float(max_age_sec):
+        return False, "CACHE_STALE"
+    for field in ("conv_id", "step_index", "content_sha256"):
+        if cache_doc.get(field) != anchor.get(field):
+            return False, f"ANCHOR_MISMATCH_{field.upper()}"
+    return True, "VERIFIED_HOST_CACHE"

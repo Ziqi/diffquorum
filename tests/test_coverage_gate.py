@@ -30,6 +30,7 @@ TARGET_FILES = (
     (SRC_DIR / "diffquorum" / "governance.py").resolve(),
     (SRC_DIR / "diffquorum" / "wake_gates.py").resolve(),
     (SRC_DIR / "diffquorum" / "ops.py").resolve(),
+    (SRC_DIR / "diffquorum" / "plan_lock.py").resolve(),
     (SRC_DIR / "diffquorum" / "cli.py").resolve(),
 )
 
@@ -62,6 +63,7 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     import diffquorum.cli as cli
     import diffquorum.governance as gov
     import diffquorum.ops as ops
+    import diffquorum.plan_lock as plk
     import diffquorum.wake_gates as wg
 
     # 1. Init, TOML error branches, and board refresh / overflow branches
@@ -461,9 +463,80 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
             ["release-preflight", "--repo-root", str(REPO_ROOT)],
             ["review", "--root", str(cli_ws), "--level", "2", "--tree-hash", "deadbeef02", "--blocker", "Tone nit", "--blocker-class", "style"],
             ["archive", "--repo-root", str(mini_repo), "--verify"],
+            ["plan", "open", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "lead", "--scope", "router-v1", "--title", "Draft A"],
+            ["plan", "open", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "lead", "--scope", "router-v1", "--title", "Draft A2"],
+            ["plan", "open", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "worker", "--scope", "router-v1", "--title", "Competing"],
+            ["plan", "list", "--plans-file", str(temp_root / "cov_plans.json"), "--scope", "router-v1"],
+            ["plan", "close", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "lead", "--scope", "router-v1", "--status", "APPROVED", "--note", "ship"],
+            ["plan", "list", "--plans-file", str(temp_root / "cov_plans.json"), "--all"],
+            ["qa", "--records-json", json.dumps([{"seat": "lead", "user_inputs": ["[BUS-WAKE]", "Check deploy status"], "last_reply": "All green"}])],
+            ["meetings", "list", "--ledger", str(temp_root / "cov_meetings.jsonl"), "--digest"],
+            ["meetings", "record", "--ledger", str(temp_root / "cov_meetings.jsonl"), "--title", "Sync", "--topic", "Schema", "--participant", "lead", "--decision", "Go"],
+            ["meetings", "list", "--ledger", str(temp_root / "cov_meetings.jsonl"), "--digest"],
         ):
             assert cli.main(cmd_argv) == 0, f"CLI failed on {cmd_argv}"
         assert cli.main(["dispatch", "--root", str(cli_ws)]) == 2
+
+    # Exercise Wave C plan_lock, wake_gates, and ops edge branches
+    p_cov = temp_root / "direct_plans.json"
+    r_p1 = plk.open_pending_plan(p_cov, seat="worker", scope="db-mig", title="Step 1")
+    assert r_p1["ok"] is True
+    assert plk.supersede_plans_for_scope(p_cov, "db-mig", superseded_by="TKT-1") == [r_p1["plan"]["plan_id"]]
+    for bad_call in (
+        lambda: plk.normalize_plan_scope("!!!"),
+        lambda: plk.open_pending_plan(p_cov, seat="", scope="x", title="y"),
+        lambda: plk.list_pending_plans(p_cov, status="INVALID"),
+        lambda: plk.close_pending_plan(p_cov, seat="lead", status="BAD"),
+        lambda: plk.close_pending_plan(p_cov, seat="lead"),
+        lambda: plk.close_pending_plan(p_cov, seat="lead", plan_id="PLN-MISSING"),
+    ):
+        try:
+            bad_call()
+        except (ValueError, KeyError):
+            pass
+    r_p2 = plk.open_pending_plan(p_cov, seat="worker", scope="auth-v2", title="Auth plan", owner_seat="lead")
+    try:
+        plk.close_pending_plan(p_cov, seat="stranger", plan_id=r_p2["plan"]["plan_id"])
+    except PermissionError:
+        pass
+
+    assert wg.is_silent_sync_message("【TERMINAL-ACK】 done", priority="P2") is True
+    assert wg.is_silent_sync_message("【TERMINAL-ACK】 urgent", priority="P0") is False
+    assert wg.is_silent_sync_message("Please send 【TERMINAL-ACK】 when done", priority="P2") is False
+    assert wg.is_report_no_reply_message("【交卷免回】 Task complete") is True
+    assert wg.is_idle_cli_footer("⏵⏵ auto mode") is True
+    assert wg.is_idle_cli_footer("? for short…") is True
+    assert wg.is_explicit_approval_text("好嘞先睡了。approve") is True
+    assert wg.is_explicit_approval_text("不通过") is False
+    assert wg.is_explicit_approval_text("通过") is True
+    assert wg.should_auto_exit_stale_copy_mode(pane_in_mode=True, min_client_idle_sec=200.0) is True
+    assert wg.should_auto_exit_stale_copy_mode(pane_in_mode=True, min_client_idle_sec=200.0, protected_session=True) is False
+    assert wg.compute_high_prio_ticket_backoff(0) == 0.0
+    assert wg.compute_high_prio_ticket_backoff(2) == 60.0
+    for r_str in ("copy_mode", "client_typing", "modal", "spinner", "footer", "awaiting_human_approve", "task_running", "transcript", "rate_limit", "other"):
+        assert wg.classify_wake_block_code(r_str)
+    assert wg.should_defer_low_priority_wake(human_reply_age_sec=60.0, priority="P2") is True
+    assert wg.should_defer_low_priority_wake(human_reply_age_sec=60.0, priority="P1") is False
+    recs = wg.collect_terminal_ticket_receipts(
+        [{"ticket_id": "TKT-1", "status": "DONE", "from_seat": "lead", "updated_epoch": 500.0}],
+        {},
+        watermark_ts=100.0,
+    )
+    assert len(recs) == 1
+    ok_c, _ = wg.verify_cached_host_approval(
+        {"ok": True, "verified_epoch": 990.0, "conv_id": "c1", "step_index": 5, "content_sha256": "h1"},
+        {"conv_id": "c1", "step_index": 5, "content_sha256": "h1"},
+        now_ts=1000.0,
+    )
+    assert ok_c is True
+    assert wg.verify_cached_host_approval(None, None, now_ts=1000.0)[0] is False
+    assert wg.verify_cached_host_approval({"ok": True, "verified_epoch": 900.0}, {}, now_ts=1000.0)[0] is False
+
+    latch1 = ops.evaluate_two_cap_alert_latch({}, ["seat-a"], hour_local=14)
+    latch2 = ops.evaluate_two_cap_alert_latch(latch1["counts"], ["seat-a"], hour_local=15)
+    latch3 = ops.evaluate_two_cap_alert_latch(latch2["counts"], ["seat-a"], hour_local=16)
+    assert latch1["notify_keys"] == ["seat-a"] and latch3["notify_keys"] == []
+    assert ops.evaluate_two_cap_alert_latch({}, ["seat-a"], hour_local=3)["in_quiet_hours"] is True
 
     shutil.rmtree(ws, ignore_errors=True)
 
