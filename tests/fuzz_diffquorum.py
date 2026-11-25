@@ -50,7 +50,7 @@ from diffquorum.governance import (  # noqa: E402
     quorum_verify,
     run_sanitize_lint,
 )
-from diffquorum.plan_lock import close_pending_plan, open_pending_plan  # noqa: E402
+from diffquorum.plan_lock import build_pre_invocation_pending_banner, close_pending_plan, format_pending_plans_bar, open_pending_plan  # noqa: E402
 from diffquorum.wake_gates import evaluate_six_gates, is_explicit_approval_text, is_silent_sync_message, strip_terminal_escapes  # noqa: E402
 
 
@@ -179,6 +179,8 @@ def run_stdlib_campaign(iterations: int, seed: int) -> int:
                 r_open = open_pending_plan(p_fuzz, seat="lead", scope=f"scope-{i % 7}", title=f"Plan {i}")
                 if not r_open["collision"]:
                     r_comp = open_pending_plan(p_fuzz, seat="builder", scope=f"scope-{i % 7}", title="Competing")
+                    _ = build_pre_invocation_pending_banner("builder", p_fuzz, redacted_seats={"vault"})
+                    _ = format_pending_plans_bar(p_fuzz, width=56, redacted_seats={"vault"})
                     assert r_comp["collision"] is True
                     close_pending_plan(p_fuzz, seat="lead", plan_id=r_open["plan"]["plan_id"], status="APPROVED")
 

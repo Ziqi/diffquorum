@@ -309,3 +309,164 @@ def supersede_plans_for_scope(
             doc["plans"] = plans
             _write_plans_doc_locked(p_file, doc)
     return superseded
+
+
+PENDING_PLANS_MAX_READ_BYTES = 16384
+STRICT_PLAN_ID_RE = re.compile(r"^PLN-\d{8}-\d{3,}$")
+TITLE_TAG_PREFIX_RE = re.compile(r"^(?:\s*\[[^\]]{1,42}\]\s*)+")
+UNSAFE_BANNER_CHARS_RE = re.compile(r"[\x00-\x1f\x7f<>\[\]`|]+")
+
+
+def _read_plans_doc_readonly_bounded(path: pathlib.Path) -> dict[str, Any] | None:
+    """Pure read-only `O_RDONLY | O_NOFOLLOW` (`<=16KB`) reader that never creates locks or mutates disk."""
+    try:
+        if path.is_symlink() or not path.exists():
+            return None
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > PENDING_PLANS_MAX_READ_BYTES:
+                return None
+            raw = os.read(fd, PENDING_PLANS_MAX_READ_BYTES)
+        finally:
+            os.close(fd)
+        doc = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("plans"), list):
+        return None
+    return doc
+
+
+def sanitize_plan_banner_title(raw_title: str, max_chars: int = 32) -> str:
+    """Strips control chars, HTML/XML brackets, backticks, and pipes from plan titles before display."""
+    cleaned = UNSAFE_BANNER_CHARS_RE.sub(" ", str(raw_title or ""))
+    cleaned = " ".join(cleaned.split())
+    stripped = TITLE_TAG_PREFIX_RE.sub("", cleaned).strip()
+    return (stripped or cleaned)[:max_chars]
+
+
+def load_reconciled_pending_plans_ro(
+    primary_path: str | pathlib.Path,
+    mirror_path: str | pathlib.Path | None = None,
+) -> dict[str, Any] | None:
+    """Reconciles primary and optional mirror `pending_plans.json` files by highest monotonic integer `rev`."""
+    cands: list[pathlib.Path] = [pathlib.Path(primary_path).expanduser()]
+    if mirror_path is not None:
+        cands.append(pathlib.Path(mirror_path).expanduser())
+    best_doc: dict[str, Any] | None = None
+    best_rev = -1
+    for fp in cands:
+        doc = _read_plans_doc_readonly_bounded(fp)
+        if doc is None:
+            continue
+        raw_rev = doc.get("rev")
+        rev = int(raw_rev) if isinstance(raw_rev, int) and not isinstance(raw_rev, bool) else 0
+        if best_doc is None or rev > best_rev:
+            best_doc = doc
+            best_rev = rev
+    return best_doc
+
+
+def format_pending_plans_bar(
+    primary_path: str | pathlib.Path,
+    *,
+    mirror_path: str | pathlib.Path | None = None,
+    width: int = 80,
+    redacted_seats: set[str] | frozenset[str] | None = None,
+) -> str:
+    """
+    Renders a single auto-collapsed HUD/directory pending-approval bar (`""` when `0` `WAITING_APPROVE` plans exist).
+    Sensitive seats in `redacted_seats` render strictly as `<seat>(<N> pending)` without exposing plan titles or scopes.
+    """
+    doc = load_reconciled_pending_plans_ro(primary_path, mirror_path=mirror_path)
+    if doc is None:
+        return ""
+    redacted = set(redacted_seats) if redacted_seats else set()
+    total = 0
+    red_counts: dict[str, int] = {}
+    ordered: list[tuple[bool, str, str]] = []
+    title_cap = 28 if width >= 76 else 14
+    for rec in doc.get("plans") or []:
+        if not isinstance(rec, dict) or str(rec.get("status") or "").strip().upper() != "WAITING_APPROVE":
+            continue
+        seat = str(rec.get("seat") or "").strip() or "seat"
+        total += 1
+        if seat in redacted:
+            red_counts[seat] = red_counts.get(seat, 0) + 1
+            ordered.append((True, seat, ""))
+        else:
+            t = sanitize_plan_banner_title(str(rec.get("title") or ""), max_chars=title_cap) or str(rec.get("plan_id") or "PLAN")
+            ordered.append((False, seat, f"{seat}:{t}"))
+    if total <= 0:
+        return ""
+    tokens: list[str] = []
+    seen_red: set[str] = set()
+    for is_red, seat, tok in ordered:
+        if is_red:
+            if seat not in seen_red:
+                tokens.append(f"{seat}({red_counts[seat]} pending)")
+                seen_red.add(seat)
+        else:
+            tokens.append(tok)
+    line = f"[APR:{total}] " + " | ".join(tokens)
+    limit = max(24, int(width))
+    return line if len(line) <= limit else (line[: limit - 2] + "..")
+
+
+def build_pre_invocation_pending_banner(
+    seat: str,
+    primary_path: str | pathlib.Path,
+    *,
+    mirror_path: str | pathlib.Path | None = None,
+    redacted_seats: set[str] | frozenset[str] | None = None,
+) -> str:
+    """
+    Zero-Token `PreInvocation` hook helper: returns `""` (0 bytes) when no `WAITING_APPROVE` plans exist;
+    otherwise emits a 1-line summary explicitly splitting `own` vs `peers` counts so agents never claim
+    "0 pending approvals" from stale single-seat memory while peer seats have open plans.
+    """
+    self_seat = str(seat or "").strip()
+    doc = load_reconciled_pending_plans_ro(primary_path, mirror_path=mirror_path)
+    if doc is None:
+        return ""
+    redacted = set(redacted_seats) if redacted_seats else set()
+    own_cnt = 0
+    peer_cnt = 0
+    red_counts: dict[str, int] = {}
+    ordered: list[tuple[bool, str, str]] = []
+    for rec in doc.get("plans") or []:
+        if not isinstance(rec, dict) or str(rec.get("status") or "").strip().upper() != "WAITING_APPROVE":
+            continue
+        rec_seat = str(rec.get("seat") or "").strip() or "seat"
+        if rec_seat == self_seat:
+            own_cnt += 1
+        else:
+            peer_cnt += 1
+        if rec_seat in redacted:
+            red_counts[rec_seat] = red_counts.get(rec_seat, 0) + 1
+            ordered.append((True, rec_seat, ""))
+        else:
+            raw_pid = str(rec.get("plan_id") or "").strip()
+            safe_pid = raw_pid if STRICT_PLAN_ID_RE.fullmatch(raw_pid) else "PLN"
+            safe_title = sanitize_plan_banner_title(str(rec.get("title") or ""), max_chars=28)
+            tok = f"{rec_seat}({safe_pid}:{safe_title})" if safe_title else f"{rec_seat}({safe_pid})"
+            ordered.append((False, rec_seat, tok))
+
+    total = own_cnt + peer_cnt
+    if total <= 0:
+        return ""
+    tokens: list[str] = []
+    seen_red: set[str] = set()
+    for is_red, rec_seat, tok in ordered:
+        if is_red:
+            if rec_seat not in seen_red:
+                tokens.append(f"{rec_seat}({red_counts[rec_seat]} pending)")
+                seen_red.add(rec_seat)
+        else:
+            tokens.append(tok)
+    return (
+        f"[DIFFQUORUM PENDING PLANS | own:{own_cnt} | peers:{peer_cnt} | total:{total}] "
+        f"{' ; '.join(tokens)} "
+        "(Non-instructional display metadata: split own vs peer counts in trailing summary; never report 0 from stale memory)"
+    )

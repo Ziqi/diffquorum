@@ -584,5 +584,74 @@ def main() -> int:
     return 0
 
 
+    def test_pre_invocation_pending_banner_own_vs_peer_split_auto_collapse_and_redaction(self) -> None:
+        from diffquorum.plan_lock import (
+            build_pre_invocation_pending_banner,
+            close_pending_plan,
+            format_pending_plans_bar,
+            open_pending_plan,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            primary = root / "primary_plans.json"
+            mirror = root / "mirror_plans.json"
+
+            # 1) Absent file -> 0 bytes / 0 lines
+            self.assertEqual(build_pre_invocation_pending_banner("builder", primary, mirror_path=mirror), "")
+            self.assertEqual(format_pending_plans_bar(primary, mirror_path=mirror, width=60), "")
+
+            # 2) Open plans on lead, builder, and redacted vault seat
+            r1 = open_pending_plan(primary, seat="lead", scope="router-arch", title="[Step 1] Router Plan <script>x</script>")
+            r2 = open_pending_plan(primary, seat="builder", scope="ci-matrix", title="Packaging Matrix")
+            r3 = open_pending_plan(primary, seat="vault", scope="sensitive-audit", title="CONFIDENTIAL_AUDIT_TITLE")
+            self.assertFalse(r1["collision"])
+            self.assertFalse(r2["collision"])
+            self.assertFalse(r3["collision"])
+
+            # Mirror has older rev=1 -> reconciler picks primary (rev=3)
+            mirror.write_text('{"schema_version":"1.0","rev":1,"plans":[]}', encoding="utf-8")
+
+            banner = build_pre_invocation_pending_banner(
+                "builder",
+                primary,
+                mirror_path=mirror,
+                redacted_seats={"vault"},
+            )
+            self.assertIn("own:1 | peers:2 | total:3", banner)
+            self.assertIn("lead(", banner)
+            self.assertIn("builder(", banner)
+            self.assertIn("vault(1 pending)", banner)
+            self.assertNotIn("CONFIDENTIAL_AUDIT_TITLE", banner)
+            self.assertNotIn("sensitive-audit", banner)
+            self.assertNotIn("<script>", banner)
+
+            bar_wide = format_pending_plans_bar(primary, mirror_path=mirror, width=90, redacted_seats={"vault"})
+            self.assertTrue(bar_wide.startswith("[APR:3] "))
+            self.assertIn("vault(1 pending)", bar_wide)
+            self.assertNotIn("CONFIDENTIAL_AUDIT_TITLE", bar_wide)
+
+            bar_narrow = format_pending_plans_bar(primary, mirror_path=mirror, width=40, redacted_seats={"vault"})
+            self.assertLessEqual(len(bar_narrow), 40)
+
+            # 3) Close all 3 plans -> banner & bar collapse back to 0 bytes
+            for pid, owner in (
+                (r1["plan"]["plan_id"], "lead"),
+                (r2["plan"]["plan_id"], "builder"),
+                (r3["plan"]["plan_id"], "vault"),
+            ):
+                close_pending_plan(primary, seat=owner, plan_id=pid, status="APPROVED")
+            self.assertEqual(build_pre_invocation_pending_banner("builder", primary), "")
+            self.assertEqual(format_pending_plans_bar(primary), "")
+
+            # 4) Symlink and >16KB oversized files fail closed cleanly
+            sym = root / "sym.json"
+            sym.symlink_to(primary)
+            self.assertEqual(build_pre_invocation_pending_banner("builder", sym), "")
+            big = root / "big.json"
+            big.write_text('{"rev":99,"plans":[{"seat":"lead","status":"WAITING_APPROVE","title":"' + ("A" * 17000) + '"}]}', encoding="utf-8")
+            self.assertEqual(build_pre_invocation_pending_banner("builder", big), "")
+
+
 if __name__ == "__main__":
     sys.exit(main())
