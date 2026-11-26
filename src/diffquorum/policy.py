@@ -5,19 +5,23 @@
 Clean-room multi-agent governance policies (`policy.py`):
   1. Front-Door Discussion Cap (`D0..D2`) & Multi-Model Specialty Routing
   2. Blast-Radius 4-Tier Review Routing (`R0..R3`) with Pure-Copy Fast Lane (`R1`)
-  3. Negative-Experiment Double-Blind `Fold-A / Fold-B` M&M Autopsy Verifier
-  4. Machine-Readable Master Dictionary Cross-Repo Drift & Typography Guard
+     and `commercial_flagship_deliverable` Non-Code `R3` Domain
+  3. Post-Launch Zero-Context Blind Evaluation (`B0..B2`) for Live Products & Commercial Deliverables
+  4. Negative-Experiment Double-Blind `Fold-A / Fold-B` M&M Autopsy Verifier
+  5. Machine-Readable Master Dictionary Cross-Repo Drift & Typography Guard
 """
 
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import math
 import os
 import pathlib
 import re
 import stat
+import urllib.parse
 from typing import Any
 
 DISCUSSION_TIERS: dict[str, dict[str, Any]] = {
@@ -73,8 +77,40 @@ R3_CRITICAL_DOMAINS: frozenset[str] = frozenset(
         "auth_or_multitenant_privacy",
         "core_scoring_or_ledger_math",
         "state_schema_or_migration",
+        "commercial_flagship_deliverable",
     }
 )
+
+BLIND_EVAL_TIERS: dict[str, dict[str, Any]] = {
+    "B0": {
+        "label": "skip_blind_eval",
+        "min_evaluators": 0,
+        "max_evaluators": 0,
+        "max_rounds": 0,
+        "description": "Internal maintenance or non-user-facing change: skip post-launch blind evaluation.",
+    },
+    "B1": {
+        "label": "single_release_or_commercial_deliverable",
+        "min_evaluators": 1,
+        "max_evaluators": 2,
+        "max_rounds": 1,
+        "description": "Single feature launch or external commercial deliverable: 1..2 zero-context cross-family blind evaluators, 1 round into next-version backlog.",
+    },
+    "B2": {
+        "label": "flagship_launch_cold_start",
+        "min_evaluators": 2,
+        "max_evaluators": 3,
+        "max_rounds": 1,
+        "description": "Flagship product cold-start launch: 2..3 distinct cross-family blind evaluators with optional user personas, 1 round into next-version backlog.",
+    },
+}
+
+CGNAT_NETWORK = ipaddress.IPv4Network((0x64400000, 10))
+FAKE_IP_NETWORK = ipaddress.IPv4Network((0xC6120000, 15))
+PUBLIC_ARTIFACT_URI_RE = re.compile(r"^public-artifact:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+LOCAL_PATH_PREFIX_RE = re.compile(r"^(?:/|~[/\\]|\.{1,2}[/\\]|[A-Za-z]:[/\\]|file://)", re.IGNORECASE)
+INTERNAL_HOST_SUFFIXES: tuple[str, ...] = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".corp", ".intranet")
+NUMERIC_OR_HEX_LABEL_RE = re.compile(r"^(?:\d+|0x[0-9a-f]+)$", re.IGNORECASE)
 
 MM_TRIGGER_STATUSES: frozenset[str] = frozenset({"REJECTED", "HOLD", "UNPROMOTED", "ANOMALY"})
 MM_VALID_DIRECTIONS: frozenset[str] = frozenset({"up", "down", "threshold", "nonzero"})
@@ -346,6 +382,143 @@ def evaluate_blast_radius_route(
         "required_blind_reviewers": required_blind_reviewers,
         "fast_lane_eligible": effective_tier in ("R0", "R1"),
         "rationale": rationale,
+        "issue_count": len(issues),
+        "issues": issues,
+    }
+
+
+def _is_valid_external_entrypoint(entrypoint: str) -> bool:
+    """Returns True only for genuine external HTTP(S) URLs or sanitized `public-artifact:` URIs."""
+    ep = str(entrypoint or "").strip()
+    if not ep or any(ch.isspace() for ch in ep) or LOCAL_PATH_PREFIX_RE.match(ep):
+        return False
+    if PUBLIC_ARTIFACT_URI_RE.fullmatch(ep):
+        return True
+    try:
+        parsed = urllib.parse.urlparse(ep)
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    if not host or host == "localhost" or any(host.endswith(sfx) for sfx in INTERNAL_HOST_SUFFIXES):
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        if "." not in host:
+            return False
+        labels = host.split(".")
+        if any(not lbl for lbl in labels) or all(NUMERIC_OR_HEX_LABEL_RE.fullmatch(lbl) for lbl in labels):
+            return False
+        return True
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if not addr.is_global:
+        return False
+    if isinstance(addr, ipaddress.IPv4Address) and (addr in CGNAT_NETWORK or addr in FAKE_IP_NETWORK):
+        return False
+    return True
+
+
+def evaluate_post_launch_blind_eval(
+    *,
+    tier: str,
+    author_family: str,
+    external_entrypoint: str = "",
+    leaked_internal_context: bool = False,
+    evaluator_models: list[str] | tuple[str, ...] = (),
+    evaluator_families: list[str] | tuple[str, ...] = (),
+    evaluator_personas: list[str] | tuple[str, ...] = (),
+    is_blocking_live_service: bool = False,
+    eval_round: int = 1,
+) -> dict[str, Any]:
+    """
+    Validates Stage-3 post-launch zero-context blind evaluation (`B0..B2`) for launched products
+    and external commercial deliverables: strictly non-blocking (`is_blocking_live_service=False`),
+    single-round backlog capture, genuine external entrypoint only, and distinct cross-family evaluators.
+    """
+    t = str(tier or "").strip().upper()
+    if t not in BLIND_EVAL_TIERS:
+        raise ValueError(f"Unsupported blind eval tier {tier!r}; expected one of {tuple(BLIND_EVAL_TIERS)}")
+    spec = BLIND_EVAL_TIERS[t]
+    issues: list[str] = []
+
+    if is_blocking_live_service is not False:
+        issues.append("blind_eval_must_not_block_live_service: Stage-3 blind evaluation feeds backlog only and must never block live service")
+    if isinstance(eval_round, bool) or not isinstance(eval_round, int) or eval_round < 0:
+        issues.append(f"invalid_eval_round: eval_round={eval_round!r} must be a non-negative integer")
+    elif t == "B0" and eval_round > 0:
+        issues.append(f"blind_eval_round_cap_exceeded: tier B0 requires eval_round == 0, got {eval_round}")
+    elif t in ("B1", "B2") and eval_round != 1:
+        issues.append(
+            f"blind_eval_round_cap_exceeded: tier {t} caps blind eval at 1 round into next-version backlog, got {eval_round}"
+            if eval_round > 1
+            else f"invalid_eval_round: tier {t} requires eval_round == 1, got {eval_round}"
+        )
+
+    auth_fam = _norm_token(author_family)
+    if not auth_fam:
+        issues.append("missing_author_family: author_family must be non-empty")
+
+    raw_models = list(evaluator_models)
+    raw_families = list(evaluator_families)
+    raw_personas = list(evaluator_personas)
+    if any(not str(m).strip() for m in raw_models):
+        issues.append("blank_evaluator_model: evaluator_models contains empty entry")
+    if any(not _norm_token(f) for f in raw_families):
+        issues.append("blank_evaluator_family: evaluator_families contains empty entry")
+    if any(not _norm_token(p) for p in raw_personas):
+        issues.append("blank_evaluator_persona: evaluator_personas contains empty entry")
+
+    models = [str(m).strip() for m in raw_models if str(m).strip()]
+    families = [_norm_token(f) for f in raw_families if _norm_token(f)]
+    personas = [_norm_token(p) for p in raw_personas if _norm_token(p)]
+
+    for mdl in models:
+        if LIGHTWEIGHT_MODEL_RE.search(mdl):
+            issues.append(f"lightweight_model_forbidden: {mdl!r} is forbidden for Stage-3 blind evaluation")
+    if (models or families) and len(families) != len(models):
+        issues.append(f"family_count_mismatch: {len(models)} evaluator_models != {len(families)} evaluator_families")
+    if auth_fam and auth_fam in families:
+        issues.append(f"same_family_self_eval: evaluator family matches author_family {auth_fam!r}")
+    if len(families) >= 2 and len(set(families)) < len(families):
+        issues.append("duplicate_evaluator_family: Stage-3 blind evaluators must belong to distinct model families")
+
+    distinct_ext = {f for f in families if f != auth_fam} if auth_fam else set(families)
+    if t == "B0":
+        if models or families:
+            issues.append("unexpected_evaluators_for_b0: tier B0 skips blind evaluation (0 evaluators)")
+    else:
+        if leaked_internal_context is not False:
+            issues.append("internal_context_leaked: Stage-3 evaluators must receive zero internal docs, code, or chat history")
+        if not _is_valid_external_entrypoint(external_entrypoint):
+            issues.append(
+                f"invalid_or_internal_external_entrypoint: {external_entrypoint!r} must be a public HTTP(S) URL or public-artifact:<slug>"
+            )
+        if len(models) < int(spec["min_evaluators"]) or len(distinct_ext) < int(spec["min_evaluators"]):
+            issues.append(
+                f"insufficient_blind_evaluators: tier {t} requires >= {spec['min_evaluators']} distinct cross-family blind evaluator(s)"
+            )
+        if len(models) > int(spec["max_evaluators"]) or len(families) > int(spec["max_evaluators"]):
+            issues.append(
+                f"too_many_blind_evaluators: tier {t} caps blind evaluators at <= {spec['max_evaluators']}"
+            )
+        if personas:
+            if len(personas) != len(models):
+                issues.append(f"persona_count_mismatch: {len(personas)} evaluator_personas != {len(models)} evaluator_models")
+            elif len(personas) >= 2 and len(set(personas)) < len(personas):
+                issues.append("duplicate_evaluator_persona: evaluator_personas must be distinct across evaluators")
+
+    return {
+        "ok": len(issues) == 0,
+        "tier": t,
+        "label": spec["label"],
+        "max_rounds": spec["max_rounds"],
+        "min_evaluators": spec["min_evaluators"],
+        "max_evaluators": spec["max_evaluators"],
+        "distinct_evaluator_families": sorted(distinct_ext),
+        "backlog_only": True,
         "issue_count": len(issues),
         "issues": issues,
     }

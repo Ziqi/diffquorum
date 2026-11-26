@@ -52,6 +52,7 @@ EXPLICIT_APPROVAL_SENTENCE_RE = re.compile(
     r"(?:"
     r"(?:按(?:照)?(?:你(?:的)?|上述|上面(?:的)?|这个|该|本)?(?:推荐|建议|方案|计划)(?:的)?[\s,，:：—-]*)?"
     r"(?:我(?:们)?[\s,，]*)?"
+    r"(?:(?:其他|其它|其余|剩下(?:的)?|剩余(?:的)?|余下(?:的)?)[\s,，:：—-]*)?"
     r"(?:(?:一起|一并|一块|全部|全都|全|都)[\s,，:：—-]*)?"
     r"(?:approve(?:d)?|同意(?:执行|了)?|批准(?:执行|了)?|确认执行|通过|可以)"
     r"(?:[\s,，:：—-]+"
@@ -59,6 +60,19 @@ EXPLICIT_APPROVAL_SENTENCE_RE = re.compile(
     r"|(?:请)?(?:按(?:照)?|照)(?:这个|该|本|上述|上面(?:的)?|你(?:的)?)(?:推荐|建议|方案|计划)?(?:一起|一并)?(?:直接|立即|开始)?执行(?:吧|了)?"
     r")"
     r"[~～]*$",
+    re.IGNORECASE,
+)
+TRAILING_REST_APPROVAL_SPLIT_RE = re.compile(
+    r"^(.+?)[\s,，]+((?:其他|其它|其余|剩下(?:的)?|剩余(?:的)?|余下(?:的)?)[\s,，:：—-]*"
+    r"(?:(?:一起|一并|一块|全部|全都|全|都)[\s,，:：—-]*)?"
+    r"(?:approve(?:d)?|同意(?:执行|了)?|批准(?:执行|了)?|确认执行|通过|可以)"
+    r"(?:[\s,，:：—-]+(?:please|go\s+ahead|proceed|(?:请)?(?:直接|立即|开始|继续)?执行(?:吧)?))?[~～]*)$",
+    re.IGNORECASE,
+)
+REMAINDER_APPROVAL_PREFIX_RE = re.compile(r"^(?:其他|其它|其余|剩下(?:的)?|剩余(?:的)?|余下(?:的)?)")
+SPLIT_PREFIX_NEGATION_RE = re.compile(
+    r"(?:不(?!错)|别|勿|未(?:通过|批准|确认|同意|就绪|完成)|没(?:通过|批准|确认|同意|完)|"
+    r"只(?:选|要|用|留|做|改)|仅(?:做|改|选|留|用)|暂缓|缓一缓|待定|有问题|先等等|再看看)",
     re.IGNORECASE,
 )
 NEGATED_OR_QUESTION_APPROVAL_RE = re.compile(
@@ -230,19 +244,34 @@ def classify_seat_state(
 
 
 def is_explicit_approval_text(text: str) -> bool:
-    """Fail-closed check supporting both leading and multi-sentence trailing human approvals (PF-023 & PF-031)."""
+    """Fail-closed check supporting leading, trailing, and space-separated `<selection> 其他/其余 approve` (PF-023/031/047)."""
     cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip().strip("\"'“”‘’`").strip()
     if not cleaned or len(cleaned) > 600:
         return False
     if REVOCATION_RE.search(cleaned):
         return False
-    sentences = [
+    raw_sentences = [
         s.strip().strip("\"'“”‘’`").strip()
         for s in re.findall(r"[^。.!！?？;；\n]+[?？]*", cleaned)
         if s.strip().strip("\"'“”‘’`").strip()
     ]
-    if not sentences:
+    if not raw_sentences:
         return False
+    sentences: list[str] = []
+    for sent in raw_sentences:
+        if not NEGATED_OR_QUESTION_APPROVAL_RE.search(sent) and EXPLICIT_APPROVAL_SENTENCE_RE.fullmatch(sent):
+            sentences.append(sent)
+            continue
+        m_split = TRAILING_REST_APPROVAL_SPLIT_RE.fullmatch(sent)
+        if m_split:
+            prefix_clause = m_split.group(1).strip()
+            tail_clause = m_split.group(2).strip()
+            if SPLIT_PREFIX_NEGATION_RE.search(prefix_clause):
+                return False
+            sentences.append(prefix_clause)
+            sentences.append(tail_clause)
+        else:
+            sentences.append(sent)
     approval_indices = [
         idx
         for idx, sent in enumerate(sentences)
@@ -251,6 +280,7 @@ def is_explicit_approval_text(text: str) -> bool:
     if not approval_indices:
         return False
     first_idx = approval_indices[0]
+    has_remainder_app = any(REMAINDER_APPROVAL_PREFIX_RE.match(sentences[i]) for i in approval_indices)
     app_set = set(approval_indices)
     for idx, sent in enumerate(sentences):
         if idx in app_set:
@@ -258,6 +288,8 @@ def is_explicit_approval_text(text: str) -> bool:
         if FOLLOWUP_RESTRICTION_RE.search(sent):
             return False
         if idx < first_idx and NEGATED_OR_QUESTION_APPROVAL_RE.search(sent):
+            return False
+        if has_remainder_app and idx < first_idx and SPLIT_PREFIX_NEGATION_RE.search(sent):
             return False
         if idx > first_idx and ("?" in sent or "？" in sent) and not POST_APPROVAL_CONFIRM_Q_RE.search(sent):
             return False

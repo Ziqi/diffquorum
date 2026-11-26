@@ -1,6 +1,6 @@
 # Production Pitfalls & Engineering Fixes (`DiffQuorum` Lessons Learned)
 
-Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **15 major pitfalls** and the deterministic fixes built into this toolkit.
+Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **18 major pitfalls** and the deterministic fixes built into this toolkit.
 
 ---
 
@@ -157,3 +157,14 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
   - Extended `plan open` / `plan list` with `--kind {PLAN,DECISION,CIRCUIT_BREAKER,INPUT_REQUIRED}` (`[DEC]/[CB]/[INP]` badges), added atomic in-place `plan reopen` (zero visibility gap + cross-seat collision check), and bounded retained closed history to the latest `200` items while never dropping any `WAITING_APPROVE` record.
   - Raised read-only `PENDING_PLANS_MAX_READ_BYTES` from `16 KiB` to `512 KiB` with bounded chunked reads, and allowed `plan reopen` + `~/bin/` in `validate_plan_hook_command`.
   - Added `evaluate_stop_consistency_gate` (fires ONLY on `NO_TOOL_CALL` + `fully_idle`, strips fenced/inline code before matching human-pause cues, catches false-zero own/peer footers, enforces a hard `continuation_active` 1-retry anti-loop guard, and supports `readonly_auto_register` for shell-less seats) plus `validate_hooks_json_schema` (enforcing flat vs grouped event schemas) and Gate 4 `has_waiting_pending_plan` wakeup protection.
+
+## 18. Post-Launch Blind Eval Context Leaks, Non-Code Flagship Drift & Space-Separated Approvals (`policy.py` & `wake_gates.py`)
+
+- **What broke**:
+  1. Teams either skipped post-launch cold-start user testing completely or handed internal source trees/localhost drafts to evaluators — leaking builder blind spots and turning post-launch UX checks into blocking release loops.
+  2. Non-code flagship commercial deliverables (client proposals, pricing decks, executive launches) bypassed `R3` dual-blind rigor because blast-radius rules only listed code domains.
+  3. Natural space-separated operator confirmations combining an affirmative selection with a trailing approval (e.g., `"Option A looks good, rest approve"` / `"方案A比较好 其他 approve"`) failed sentence-level regex matching when no period separated the two clauses.
+- **Root-cause fix (`evaluate_post_launch_blind_eval` / `blind-eval-check`, `R3_CRITICAL_DOMAINS`, `is_explicit_approval_text`)**:
+  - Extended `R3_CRITICAL_DOMAINS` with `commercial_flagship_deliverable` so flagship non-code proposals receive the same parallel dual-blind `R3` rigor as critical code.
+  - Added Stage-3 `B0–B2` post-launch zero-context blind evaluation (`diffquorum blind-eval-check`): strictly non-blocking (`is_blocking_live_service=False`), capped at `1` round feeding directly into the next-version backlog, requiring `leaked_internal_context=False`, a genuine public HTTP(S) URL or `public-artifact:<slug>` entrypoint (rejecting `localhost`, loopback, RFC1918/CGNAT/link-local/Fake-IP ranges, `file://`, and local paths), distinct cross-family evaluators, and zero lightweight models.
+  - Upgraded `is_explicit_approval_text` with a fail-closed space/comma clause splitter (`TRAILING_REST_APPROVAL_SPLIT_RE`) that accepts affirmative `<selection> 其他/其余 approve` phrasing while immediately rejecting any negation, restriction (`除了`/`只做`/`先别`), question, or revocation.

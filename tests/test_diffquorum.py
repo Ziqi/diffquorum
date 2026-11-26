@@ -2035,6 +2035,160 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
             # 8) Retention cap retains all WAITING_APPROVE + bounded latest closed entries
             self.assertEqual(PLAN_MAX_CLOSED_RETAIN, 200)
 
+    def test_29_three_stage_blind_eval_commercial_r3_and_space_approval(self) -> None:
+        from diffquorum.policy import evaluate_blast_radius_route, evaluate_post_launch_blind_eval
+        from diffquorum.wake_gates import is_explicit_approval_text
+
+        # 1) Non-code commercial_flagship_deliverable auto-escalates to R3 dual-blind review
+        r3_under = evaluate_blast_radius_route(
+            critical_domains_touched=["commercial_flagship_deliverable"],
+            claimed_tier="R2",
+            author_family="family_a",
+            reviewer_families=["family_b"],
+            has_written_spec=True,
+        )
+        self.assertFalse(r3_under["ok"])
+        self.assertEqual(r3_under["required_tier"], "R3")
+        r3_ok = evaluate_blast_radius_route(
+            critical_domains_touched=["commercial_flagship_deliverable"],
+            claimed_tier="R3",
+            author_family="family_a",
+            reviewer_families=["family_b", "family_c"],
+            has_written_spec=True,
+            independent_verification_passed=True,
+        )
+        self.assertTrue(r3_ok["ok"], r3_ok["issues"])
+
+        # 2) Stage-3 post-launch zero-context blind evaluation (B0..B2)
+        self.assertTrue(evaluate_post_launch_blind_eval(tier="B0", author_family="family_a", eval_round=0)["ok"])
+        self.assertFalse(evaluate_post_launch_blind_eval(tier="B0", author_family="family_a", eval_round=1)["ok"])
+        self.assertFalse(
+            evaluate_post_launch_blind_eval(
+                tier="B0",
+                author_family="family_a",
+                eval_round=0,
+                evaluator_models=["frontier-model-b"],
+                evaluator_families=["family_b"],
+            )["ok"]
+        )
+        self.assertTrue(
+            evaluate_post_launch_blind_eval(
+                tier="B1",
+                author_family="family_a",
+                external_entrypoint="public-artifact:executive-deck-v1.pdf",
+                evaluator_models=["frontier-model-b"],
+                evaluator_families=["family_b"],
+            )["ok"]
+        )
+        self.assertTrue(
+            evaluate_post_launch_blind_eval(
+                tier="B2",
+                author_family="family_a",
+                external_entrypoint="https://app.example.com/start",
+                evaluator_models=["frontier-model-b", "frontier-model-c"],
+                evaluator_families=["family_b", "family_c"],
+                evaluator_personas=["first_time_user", "enterprise_buyer"],
+            )["ok"]
+        )
+
+        # Reject internal/private/CGNAT/fake-IP/file/local entrypoints & context leaks
+        cgnat_host = ".".join(("100", "64", "2", "9"))
+        fake_host = ".".join(("198", "18", "0", "25"))
+        rfc1918_host = ".".join(("192", "168", "1", "20"))
+        for bad_ep in (
+            "",
+            "http://localhost:3000",
+            "http://127.0.0.1:8000",
+            f"http://{rfc1918_host}:8080",
+            f"http://{cgnat_host}/demo",
+            f"http://{fake_host}/demo",
+            f"http://[::ffff:{fake_host}]/demo",
+            f"http://[::ffff:{cgnat_host}]/demo",
+            "http://[invalid",
+            "http://intranet/portal",
+            "http://2130706433/",
+            "file:///etc/hosts",
+            "/tmp/internal-draft.pdf",
+            "~/private/spec.md",
+        ):
+            r_ep = evaluate_post_launch_blind_eval(
+                tier="B1",
+                author_family="family_a",
+                external_entrypoint=bad_ep,
+                evaluator_models=["frontier-model-b"],
+                evaluator_families=["family_b"],
+            )
+            self.assertFalse(r_ep["ok"], f"Expected rejection for internal entrypoint {bad_ep!r}")
+            self.assertTrue(any("invalid_or_internal_external_entrypoint" in x for x in r_ep["issues"]))
+
+        r_fail = evaluate_post_launch_blind_eval(
+            tier="B2",
+            author_family="family_a",
+            external_entrypoint="https://app.example.com",
+            leaked_internal_context=True,
+            is_blocking_live_service=True,
+            eval_round=2,
+            evaluator_models=["small-fast-model", "frontier-model-a"],
+            evaluator_families=["family_b", "family_a"],
+            evaluator_personas=["buyer", "buyer"],
+        )
+        self.assertFalse(r_fail["ok"])
+        joined = "\n".join(r_fail["issues"])
+        for expected_code in (
+            "blind_eval_must_not_block_live_service",
+            "blind_eval_round_cap_exceeded",
+            "internal_context_leaked",
+            "lightweight_model_forbidden",
+            "same_family_self_eval",
+            "duplicate_evaluator_persona",
+        ):
+            self.assertIn(expected_code, joined)
+
+        # CLI blind-eval-check returns exit 0 on valid B2 and exit 2 on internal entrypoint
+        r_cli_ok = self.run_cli(
+            "blind-eval-check",
+            "--tier", "B2",
+            "--author-family", "family_a",
+            "--external-entrypoint", "https://app.example.com/demo",
+            "--evaluator-model", "frontier-model-b",
+            "--evaluator-family", "family_b",
+            "--evaluator-model", "frontier-model-c",
+            "--evaluator-family", "family_c",
+            "--evaluator-persona", "buyer",
+            "--evaluator-persona", "auditor",
+        )
+        self.assertEqual(r_cli_ok.returncode, 0, r_cli_ok.stdout + r_cli_ok.stderr)
+        r_cli_bad = self.run_cli(
+            "blind-eval-check",
+            "--tier", "B1",
+            "--author-family", "family_a",
+            "--external-entrypoint", "http://localhost:8080",
+            "--evaluator-model", "frontier-model-b",
+            "--evaluator-family", "family_b",
+            check=False,
+        )
+        self.assertEqual(r_cli_bad.returncode, 2)
+
+        # 3) Space- & comma-separated '<selection> 其他/其余 approve' (Fail-Closed on negations/restrictions)
+        self.assertTrue(is_explicit_approval_text("方案A比较好 其他 approve"))
+        self.assertTrue(is_explicit_approval_text("选项一不错，其余同意"))
+        self.assertTrue(is_explicit_approval_text("选方案二 剩下的都批准"))
+        for bad_txt in (
+            "方案A不好 其他 approve",
+            "方案A不好。其他 approve",
+            "方案A不好\n其他 approve",
+            "方案A未通过 其他 approve",
+            "只选方案A 其他 approve",
+            "方案A暂缓 其他 approve",
+            "别选方案A 其他 approve",
+            "除了方案B 其他 approve",
+            "只做方案A 其他 approve",
+            "先别改A 其他 approve",
+            "方案A行吗？其他 approve",
+            "不要用方案A 其他 approve",
+        ):
+            self.assertFalse(is_explicit_approval_text(bad_txt), f"Must reject {bad_txt!r}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,7 @@ from .policy import (
     audit_master_dictionary_drift,
     evaluate_blast_radius_route,
     evaluate_discussion_plan,
+    evaluate_post_launch_blind_eval,
     validate_mm_autopsy_packet,
 )
 from .wake_gates import evaluate_six_gates, is_explicit_approval_text, revocation_applies_to_scope
@@ -342,6 +343,17 @@ def main(argv: list[str] | None = None) -> int:
     p_risk.add_argument("--has-written-spec", action="store_true")
     p_risk.add_argument("--independent-verification-passed", action="store_true")
     p_risk.add_argument("--review-round", type=int, default=1)
+
+    p_be = sub.add_parser("blind-eval-check", help="校验阶段三上线后零上下文盲测 B0-B2 护栏（非阻塞、外部入口、跨家族）", allow_abbrev=False)
+    p_be.add_argument("--tier", required=True, choices=("B0", "B1", "B2"))
+    p_be.add_argument("--author-family", required=True)
+    p_be.add_argument("--external-entrypoint", default="")
+    p_be.add_argument("--leaked-internal-context", action="store_true")
+    p_be.add_argument("--blocking-live-service", action="store_true")
+    p_be.add_argument("--eval-round", type=int, default=1)
+    p_be.add_argument("--evaluator-model", action="append", default=[])
+    p_be.add_argument("--evaluator-family", action="append", default=[])
+    p_be.add_argument("--evaluator-persona", action="append", default=[])
 
     p_mm = sub.add_parser("mm-verify", help="校验负结果实验 Fold-A/Fold-B 隔离双盲 M&M 尸检数据包", allow_abbrev=False)
     p_mm.add_argument("--packet", required=True)
@@ -759,6 +771,21 @@ def main(argv: list[str] | None = None) -> int:
                 has_written_spec=args.has_written_spec,
                 independent_verification_passed=args.independent_verification_passed,
                 review_round=args.review_round,
+            )
+            _out(rep)
+            return 0 if rep["ok"] else 2
+
+        if args.cmd == "blind-eval-check":
+            rep = evaluate_post_launch_blind_eval(
+                tier=args.tier,
+                author_family=args.author_family,
+                external_entrypoint=args.external_entrypoint,
+                leaked_internal_context=args.leaked_internal_context,
+                evaluator_models=args.evaluator_model,
+                evaluator_families=args.evaluator_family,
+                evaluator_personas=args.evaluator_persona,
+                is_blocking_live_service=args.blocking_live_service,
+                eval_round=args.eval_round,
             )
             _out(rep)
             return 0 if rep["ok"] else 2

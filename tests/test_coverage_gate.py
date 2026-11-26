@@ -509,6 +509,9 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     assert wg.is_idle_cli_footer("⏵⏵ auto mode") is True
     assert wg.is_idle_cli_footer("? for short…") is True
     assert wg.is_explicit_approval_text("好嘞先睡了。approve") is True
+    assert wg.is_explicit_approval_text("方案A比较好 其他 approve") is True
+    assert wg.is_explicit_approval_text("方案A不好 其他 approve") is False
+    assert wg.is_explicit_approval_text("方案A不好。其他 approve") is False
     assert wg.is_explicit_approval_text("不通过") is False
     assert wg.is_explicit_approval_text("通过") is True
     assert wg.should_auto_exit_stale_copy_mode(pane_in_mode=True, min_client_idle_sec=200.0) is True
@@ -710,6 +713,67 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
         independent_verification_passed=True,
         claimed_tier="R3",
     )["ok"] is True
+    assert pol.evaluate_blast_radius_route(
+        critical_domains_touched=["commercial_flagship_deliverable"],
+        author_family="fam_a",
+        reviewer_families=["fam_b", "fam_c"],
+        has_written_spec=True,
+        independent_verification_passed=True,
+        claimed_tier="R3",
+    )["ok"] is True
+    assert pol.evaluate_post_launch_blind_eval(tier="B0", author_family="fam_a", eval_round=0)["ok"] is True
+    assert pol.evaluate_post_launch_blind_eval(tier="B0", author_family="fam_a", eval_round=1, evaluator_models=["m1"], evaluator_families=["fam_b"])["ok"] is False
+    assert pol.evaluate_post_launch_blind_eval(
+        tier="B1",
+        author_family="fam_a",
+        external_entrypoint="public-artifact:proposal-v1.pdf",
+        evaluator_models=["frontier-b"],
+        evaluator_families=["fam_b"],
+    )["ok"] is True
+    assert pol.evaluate_post_launch_blind_eval(
+        tier="B2",
+        author_family="fam_a",
+        external_entrypoint="https://portal.example.com/demo",
+        evaluator_models=["frontier-b", "frontier-c"],
+        evaluator_families=["fam_b", "fam_c"],
+        evaluator_personas=["buyer", "auditor"],
+    )["ok"] is True
+    cov_cgnat = ".".join(("100", "64", "1", "1"))
+    cov_pub_ip = ".".join(("93", "184", "216", "34"))
+    assert pol.evaluate_post_launch_blind_eval(
+        tier="B1", author_family="fam_a", external_entrypoint=f"https://{cov_pub_ip}/ok", evaluator_models=["frontier-b"], evaluator_families=["fam_b"]
+    )["ok"] is True
+    for bad_ep in ("", "ftp://example.com", "http://localhost:80", f"http://{cov_cgnat}/x", f"http://[::ffff:{cov_cgnat}]/x", "http://[invalid", "http://intranet/x", "http://127.0.0.1/x", "http://1.2.3/x"):
+        assert pol.evaluate_post_launch_blind_eval(
+            tier="B1", author_family="fam_a", external_entrypoint=bad_ep, evaluator_models=["frontier-b"], evaluator_families=["fam_b"]
+        )["ok"] is False
+    assert pol.evaluate_post_launch_blind_eval(
+        tier="B2",
+        author_family="",
+        external_entrypoint="https://portal.example.com",
+        leaked_internal_context=True,
+        is_blocking_live_service=True,
+        eval_round=-1,
+        evaluator_models=["", "mini-x", "m3", "m4"],
+        evaluator_families=["", "fam_b", "fam_b"],
+        evaluator_personas=["", "p1", "p1"],
+    )["ok"] is False
+    assert pol.evaluate_post_launch_blind_eval(
+        tier="B1",
+        author_family="fam_a",
+        external_entrypoint="https://portal.example.com",
+        eval_round=2,
+        evaluator_models=["frontier-b"],
+        evaluator_families=["fam_a"],
+        evaluator_personas=["p1", "p2"],
+    )["ok"] is False
+    try:
+        pol.evaluate_post_launch_blind_eval(tier="B9", author_family="fam_a")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for bad blind eval tier")
+
     try:
         pol.evaluate_blast_radius_route(claimed_tier="R9")
     except ValueError:
@@ -826,6 +890,8 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
         assert cli.main(["route-risk", "--pure-copy-candidate", "--claimed-tier", "R1"]) == 2
         assert cli.main(["route-risk", "--pure-copy-candidate", "--r1-invariants-json", "[]", "--claimed-tier", "R1"]) == 2
         assert cli.main(["route-risk", "--pure-copy-candidate", "--r1-invariants-json", json.dumps(all_r1), "--claimed-tier", "R1"]) == 0
+        assert cli.main(["blind-eval-check", "--tier", "B0", "--author-family", "fam_a", "--eval-round", "0"]) == 0
+        assert cli.main(["blind-eval-check", "--tier", "B1", "--author-family", "fam_a", "--external-entrypoint", "http://localhost:80"]) == 2
         assert cli.main(["mm-verify", "--packet", str(mm_file)]) == 0
         assert cli.main(["dict-check", "--dict", str(d_clean), "--target", str(dict_dir / "b.md")]) == 0
 
