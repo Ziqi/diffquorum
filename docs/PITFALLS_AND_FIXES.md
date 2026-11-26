@@ -1,6 +1,6 @@
 # Production Pitfalls & Engineering Fixes (`DiffQuorum` Lessons Learned)
 
-Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **13 major pitfalls** and the deterministic fixes built into this toolkit.
+Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **15 major pitfalls** and the deterministic fixes built into this toolkit.
 
 ---
 
@@ -121,3 +121,21 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
 - **Root-cause fix (`validate_plan_hook_command` + `build_headless_review_argv` / `validate_headless_review_spec`)**:
   - Share a single deterministic validator (`validate_plan_hook_command`) across every seat's `PreToolUse` hook so `plan list` (`allow_readonly`) and `plan open | close` (`allow_mutate`) are allowed symmetrically everywhere while failing closed on shell metacharacters or `--plans-file` / `--root` target-override flags.
   - Enforce explicit tool stripping (`--disallowed-tools` / `--tools ""` / `--no-tools`), reject live web-search trigger phrases in blind-review prompts, and bound per-chunk prompt size and timeout strictly below `300s` via `build_headless_review_argv` and `validate_headless_review_spec`.
+
+## 14. Multi-Model Talking-Shop Drift & Line-Count Review Misallocation (`D0–D2` + `R0–R3`)
+
+- **What broke**:
+  1. Inviting multiple LLMs to debate open-ended product/architecture topics without a concrete strawman or round cap degraded into multi-round talking shops, while routing lightweight models onto critical design tables caused shallow mistakes.
+  2. Gating reviews by raw diff line count wasted tokens auditing 200-line copy/label syncs while under-auditing 5-line changes touching billing/coupons, authentication/multi-tenant privacy (IDOR), core ranking/accounting math, or persistent schema migrations.
+- **Root-cause fix (`policy.py`: `discuss-check` & `route-risk`)**:
+  - **Front-door `D0–D2` single-round cap**: `D0` (`0` external advisors), `D1` (`1` matched specialist, `<= 1` round), `D2` (concrete strawman first, `<= 2` distinct cross-family blind advisors for `1` round; optional tie-breaker only on direct conflict; lightweight models blocked from decision tables).
+  - **Back-door `R0–R3` blast-radius routing**: `R0` (offline/read-only `<5s`), `R1` (pure-copy fast lane requiring all 5 zero-logic/storage/auth/route/CSS-bloat invariants -> auto-escalates to `R2` if any fails), `R2` (spec + `1` cross-family blind reviewer, `<= 2` rounds), `R3` (4 critical blast-radius domains -> `>= 2` distinct cross-family blind reviewers in parallel + independent recomputation/negative-security tests).
+
+## 15. Post-Hoc Self-Confirmation on Failed Experiments & Cross-Repo Terminology Drift (`Fold-A/B` M&M + `Master Dict`)
+
+- **What broke**:
+  1. Asking a single model to explain why a pre-registered experiment failed on the full diagnostic dataset produced persuasive post-hoc stories that hypothesized and "validated" on the exact same data slice (confirmation bias & holdout leakage).
+  2. Maintaining terminology, versions, and forbidden public jargon manually across multiple repositories and bilingual docs caused silent copy drift and dual-SSOT conflicts.
+- **Root-cause fix (`policy.py`: `mm-verify`, `partition_ab_folds` & `dict-check`)**:
+  - **Double-blind `Fold-A / Fold-B` M&M Autopsy**: Strictly offline research retrospective (`is_release_gate=false`, `autopsy_round=1`, zero holdout overlap). Splits diagnostic blocks into disjoint odd `Fold-A` (exposed to `>= 2` distinct cross-family blind diagnosticians with zero author bias) and sealed even `Fold-B`; requires `1..3` falsifiable hypotheses per diagnostician with fixed `SHA-256` receipts and `1..3` zero-retrain `Fold-B` probes (`<= 300s` each, Holm/Bonferroni/BH-FDR `alpha <= 0.05`).
+  - **Machine-readable `Master Dict` drift guard (`diffquorum dict-check`)**: Validates a single JSON SSOT (`O_NOFOLLOW`, bounded read), rejects dual-SSOT delegation conflicts, verifies canonical token presence across declared files, and scans target trees (`followlinks=False`) for forbidden public jargon, retired phrases, and `emoji_count == 0` invariants.

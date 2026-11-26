@@ -31,6 +31,7 @@ TARGET_FILES = (
     (SRC_DIR / "diffquorum" / "wake_gates.py").resolve(),
     (SRC_DIR / "diffquorum" / "ops.py").resolve(),
     (SRC_DIR / "diffquorum" / "plan_lock.py").resolve(),
+    (SRC_DIR / "diffquorum" / "policy.py").resolve(),
     (SRC_DIR / "diffquorum" / "cli.py").resolve(),
 )
 
@@ -603,6 +604,182 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
             pass
         else:
             raise AssertionError("expected ValueError from invalid build_headless_review_argv call")
+
+    # Exercise Governance Policy Suite (policy.py + CLI: D0-D2, R0-R3, Fold-A/B M&M, Master Dict)
+    from diffquorum import policy as pol
+
+    assert pol.evaluate_discussion_plan(tier="D0", rounds_requested=0, author_family="fam_a")["ok"] is True
+    assert pol.evaluate_discussion_plan(
+        tier="D1", rounds_requested=1, author_family="fam_a", advisor_models=["m1"], advisor_families=["fam_b"]
+    )["ok"] is True
+    assert pol.evaluate_discussion_plan(
+        tier="D2",
+        rounds_requested=1,
+        author_family="fam_a",
+        advisor_models=["m1", "m2", "m3"],
+        advisor_families=["fam_b", "fam_c", "fam_d"],
+        has_strawman=True,
+        tie_breaker_conflict=True,
+    )["ok"] is True
+    assert pol.evaluate_discussion_plan(
+        tier="D2", rounds_requested=2, author_family="", advisor_models=["mini-x", "m2"], advisor_families=["fam_b", "fam_b"]
+    )["ok"] is False
+    assert pol.evaluate_discussion_plan(tier="D1", rounds_requested=-1, author_family="fam_a")["ok"] is False
+    assert pol.evaluate_discussion_plan(
+        tier="D1", rounds_requested=1, author_family="fam_a", advisor_models=["m1"], advisor_families=["fam_b", "fam_c"]
+    )["ok"] is False
+    try:
+        pol.evaluate_discussion_plan(tier="D9", rounds_requested=0, author_family="fam_a")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for bad discussion tier")
+
+    all_r1 = {k: True for k in pol.R1_FAST_LANE_INVARIANTS}
+    assert pol.evaluate_blast_radius_route(offline_or_readonly=True, claimed_tier="R0")["ok"] is True
+    assert pol.evaluate_blast_radius_route(pure_copy_candidate=True, r1_invariants=all_r1, claimed_tier="R1")["ok"] is True
+    assert pol.evaluate_blast_radius_route(
+        pure_copy_candidate=True, r1_invariants={**all_r1, "zero_route_removals": False}, claimed_tier="R1"
+    )["ok"] is False
+    assert pol.evaluate_blast_radius_route(
+        author_family="fam_a", reviewer_families=["fam_b"], has_written_spec=True, claimed_tier="R2"
+    )["ok"] is True
+    assert pol.evaluate_blast_radius_route(
+        author_family="fam_a", reviewer_families=["fam_a"], has_written_spec=False, review_round=3, claimed_tier="R2"
+    )["ok"] is False
+    assert pol.evaluate_blast_radius_route(
+        critical_domains_touched=["billing_or_redemption", "unknown_dom"],
+        author_family="fam_a",
+        reviewer_families=["fam_a"],
+        claimed_tier="R2",
+        review_round=-1,
+    )["ok"] is False
+    assert pol.evaluate_blast_radius_route(
+        critical_domains_touched=["state_schema_or_migration"],
+        author_family="fam_a",
+        reviewer_families=["fam_b", "fam_c"],
+        has_written_spec=True,
+        independent_verification_passed=True,
+        claimed_tier="R3",
+    )["ok"] is True
+    try:
+        pol.evaluate_blast_radius_route(claimed_tier="R9")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for bad blast radius tier")
+
+    folds = pol.partition_ab_folds(["B1", "B2", "B3", "B4"], embargo_blocks=0, holdout_blocks=["B5"])
+    assert folds["fold_a"] == ["B1", "B3"] and folds["fold_b"] == ["B2", "B4"]
+    for bad_fold in (
+        lambda: pol.partition_ab_folds(["B1", "B2"], embargo_blocks=-1),
+        lambda: pol.partition_ab_folds(["B1", "B1"]),
+        lambda: pol.partition_ab_folds(["B1", "B5"], holdout_blocks=["B5"]),
+        lambda: pol.partition_ab_folds(["B1"]),
+    ):
+        try:
+            bad_fold()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError from partition_ab_folds")
+
+    mm_pkt = {
+        "experiment_status": "HOLD",
+        "is_release_gate": False,
+        "autopsy_round": 1,
+        "author_family": "fam_a",
+        "fold_a_blocks": ["B1", "B3"],
+        "fold_b_blocks": ["B2", "B4"],
+        "holdout_blocks": ["B5"],
+        "exposed_to_diagnosticians": "fold_a_only",
+        "contains_author_hypotheses": False,
+        "diagnosticians": [
+            {
+                "model_family": "fam_b",
+                "saw_fold_b": False,
+                "report_sha256": "1" * 64,
+                "hypotheses": [{"mechanism": "m", "fold_b_metric": "k", "expected_direction": "up", "single_variable_change": "v"}],
+            },
+            {
+                "model_family": "fam_c",
+                "saw_fold_b": False,
+                "report_sha256": "2" * 64,
+                "hypotheses": [{"mechanism": "m2", "fold_b_metric": "k2", "expected_direction": "down", "single_variable_change": "v2"}],
+            },
+        ],
+        "converged_probes": [{"fold_b_metric": "k", "zero_retrain": True, "max_runtime_sec": 60}],
+        "multiple_testing_correction": "holm",
+        "alpha": 0.05,
+    }
+    assert pol.validate_mm_autopsy_packet(mm_pkt)["ok"] is True
+    assert pol.validate_mm_autopsy_packet(
+        {
+            "experiment_status": "PASSED",
+            "is_release_gate": True,
+            "autopsy_round": 2,
+            "author_family": "fam_a",
+            "fold_a_blocks": ["B1", "B5"],
+            "fold_b_blocks": ["B1"],
+            "holdout_blocks": ["B5"],
+            "exposed_to_diagnosticians": "full",
+            "contains_author_hypotheses": True,
+            "diagnosticians": [
+                {"model_family": "fam_a", "saw_fold_b": True, "report_sha256": "bad", "hypotheses": [{"expected_direction": "sideways"}]},
+                "not_a_dict",
+            ],
+            "converged_probes": [{"zero_retrain": False, "max_runtime_sec": 999}],
+            "multiple_testing_correction": "none",
+            "alpha": float("nan"),
+        }
+    )["ok"] is False
+
+    dict_dir = temp_root / "dict_cov"
+    dict_dir.mkdir(parents=True)
+    d_json = dict_dir / "master.json"
+    d_json.write_text(
+        json.dumps(
+            {
+                "schema_version": "diffquorum_master_dict/v1",
+                "version": "1.0.0",
+                "single_authority_domains": {"nav": "NAMING_V1"},
+                "canonical_tokens": {"ver": {"value": "v2.0", "required_in": ["a.md", "../escape.md", "missing.md"]}},
+                "canonical_terms": {"t": {"forbidden": ["badword"]}},
+                "retired_phrases": ["oldphrase"],
+                "typography_invariants": {"emoji_count": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (dict_dir / "a.md").write_text("v1.0 badword oldphrase \U0001f7e2\n", encoding="utf-8")
+    (dict_dir / "b.md").write_text("v2.0 clean\n", encoding="utf-8")
+    d_clean = dict_dir / "master_clean.json"
+    d_clean.write_text(
+        json.dumps(
+            {
+                "schema_version": "diffquorum_master_dict/v1",
+                "version": "1.0.0",
+                "canonical_tokens": {"ver": {"value": "v2.0", "required_in": ["b.md"]}},
+                "canonical_terms": {"t": {"forbidden": ["badword"]}},
+                "retired_phrases": ["oldphrase"],
+                "typography_invariants": {"emoji_count": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert pol.audit_master_dictionary_drift(d_json, dict_dir, exclude_paths=["b.md"])["ok"] is False
+    assert pol.audit_master_dictionary_drift(d_json, dict_dir / "a.md")["ok"] is False
+    assert pol.audit_master_dictionary_drift(d_clean, dict_dir / "b.md")["ok"] is True
+
+    mm_file = dict_dir / "mm.json"
+    mm_file.write_text(json.dumps(mm_pkt), encoding="utf-8")
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        assert cli.main(["discuss-check", "--tier", "D0", "--rounds", "0", "--author-family", "fam_a"]) == 0
+        assert cli.main(["route-risk", "--pure-copy-candidate", "--claimed-tier", "R1"]) == 2
+        assert cli.main(["route-risk", "--pure-copy-candidate", "--r1-invariants-json", "[]", "--claimed-tier", "R1"]) == 2
+        assert cli.main(["route-risk", "--pure-copy-candidate", "--r1-invariants-json", json.dumps(all_r1), "--claimed-tier", "R1"]) == 0
+        assert cli.main(["mm-verify", "--packet", str(mm_file)]) == 0
+        assert cli.main(["dict-check", "--dict", str(d_clean), "--target", str(dict_dir / "b.md")]) == 0
 
     shutil.rmtree(ws, ignore_errors=True)
 

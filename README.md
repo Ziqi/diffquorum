@@ -13,7 +13,7 @@
 
 **Zero-dependency multi-agent session coordination (`<400B` pointer blackboard, 6-gate modal-aware idle wakeup), Stage-2 blind anti-fake-quorum verifier & 0-token pitfall ratchet for AI coding agents.** *(Formerly `StarCouncil`; seamlessly supports `.starcouncil/` workspaces and `starcouncil` CLI shims.)*
 
-Language: **English** | [简体中文 (Simplified Chinese)](./README.zh-CN.md) | [13 Production Pitfalls & Fixes](./docs/PITFALLS_AND_FIXES.md)
+Language: **English** | [简体中文 (Simplified Chinese)](./README.zh-CN.md) | [15 Production Pitfalls & Fixes](./docs/PITFALLS_AND_FIXES.md)
 
 ---
 
@@ -25,6 +25,7 @@ Most multi-agent setups copy-paste walls of text across panes, wake busy/approva
 - **6-Gate ANSI- & Modal-Aware Idle Wakeup (`wake-check`)**: Strips ANSI CSI/OSC escapes before prompt matching, detects interactive approval modals (`WAITING_MODAL_RE`) even above `> Ask anything...`, requires `#{client_activity} >= 15s` keyboard idle, ignores background `isDaemon` watchers, recovers cold-interrupted `ERROR_MESSAGE` streams, guards `P0/P1` tickets with bounded backoff + terminal receipt guarantees, and emits exact `BSpace` rollbacks across `agy`, `claude`, `codex`, and `opencode`.
 - **Pending-Plan Collision Lock & 0-Token `PreInvocation` Visibility (`plan` / `plan_lock.py`)**: Atomic `0600` + `flock` `diffquorum plan open | list | close` prevents competing drafts on the same logical scope, reconciles `own:X | peers:Y` turn-start banners (`0` bytes when idle, hard redaction for sensitive seats), and enforces symmetric multi-seat `PreToolUse` hook validation (`validate_plan_hook_command`).
 - **Stage-2 Blind `Peer A/B/C` Anti-Fake-Quorum Verifier & Headless CLI Guard (`quorum-*` / `governance.py`)**: Blocks single-model roleplay (`SOLO_SYNTHESIS`) unless `>= 2` independent authors, source kinds, and non-identical SHA-256 submissions exist on disk (optionally bound via `--diff-sha256`); exports anonymized `Peer A/B/C` packets (`blind_packet.md` + local `reveal_map.json`); and enforces tool-stripped `<300s` headless blind reviews (`build_headless_review_argv` / `validate_headless_review_spec`) plus 4-class objective `BLOCK` convergence & `release-preflight`.
+- **Governance Policy Suite (`discuss-check` / `route-risk` / `mm-verify` / `dict-check`)**: Enforces `D0–D2` single-round front-door exploration caps with cross-family specialty routing, `R0–R3` blast-radius review tiers (including a 5-invariant `R1` pure-copy fast lane and parallel dual-blind `R3` escalation for billing/auth/core-math/schema), `Fold-A / Fold-B` anti-self-confirmation double-blind M&M autopsies for failed experiments, and zero-token machine-readable `Master Dict` cross-repo drift/jargon/emoji auditing.
 - **`<1s` Zero-Token `preflight`, Lossless `curate` & Two-Round Andon Cord (`PITFALL_HALT`)**: Checks target writeability (catching read-only sandboxes / symlink traps), resource locks, and worker CLIs/state dirs before spending tokens; provides zero-delete SHA-256 ledger folding (`curate`), `0600` meeting/Q&A ledgers (`meetings` / `qa`), caps external review at `<= 2` rounds, and ships optional headless runner presets (`diffquorum preset --profile generic-ptr|claude-sub|codex|agy-hydrogen`).
 
 ## `.diffquorum/` 5 Live Archives

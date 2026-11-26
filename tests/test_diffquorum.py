@@ -1473,6 +1473,296 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_headless_review_argv("reviewer-cli", model="m1", prompt="p", disallowed_tools=())
 
+    def test_governance_policy_suite_discussion_blast_radius_mm_and_master_dict(self) -> None:
+        from diffquorum.policy import (
+            R1_FAST_LANE_INVARIANTS,
+            audit_master_dictionary_drift,
+            evaluate_blast_radius_route,
+            evaluate_discussion_plan,
+            partition_ab_folds,
+            validate_mm_autopsy_packet,
+        )
+
+        # 1) D0..D2 front-door discussion cap & specialty routing
+        self.assertTrue(evaluate_discussion_plan(tier="D0", rounds_requested=0, author_family="family_a")["ok"])
+        self.assertFalse(
+            evaluate_discussion_plan(
+                tier="D0", rounds_requested=1, author_family="family_a", advisor_models=["m1"], advisor_families=["family_b"]
+            )["ok"]
+        )
+        self.assertTrue(
+            evaluate_discussion_plan(
+                tier="D1",
+                rounds_requested=1,
+                author_family="family_a",
+                advisor_models=["frontier-b"],
+                advisor_families=["family_b"],
+                specialty_domain="pricing_and_product_pruning",
+            )["ok"]
+        )
+        d2_ok = evaluate_discussion_plan(
+            tier="D2",
+            rounds_requested=1,
+            author_family="family_a",
+            advisor_models=["frontier-b", "frontier-c"],
+            advisor_families=["family_b", "family_c"],
+            has_strawman=True,
+        )
+        self.assertTrue(d2_ok["ok"], d2_ok)
+        d2_bad = evaluate_discussion_plan(
+            tier="D2",
+            rounds_requested=2,
+            author_family="family_a",
+            advisor_models=["fast-mini-1", "frontier-a"],
+            advisor_families=["family_b", "family_a"],
+            has_strawman=False,
+        )
+        self.assertFalse(d2_bad["ok"])
+        joined_d2 = "\n".join(d2_bad["issues"])
+        self.assertIn("discussion_round_cap_exceeded", joined_d2)
+        self.assertIn("missing_strawman", joined_d2)
+        self.assertIn("lightweight_model_forbidden", joined_d2)
+        self.assertIn("same_family_self_review", joined_d2)
+
+        # 1b) Lightweight model delimiter checks (`:` / `@`) and D0 stray advisor_families
+        self.assertFalse(
+            evaluate_discussion_plan(
+                tier="D1",
+                rounds_requested=1,
+                author_family="family_a",
+                advisor_models=["phi4-mini:latest"],
+                advisor_families=["family_b"],
+            )["ok"]
+        )
+        self.assertFalse(
+            evaluate_discussion_plan(
+                tier="D0",
+                rounds_requested=0,
+                author_family="family_a",
+                advisor_families=["family_b"],
+            )["ok"]
+        )
+
+        # 2) R0..R3 blast-radius 4-tier routing including R1 pure-copy fast lane
+        self.assertTrue(evaluate_blast_radius_route(offline_or_readonly=True, claimed_tier="R0")["ok"])
+        all_r1 = {k: True for k in R1_FAST_LANE_INVARIANTS}
+        r1_ok = evaluate_blast_radius_route(pure_copy_candidate=True, r1_invariants=all_r1, claimed_tier="R1")
+        self.assertTrue(r1_ok["ok"] and r1_ok["fast_lane_eligible"])
+
+        # Violating or omitting R1 invariants must auto-escalate to R2 and reject claimed R1
+        r1_escalated = evaluate_blast_radius_route(
+            pure_copy_candidate=True,
+            r1_invariants={**all_r1, "zero_logic_math_changes": False},
+            claimed_tier="R1",
+        )
+        self.assertFalse(r1_escalated["ok"])
+        self.assertEqual(r1_escalated["required_tier"], "R2")
+
+        # Unknown critical domain must fail closed to R3 (never fast_lane_eligible)
+        r_unk = evaluate_blast_radius_route(
+            offline_or_readonly=True,
+            critical_domains_touched=["unlisted_critical_surface"],
+            claimed_tier="R0",
+        )
+        self.assertFalse(r_unk["ok"])
+        self.assertEqual(r_unk["required_tier"], "R3")
+        self.assertFalse(r_unk["fast_lane_eligible"])
+
+        # Critical domain auto-escalates to R3 requiring 2 distinct cross-family reviewers + independent tests
+        r3_bad = evaluate_blast_radius_route(
+            critical_domains_touched=["auth_or_multitenant_privacy"],
+            claimed_tier="R2",
+            author_family="family_a",
+            reviewer_families=["family_b"],
+            has_written_spec=True,
+        )
+        self.assertFalse(r3_bad["ok"])
+        self.assertEqual(r3_bad["required_tier"], "R3")
+        r3_ok = evaluate_blast_radius_route(
+            critical_domains_touched=["billing_or_redemption", "auth_or_multitenant_privacy"],
+            claimed_tier="R3",
+            author_family="family_a",
+            reviewer_families=["family_b", "family_c"],
+            has_written_spec=True,
+            independent_verification_passed=True,
+            review_round=2,
+        )
+        self.assertTrue(r3_ok["ok"], r3_ok)
+
+        # 3) Fold-A / Fold-B anti-self-confirmation double-blind M&M autopsy
+        folds = partition_ab_folds(["W01", "W02", "W03", "W04", "W05", "W06"], embargo_blocks=1, holdout_blocks=["W07"])
+        self.assertEqual(folds["fold_a"], ["W01", "W05"])
+        self.assertEqual(folds["fold_b"], ["W03"])
+        self.assertEqual(folds["embargoed"], ["W02", "W04", "W06"])
+        with self.assertRaises(ValueError):
+            partition_ab_folds(["W01", "W07"], holdout_blocks=["W07"])
+
+        valid_mm = {
+            "experiment_status": "REJECTED",
+            "is_release_gate": False,
+            "autopsy_round": 1,
+            "author_family": "family_a",
+            "fold_a_blocks": folds["fold_a"],
+            "fold_b_blocks": folds["fold_b"],
+            "holdout_blocks": ["W07"],
+            "exposed_to_diagnosticians": "fold_a_only",
+            "contains_author_hypotheses": False,
+            "diagnosticians": [
+                {
+                    "model_family": "family_b",
+                    "saw_fold_b": False,
+                    "report_sha256": "a" * 64,
+                    "hypotheses": [
+                        {
+                            "mechanism": "feature distribution shift in bucket 3",
+                            "fold_b_metric": "rank_corr_delta",
+                            "expected_direction": "up",
+                            "single_variable_change": "drop unstable feature group",
+                        }
+                    ],
+                },
+                {
+                    "model_family": "family_c",
+                    "saw_fold_b": False,
+                    "report_sha256": "b" * 64,
+                    "hypotheses": [
+                        {
+                            "mechanism": "cache eviction overhead under burst load",
+                            "fold_b_metric": "p99_latency_delta",
+                            "expected_direction": "threshold",
+                            "single_variable_change": "increase cache ttl window",
+                        }
+                    ],
+                },
+            ],
+            "converged_probes": [
+                {"fold_b_metric": "rank_corr_delta", "zero_retrain": True, "max_runtime_sec": 180},
+            ],
+            "multiple_testing_correction": "holm",
+            "alpha": 0.05,
+        }
+        self.assertTrue(validate_mm_autopsy_packet(valid_mm)["ok"])
+
+        # Hardening regressions: omitted author_family, unregistered Fold-B probe metric, 3-diag duplicate hash, huge int alpha
+        no_auth = {**valid_mm, "author_family": ""}
+        self.assertIn("missing_author_family", "\n".join(validate_mm_autopsy_packet(no_auth)["issues"]))
+        unreg_probe = {
+            **valid_mm,
+            "converged_probes": [{"fold_b_metric": "post_hoc_unlisted_metric", "zero_retrain": True, "max_runtime_sec": 60}],
+        }
+        self.assertIn("unregistered_fold_b_probe_metric", "\n".join(validate_mm_autopsy_packet(unreg_probe)["issues"]))
+        dup3 = {
+            **valid_mm,
+            "diagnosticians": [
+                *valid_mm["diagnosticians"],
+                {**valid_mm["diagnosticians"][0], "model_family": "family_d"},
+            ],
+        }
+        self.assertIn("duplicate_diagnosis_hashes", "\n".join(validate_mm_autopsy_packet(dup3)["issues"]))
+        huge_int = {**valid_mm, "alpha": 10**400}
+        self.assertIn("invalid_alpha", "\n".join(validate_mm_autopsy_packet(huge_int)["issues"]))
+
+        bad_mm = {
+            **valid_mm,
+            "is_release_gate": True,
+            "autopsy_round": 2,
+            "fold_b_blocks": ["W01", "W03"],
+            "exposed_to_diagnosticians": "full",
+            "contains_author_hypotheses": True,
+            "alpha": 0.25,
+        }
+        res_bad_mm = validate_mm_autopsy_packet(bad_mm)
+        self.assertFalse(res_bad_mm["ok"])
+        joined_mm = "\n".join(res_bad_mm["issues"])
+        self.assertIn("mm_must_not_be_release_gate", joined_mm)
+        self.assertIn("self_confirmation_leak", joined_mm)
+        self.assertIn("fold_b_exposed", joined_mm)
+
+        # 4) Machine-readable Master Dictionary cross-repo drift & emoji guard (+ CLI)
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            dict_p = troot / "master_dict.json"
+            dict_p.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "diffquorum_master_dict/v1",
+                        "version": "1.0.0",
+                        "single_authority_domains": {"primary_nav": "NAMING_V1"},
+                        "canonical_tokens": {
+                            "platform_version": {"value": "v2.0", "required_in": ["README.md", "README.zh-CN.md"]}
+                        },
+                        "canonical_terms": {
+                            "workspace": {"zh": "工作区", "en": "Workspace", "forbidden": ["legacy-box"]}
+                        },
+                        "retired_phrases": ["Old Brand v0"],
+                        "typography_invariants": {"emoji_count": 0},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (troot / "README.md").write_text("# Demo v2.0\nWorkspace docs.\n", encoding="utf-8")
+            (troot / "README.zh-CN.md").write_text("# 示例 v2.0\n工作区文档。\n", encoding="utf-8")
+            clean_rep = audit_master_dictionary_drift(dict_p, troot)
+            self.assertTrue(clean_rep["ok"], clean_rep)
+
+            # Single-file dict-check must STILL enforce canonical_tokens required_in + colored status emoji + invalid UTF-8 byte cannot bypass
+            (troot / "README.md").write_bytes(b"# Demo v1.9\nStatus: \xf0\x9f\x9f\xa2\xff legacy-box\n")
+            sf_rep = audit_master_dictionary_drift(dict_p, troot / "README.md")
+            self.assertFalse(sf_rep["ok"])
+            joined_sf = "\n".join(sf_rep["findings"])
+            self.assertIn("canonical_token_drift", joined_sf)
+            self.assertIn("legacy-box", joined_sf)
+            self.assertIn("emoji violation", joined_sf)
+
+            # FIFO in directory must not hang or crash scanner
+            import os as _os
+
+            if hasattr(_os, "mkfifo"):
+                _os.mkfifo(str(troot / "dummy.fifo"))
+
+            # Introduce drift, forbidden phrase, and emoji -> Fail-Closed
+            (troot / "README.md").write_text("# Demo v1.9\nUses legacy-box and Old Brand v0 \U0001f680\n", encoding="utf-8")
+            drift_rep = audit_master_dictionary_drift(dict_p, troot)
+            self.assertFalse(drift_rep["ok"])
+            joined_dr = "\n".join(drift_rep["findings"])
+            self.assertIn("canonical_token_drift", joined_dr)
+            self.assertIn("legacy-box", joined_dr)
+            self.assertIn("Old Brand v0", joined_dr)
+            self.assertIn("emoji violation", joined_dr)
+
+            # CLI exit codes: 0 on pass, 2 on fail (including Fail-Closed R1 without explicit invariants JSON)
+            mm_file = troot / "mm_valid.json"
+            mm_file.write_text(json.dumps(valid_mm), encoding="utf-8")
+            self.assertEqual(self.run_cli("mm-verify", "--packet", str(mm_file)).returncode, 0)
+            self.assertEqual(
+                self.run_cli("discuss-check", "--tier", "D0", "--rounds", "0", "--author-family", "family_a").returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli("route-risk", "--offline-or-readonly", "--claimed-tier", "R0").returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli("route-risk", "--pure-copy-candidate", "--claimed-tier", "R1", check=False).returncode,
+                2,
+            )
+            self.assertEqual(
+                self.run_cli(
+                    "route-risk",
+                    "--pure-copy-candidate",
+                    "--r1-invariants-json",
+                    json.dumps(all_r1),
+                    "--claimed-tier",
+                    "R1",
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli("dict-check", "--dict", str(dict_p), "--target", str(troot), check=False).returncode,
+                2,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

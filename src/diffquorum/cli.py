@@ -47,6 +47,13 @@ from .governance import (
 )
 from .ops import collect_ast_imports, curate_ledger, list_meetings, record_meeting, render_dual_hud, run_readonly_probe, summarize_qa_directory
 from .plan_lock import close_pending_plan, list_pending_plans, open_pending_plan
+from .policy import (
+    _read_json_nofollow_bounded,
+    audit_master_dictionary_drift,
+    evaluate_blast_radius_route,
+    evaluate_discussion_plan,
+    validate_mm_autopsy_packet,
+)
 from .wake_gates import evaluate_six_gates, is_explicit_approval_text, revocation_applies_to_scope
 
 
@@ -301,6 +308,37 @@ def main(argv: list[str] | None = None) -> int:
     p_mtg_ls.add_argument("--ledger", required=True)
     p_mtg_ls.add_argument("--limit", type=int, default=20)
     p_mtg_ls.add_argument("--digest", action="store_true")
+
+    # 14. Governance Policy Suite (D0-D2 discussion cap, R0-R3 blast-radius routing, Fold-A/B M&M autopsy, Master Dict drift)
+    p_disc = sub.add_parser("discuss-check", help="校验前门探讨 D0-D2 单轮封顶、靶子底稿与异构专长派工", allow_abbrev=False)
+    p_disc.add_argument("--tier", required=True, choices=("D0", "D1", "D2"))
+    p_disc.add_argument("--rounds", type=int, default=0)
+    p_disc.add_argument("--author-family", required=True)
+    p_disc.add_argument("--advisor-model", action="append", default=[])
+    p_disc.add_argument("--advisor-family", action="append", default=[])
+    p_disc.add_argument("--has-strawman", action="store_true")
+    p_disc.add_argument("--tie-breaker-conflict", action="store_true")
+    p_disc.add_argument("--specialty-domain", default="")
+
+    p_risk = sub.add_parser("route-risk", help="按爆炸半径校验 R0-R3 四档审查路由 (含 R1 纯文案快检直通车)", allow_abbrev=False)
+    p_risk.add_argument("--offline-or-readonly", action="store_true")
+    p_risk.add_argument("--pure-copy-candidate", action="store_true")
+    p_risk.add_argument("--r1-invariants-json", default="")
+    p_risk.add_argument("--critical-domain", action="append", default=[])
+    p_risk.add_argument("--claimed-tier", default="")
+    p_risk.add_argument("--author-family", default="")
+    p_risk.add_argument("--reviewer-family", action="append", default=[])
+    p_risk.add_argument("--has-written-spec", action="store_true")
+    p_risk.add_argument("--independent-verification-passed", action="store_true")
+    p_risk.add_argument("--review-round", type=int, default=1)
+
+    p_mm = sub.add_parser("mm-verify", help="校验负结果实验 Fold-A/Fold-B 隔离双盲 M&M 尸检数据包", allow_abbrev=False)
+    p_mm.add_argument("--packet", required=True)
+
+    p_dict = sub.add_parser("dict-check", help="基于机器可读 Master Dict 主词典执行跨仓口径漂移与禁词扫描", allow_abbrev=False)
+    p_dict.add_argument("--dict", dest="dict_path", required=True)
+    p_dict.add_argument("--target", required=True)
+    p_dict.add_argument("--exclude", action="append", default=[])
 
     args = parser.parse_args(argv)
     try:
@@ -665,6 +703,50 @@ def main(argv: list[str] | None = None) -> int:
             if args.mtg_action == "list":
                 _out(list_meetings(args.ledger, limit=args.limit, digest_only=args.digest))
                 return 0
+
+        if args.cmd == "discuss-check":
+            rep = evaluate_discussion_plan(
+                tier=args.tier,
+                rounds_requested=args.rounds,
+                author_family=args.author_family,
+                advisor_models=args.advisor_model,
+                advisor_families=args.advisor_family,
+                has_strawman=args.has_strawman,
+                tie_breaker_conflict=args.tie_breaker_conflict,
+                specialty_domain=args.specialty_domain,
+            )
+            _out(rep)
+            return 0 if rep["ok"] else 2
+
+        if args.cmd == "route-risk":
+            inv_map = json.loads(args.r1_invariants_json) if args.r1_invariants_json.strip() else None
+            if inv_map is not None and not isinstance(inv_map, dict):
+                raise ValueError("--r1-invariants-json must decode to a JSON object")
+            rep = evaluate_blast_radius_route(
+                offline_or_readonly=args.offline_or_readonly,
+                pure_copy_candidate=args.pure_copy_candidate,
+                r1_invariants=inv_map,
+                critical_domains_touched=args.critical_domain,
+                claimed_tier=args.claimed_tier,
+                author_family=args.author_family,
+                reviewer_families=args.reviewer_family,
+                has_written_spec=args.has_written_spec,
+                independent_verification_passed=args.independent_verification_passed,
+                review_round=args.review_round,
+            )
+            _out(rep)
+            return 0 if rep["ok"] else 2
+
+        if args.cmd == "mm-verify":
+            pkt, _sha = _read_json_nofollow_bounded(args.packet)
+            rep = validate_mm_autopsy_packet(pkt)
+            _out(rep)
+            return 0 if rep["ok"] else 2
+
+        if args.cmd == "dict-check":
+            rep = audit_master_dictionary_drift(args.dict_path, args.target, exclude_paths=args.exclude)
+            _out(rep)
+            return 0 if rep["ok"] else 2
     except Exception as exc:
         _out({"ok": False, "error": str(exc)})
         return 2
