@@ -518,9 +518,11 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
             self.assertEqual(dq_dir(legacy_ws), legacy_dir)
             self.assertIn("Legacy Board", read_board(legacy_ws))
 
+            import diffquorum
+
             shim_ver = self.run_cli("--version", script_path=LEGACY_SCRIPT)
             self.assertEqual(shim_ver.returncode, 0)
-            self.assertIn("0.3.0.dev0", shim_ver.stdout.decode("utf-8"))
+            self.assertIn(diffquorum.__version__, shim_ver.stdout.decode("utf-8"))
 
     def test_13_wake_gates_ansi_strip_unicode_ellipsis_and_modal_blocking(self) -> None:
         colored_prompt = "\x1b[32m>\x1b[0m\x1b[3CAsk anything..."
@@ -1335,6 +1337,141 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
             self.assertIn("Arch Sync", list_meetings(mpath, digest_only=True)["digest"])
             latch = evaluate_two_cap_alert_latch({"s1": 2}, ["s1"], hour_local=14)
             self.assertEqual(latch["notify_keys"], [])
+
+    def test_pre_invocation_pending_banner_own_vs_peer_split_auto_collapse_and_redaction(self) -> None:
+        from diffquorum.plan_lock import (
+            build_pre_invocation_pending_banner,
+            close_pending_plan,
+            format_pending_plans_bar,
+            open_pending_plan,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            primary = root / "primary_plans.json"
+            mirror = root / "mirror_plans.json"
+
+            self.assertEqual(build_pre_invocation_pending_banner("builder", primary, mirror_path=mirror), "")
+            self.assertEqual(format_pending_plans_bar(primary, mirror_path=mirror, width=60), "")
+
+            r1 = open_pending_plan(primary, seat="lead", scope="router-arch", title="[Step 1] Router Plan <script>x</script>")
+            r2 = open_pending_plan(primary, seat="builder", scope="ci-matrix", title="Packaging Matrix")
+            r3 = open_pending_plan(primary, seat="vault", scope="sensitive-audit", title="CONFIDENTIAL_AUDIT_TITLE")
+            self.assertFalse(r1["collision"])
+            self.assertFalse(r2["collision"])
+            self.assertFalse(r3["collision"])
+
+            mirror.write_text('{"schema_version":"1.0","rev":1,"plans":[]}', encoding="utf-8")
+
+            banner = build_pre_invocation_pending_banner(
+                "builder",
+                primary,
+                mirror_path=mirror,
+                redacted_seats={"vault"},
+            )
+            self.assertIn("own:1 | peers:2 | total:3", banner)
+            self.assertIn("lead(", banner)
+            self.assertIn("builder(", banner)
+            self.assertIn("vault(1 pending)", banner)
+            self.assertNotIn("CONFIDENTIAL_AUDIT_TITLE", banner)
+            self.assertNotIn("sensitive-audit", banner)
+            self.assertNotIn("<script>", banner)
+
+            bar_wide = format_pending_plans_bar(primary, mirror_path=mirror, width=90, redacted_seats={"vault"})
+            self.assertTrue(bar_wide.startswith("[APR:3] "))
+            self.assertIn("vault(1 pending)", bar_wide)
+            self.assertNotIn("CONFIDENTIAL_AUDIT_TITLE", bar_wide)
+
+            bar_narrow = format_pending_plans_bar(primary, mirror_path=mirror, width=40, redacted_seats={"vault"})
+            self.assertLessEqual(len(bar_narrow), 40)
+
+            for pid, owner in (
+                (r1["plan"]["plan_id"], "lead"),
+                (r2["plan"]["plan_id"], "builder"),
+                (r3["plan"]["plan_id"], "vault"),
+            ):
+                close_pending_plan(primary, seat=owner, plan_id=pid, status="APPROVED")
+            self.assertEqual(build_pre_invocation_pending_banner("builder", primary), "")
+            self.assertEqual(format_pending_plans_bar(primary), "")
+
+            sym = root / "sym.json"
+            sym.symlink_to(primary)
+            self.assertEqual(build_pre_invocation_pending_banner("builder", sym), "")
+            big = root / "big.json"
+            big.write_text(
+                '{"rev":99,"plans":[{"seat":"lead","status":"WAITING_APPROVE","title":"' + ("A" * 17000) + '"}]}',
+                encoding="utf-8",
+            )
+            self.assertEqual(build_pre_invocation_pending_banner("builder", big), "")
+
+    def test_plan_hook_allowlist_symmetry_and_headless_review_guards(self) -> None:
+        from diffquorum.governance import build_headless_review_argv, validate_headless_review_spec
+        from diffquorum.plan_lock import validate_plan_hook_command
+
+        # 1) Multi-seat PreToolUse hook symmetry for plan open/list/close
+        self.assertEqual(validate_plan_hook_command("diffquorum plan list")["mode"], "allow_readonly")
+        self.assertEqual(validate_plan_hook_command("python3 /usr/local/bin/star-bus.py plan open --seat s1 --scope demo --title T")["mode"], "allow_mutate")
+        self.assertEqual(validate_plan_hook_command("star-bus plan close --seat s1 --plan-id PLN-1 --status APPROVED")["mode"], "allow_mutate")
+        for bad_cmd in (
+            "",
+            "diffquorum plan list; id",
+            "diffquorum plan list --plans-file /tmp/evil.json",
+            "diffquorum plan list '--plans-file' /tmp/evil.json",
+            'diffquorum plan list "--plans-file=/tmp/evil.json"',
+            "diffquorum plan open --root /tmp/x --seat s1 --scope a --title b",
+            "diffquorum plan open '--root' /tmp/escape --seat s1 --scope a --title b",
+            'diffquorum plan open "--root=/tmp/escape" --seat s1 --scope a --title b',
+            "/tmp/attacker/diffquorum plan list",
+            "./diffquorum plan list",
+            "python3 diffquorum plan list",
+            "python3 star-bus.py plan open --seat s1 --scope a --title b",
+            "/tmp/attacker/python3 /usr/local/bin/star-bus.py plan list",
+            "diffquorum plan delete --seat s1",
+            "curl plan list",
+            "diffquorum dispatch --summary hi",
+            "diffquorum plan 'unterminated",
+        ):
+            res = validate_plan_hook_command(bad_cmd)
+            self.assertFalse(res["allowed"], f"Expected deny for {bad_cmd!r}: {res}")
+
+        # 1b) Symlinked plans_path leaf or parent must be rejected before dereferencing (O_NOFOLLOW parity)
+        from diffquorum.plan_lock import close_pending_plan, list_pending_plans, open_pending_plan, supersede_plans_for_scope
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            real_target = root / "real_plans.json"
+            leaf_link = root / "link_plans.json"
+            leaf_link.symlink_to(real_target)
+            with self.assertRaises(ValueError):
+                open_pending_plan(leaf_link, seat="lead", scope="sym-test", title="No")
+            with self.assertRaises(ValueError):
+                list_pending_plans(leaf_link)
+            with self.assertRaises(ValueError):
+                close_pending_plan(leaf_link, seat="lead", scope="sym-test")
+            with self.assertRaises(ValueError):
+                supersede_plans_for_scope(leaf_link, "sym-test", superseded_by="TKT-1")
+            self.assertFalse(real_target.exists())
+
+        # 2) Headless blind-review CLI tool-stripping, search-phrase blocking & <300s timeout guard
+        clean_prompt = "Audit the provided unified diff for objective defects only."
+        argv = build_headless_review_argv("reviewer-cli", model="frontier-reasoner", prompt=clean_prompt)
+        self.assertIn("--disallowed-tools", argv)
+        ok_spec = validate_headless_review_spec(argv=argv, prompt=clean_prompt, timeout_sec=180)
+        self.assertTrue(ok_spec["ok"], ok_spec)
+
+        bad_spec = validate_headless_review_spec(
+            argv=["reviewer-cli", "--print", clean_prompt],
+            prompt="Please web_search the latest docs and audit this diff.",
+            timeout_sec=360,
+        )
+        self.assertFalse(bad_spec["ok"])
+        joined = "\n".join(bad_spec["issues"])
+        self.assertIn("missing_tool_strip", joined)
+        self.assertIn("search_trigger_in_prompt", joined)
+        self.assertIn("timeout_exceeds_deadline", joined)
+
+        with self.assertRaises(ValueError):
+            build_headless_review_argv("reviewer-cli", model="m1", prompt="p", disallowed_tools=())
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ title: "DiffQuorum: Multi-Agent Pointer Coordination, Blind Quorum Verifier & 6-
 type: software
 authors:
   - name: "DiffQuorum Contributors"
-version: 0.3.0.dev0
+version: 0.2.0
 date-released: "2026-11-16"
 license: MIT
 repository-code: "https://github.com/Ziqi/diffquorum"

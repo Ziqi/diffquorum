@@ -1,6 +1,6 @@
 # Production Pitfalls & Engineering Fixes (`DiffQuorum` Lessons Learned)
 
-Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **8 major pitfalls** and the deterministic fixes built into this toolkit.
+Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **13 major pitfalls** and the deterministic fixes built into this toolkit.
 
 ---
 
@@ -112,3 +112,12 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
 - **Leading-Prefix Silent Tags & Orthogonal `REPORT-NO-REPLY`**: Matches `TERMINAL-ACK` / `INFO-SYNC` strictly at the start of the first non-empty line (never mid-sentence), exempts `P0` emergencies from silence, and caps `REPORT-NO-REPLY` handoffs at a single wakeup while guaranteeing terminal ticket (`WAITING_REVIEW | DONE | BLOCKED`) receipt delivery.
 - **Anti-Stall Mobile & Daemon Hardening**: Recognizes ultra-narrow mobile status footers (`⏵⏵ auto mode`, `? for short…`), string/bool `isDaemon` tasks, bounded `P0/P1` ticket backoff `(30s, 60s, 180s)`, stale `copy-mode` auto-exit (`>=180s` idle on unprotected sessions), and multi-sentence trailing approvals.
 - **Zero-Token Pre-Invocation Pending-Plan Injection & Own/Peer Split**: Pure read-only `O_NOFOLLOW` (`<=16KB`) `rev`-reconciled reader (`build_pre_invocation_pending_banner` & `format_pending_plans_bar`) emits `0` bytes when idle and injects a single `own:X | peers:Y | total:Z` summary with optional seat-level title redaction when active, eliminating stale-memory '0 pending items' omissions across seats.
+
+## 13. Asymmetric Multi-Seat Hook Allowlists & Headless Blind-Review Tool Deadlocks
+
+- **What broke**:
+  1. **Asymmetric `PreToolUse` Hook Allowlists**: When a new `0-Token` coordination subcommand (`plan open | list | close`) was rolled out across a fleet, any seat carrying a customized per-seat `PreToolUse` hook that did not symmetrically allow `plan` got blocked by its own guard and silently skipped pending-plan registration — blinding the fleet-wide approval board.
+  2. **Headless Blind-Review Tool Loops & Wall-Clock Timeouts**: Invoking an external headless LLM CLI for independent diff review without explicitly stripping built-in file/web-search tools (`--disallowed-tools`), or including web-search trigger phrases in the review prompt, caused headless runs to enter multi-minute tool-calling loops and hit hard `300s` wall-clock timeouts.
+- **Root-cause fix (`validate_plan_hook_command` + `build_headless_review_argv` / `validate_headless_review_spec`)**:
+  - Share a single deterministic validator (`validate_plan_hook_command`) across every seat's `PreToolUse` hook so `plan list` (`allow_readonly`) and `plan open | close` (`allow_mutate`) are allowed symmetrically everywhere while failing closed on shell metacharacters or `--plans-file` / `--root` target-override flags.
+  - Enforce explicit tool stripping (`--disallowed-tools` / `--tools ""` / `--no-tools`), reject live web-search trigger phrases in blind-review prompts, and bound per-chunk prompt size and timeout strictly below `300s` via `build_headless_review_argv` and `validate_headless_review_spec`.

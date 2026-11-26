@@ -538,6 +538,72 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     assert latch1["notify_keys"] == ["seat-a"] and latch3["notify_keys"] == []
     assert ops.evaluate_two_cap_alert_latch({}, ["seat-a"], hour_local=3)["in_quiet_hours"] is True
 
+    # Exercise PreInvocation pending-plans banner, HUD bar, symmetric hook validator & headless review guard
+    p_ban = temp_root / "banner_plans.json"
+    p_mir = temp_root / "mirror_plans.json"
+    assert plk.build_pre_invocation_pending_banner("builder", p_ban, mirror_path=p_mir) == ""
+    assert plk.format_pending_plans_bar(p_ban, mirror_path=p_mir, width=60) == ""
+    bp1 = plk.open_pending_plan(p_ban, seat="lead", scope="router-arch", title="Router Plan")
+    bp2 = plk.open_pending_plan(p_ban, seat="builder", scope="ci-job", title="CI Job")
+    bp3 = plk.open_pending_plan(p_ban, seat="vault", scope="sec-audit", title="PRIVATE_TITLE")
+    p_mir.write_text('{"schema_version":"1.0","rev":1,"plans":[]}', encoding="utf-8")
+    ban_txt = plk.build_pre_invocation_pending_banner("builder", p_ban, mirror_path=p_mir, redacted_seats={"vault"})
+    assert "own:1 | peers:2 | total:3" in ban_txt and "PRIVATE_TITLE" not in ban_txt
+    assert plk.format_pending_plans_bar(p_ban, mirror_path=p_mir, width=90, redacted_seats={"vault"}).startswith("[APR:3]")
+    assert len(plk.format_pending_plans_bar(p_ban, mirror_path=p_mir, width=30, redacted_seats={"vault"})) <= 30
+    for pid, owner in ((bp1["plan"]["plan_id"], "lead"), (bp2["plan"]["plan_id"], "builder"), (bp3["plan"]["plan_id"], "vault")):
+        plk.close_pending_plan(p_ban, seat=owner, plan_id=pid, status="APPROVED")
+    assert plk.build_pre_invocation_pending_banner("builder", p_ban) == ""
+    sym_p = temp_root / "sym_plans.json"
+    sym_p.symlink_to(p_ban)
+    assert plk.build_pre_invocation_pending_banner("builder", sym_p) == ""
+    big_p = temp_root / "big_plans.json"
+    big_p.write_text('{"rev":9,"plans":[{"seat":"lead","status":"WAITING_APPROVE","title":"' + ("Z" * 17000) + '"}]}', encoding="utf-8")
+    assert plk.build_pre_invocation_pending_banner("builder", big_p) == ""
+
+    assert plk.validate_plan_hook_command("diffquorum plan list")["allowed"] is True
+    assert plk.validate_plan_hook_command("python3 /usr/local/bin/star-bus.py plan open --seat s1 --scope x --title t")["allowed"] is True
+    for bad_hk in (
+        "",
+        "diffquorum plan list; id",
+        "diffquorum plan list --plans-file /tmp/a",
+        "diffquorum plan open '--root' /tmp/a --seat s1 --scope x --title t",
+        "/tmp/attacker/diffquorum plan list",
+        "python3 star-bus.py plan list",
+        "/tmp/attacker/python3 /usr/local/bin/star-bus.py plan list",
+        "diffquorum plan 'bad",
+        "diffquorum plan",
+        "unknown plan list",
+        "diffquorum inbox list",
+        "diffquorum plan wipe",
+    ):
+        assert plk.validate_plan_hook_command(bad_hk)["allowed"] is False
+    try:
+        plk.open_pending_plan(sym_p, seat="lead", scope="sym-block", title="Denied")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for symlinked plans_path")
+
+    h_argv = gov.build_headless_review_argv("reviewer-cli", model="m1", prompt="Static diff check")
+    assert gov.validate_headless_review_spec(argv=h_argv, prompt="Static diff check", timeout_sec=180)["ok"] is True
+    assert gov.validate_headless_review_spec(argv=["reviewer-cli", "--no-tools"], prompt="Static diff check", timeout_sec=120)["ok"] is True
+    assert gov.validate_headless_review_spec(argv=["reviewer-cli", "--tools", ""], prompt="Static diff check", timeout_sec=120)["ok"] is True
+    assert gov.validate_headless_review_spec(argv=["reviewer-cli", "--tools="], prompt="Static diff check", timeout_sec=120)["ok"] is True
+    assert gov.validate_headless_review_spec(argv=["reviewer-cli", "--disallowed-tools=Bash"], prompt="Static diff check", timeout_sec=120)["ok"] is True
+    assert gov.validate_headless_review_spec(argv=["reviewer-cli"], prompt="", timeout_sec=0)["ok"] is False
+    assert gov.validate_headless_review_spec(argv=["reviewer-cli"], prompt="web_search " + ("x" * 120), timeout_sec=400, max_prompt_chars=50)["ok"] is False
+    for bad_argv_call in (
+        lambda: gov.build_headless_review_argv("", model="m1", prompt="p"),
+        lambda: gov.build_headless_review_argv("cli", model="m1", prompt="p", disallowed_tools=()),
+    ):
+        try:
+            bad_argv_call()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError from invalid build_headless_review_argv call")
+
     shutil.rmtree(ws, ignore_errors=True)
 
 
@@ -582,75 +648,6 @@ def main() -> int:
         return 1
     print(f"[PASS] [COVERAGE] Statement coverage gate satisfied ({pct:.2f}% >= {args.min_coverage:.1f}%).")
     return 0
-
-
-    def test_pre_invocation_pending_banner_own_vs_peer_split_auto_collapse_and_redaction(self) -> None:
-        from diffquorum.plan_lock import (
-            build_pre_invocation_pending_banner,
-            close_pending_plan,
-            format_pending_plans_bar,
-            open_pending_plan,
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = pathlib.Path(tmp)
-            primary = root / "primary_plans.json"
-            mirror = root / "mirror_plans.json"
-
-            # 1) Absent file -> 0 bytes / 0 lines
-            self.assertEqual(build_pre_invocation_pending_banner("builder", primary, mirror_path=mirror), "")
-            self.assertEqual(format_pending_plans_bar(primary, mirror_path=mirror, width=60), "")
-
-            # 2) Open plans on lead, builder, and redacted vault seat
-            r1 = open_pending_plan(primary, seat="lead", scope="router-arch", title="[Step 1] Router Plan <script>x</script>")
-            r2 = open_pending_plan(primary, seat="builder", scope="ci-matrix", title="Packaging Matrix")
-            r3 = open_pending_plan(primary, seat="vault", scope="sensitive-audit", title="CONFIDENTIAL_AUDIT_TITLE")
-            self.assertFalse(r1["collision"])
-            self.assertFalse(r2["collision"])
-            self.assertFalse(r3["collision"])
-
-            # Mirror has older rev=1 -> reconciler picks primary (rev=3)
-            mirror.write_text('{"schema_version":"1.0","rev":1,"plans":[]}', encoding="utf-8")
-
-            banner = build_pre_invocation_pending_banner(
-                "builder",
-                primary,
-                mirror_path=mirror,
-                redacted_seats={"vault"},
-            )
-            self.assertIn("own:1 | peers:2 | total:3", banner)
-            self.assertIn("lead(", banner)
-            self.assertIn("builder(", banner)
-            self.assertIn("vault(1 pending)", banner)
-            self.assertNotIn("CONFIDENTIAL_AUDIT_TITLE", banner)
-            self.assertNotIn("sensitive-audit", banner)
-            self.assertNotIn("<script>", banner)
-
-            bar_wide = format_pending_plans_bar(primary, mirror_path=mirror, width=90, redacted_seats={"vault"})
-            self.assertTrue(bar_wide.startswith("[APR:3] "))
-            self.assertIn("vault(1 pending)", bar_wide)
-            self.assertNotIn("CONFIDENTIAL_AUDIT_TITLE", bar_wide)
-
-            bar_narrow = format_pending_plans_bar(primary, mirror_path=mirror, width=40, redacted_seats={"vault"})
-            self.assertLessEqual(len(bar_narrow), 40)
-
-            # 3) Close all 3 plans -> banner & bar collapse back to 0 bytes
-            for pid, owner in (
-                (r1["plan"]["plan_id"], "lead"),
-                (r2["plan"]["plan_id"], "builder"),
-                (r3["plan"]["plan_id"], "vault"),
-            ):
-                close_pending_plan(primary, seat=owner, plan_id=pid, status="APPROVED")
-            self.assertEqual(build_pre_invocation_pending_banner("builder", primary), "")
-            self.assertEqual(format_pending_plans_bar(primary), "")
-
-            # 4) Symlink and >16KB oversized files fail closed cleanly
-            sym = root / "sym.json"
-            sym.symlink_to(primary)
-            self.assertEqual(build_pre_invocation_pending_banner("builder", sym), "")
-            big = root / "big.json"
-            big.write_text('{"rev":99,"plans":[{"seat":"lead","status":"WAITING_APPROVE","title":"' + ("A" * 17000) + '"}]}', encoding="utf-8")
-            self.assertEqual(build_pre_invocation_pending_banner("builder", big), "")
 
 
 if __name__ == "__main__":

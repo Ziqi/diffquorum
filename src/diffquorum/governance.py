@@ -1191,3 +1191,98 @@ def run_release_preflight(
                         issues.append(f"sdist ({sdist_tar.name}): PKG-INFO Version mismatch vs {norm_ver!r}")
 
     return {"ok": len(issues) == 0, "version": norm_ver, "issue_count": len(issues), "issues": issues}
+
+
+DEFAULT_HEADLESS_DISALLOWED_TOOLS: tuple[str, ...] = (
+    "Bash",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+)
+HEADLESS_SEARCH_TRIGGER_RE = re.compile(
+    r"(?:\b(?:web_search|websearch|search\s+the\s+web|google\s+search|browse\s+the\s+internet)\b|联网检索|搜索网络|上网查)",
+    re.IGNORECASE,
+)
+
+
+def build_headless_review_argv(
+    cli_bin: str,
+    *,
+    model: str,
+    prompt: str,
+    disallowed_tools: tuple[str, ...] = DEFAULT_HEADLESS_DISALLOWED_TOOLS,
+    extra_args: tuple[str, ...] = (),
+) -> list[str]:
+    """
+    Constructs a tool-stripped headless blind-review CLI invocation so external reviewers never stall
+    inside built-in file/web-search tool loops.
+    """
+    clean_bin = str(cli_bin or "").strip()
+    clean_model = str(model or "").strip()
+    if not clean_bin or not clean_model:
+        raise ValueError("cli_bin and model must be non-empty")
+    stripped = [t.strip() for t in disallowed_tools if t and t.strip()]
+    if not stripped:
+        raise ValueError("disallowed_tools must explicitly strip built-in tools for headless blind reviews")
+    argv = [
+        clean_bin,
+        "--print",
+        "--model",
+        clean_model,
+        "--disallowed-tools",
+        ",".join(stripped),
+        *extra_args,
+        prompt,
+    ]
+    return argv
+
+
+def validate_headless_review_spec(
+    *,
+    argv: list[str],
+    prompt: str,
+    timeout_sec: float,
+    max_timeout_sec: float = 300.0,
+    max_prompt_chars: int = 120_000,
+) -> dict[str, Any]:
+    """
+    Fail-closed guard preventing headless blind-review CLI deadlocks & wall-clock timeouts:
+      1. Requires explicit tool stripping (`--disallowed-tools`, `--tools ""`, or `--no-tools`);
+      2. Rejects prompts containing live web-search trigger phrases;
+      3. Enforces `0 < timeout_sec < max_timeout_sec` (<300s) and bounded prompt size per chunk.
+    """
+    issues: list[str] = []
+    tokens = [str(t) for t in argv]
+    has_tool_strip = False
+    for idx, tok in enumerate(tokens):
+        if tok == "--no-tools":
+            has_tool_strip = True
+        elif tok.startswith("--disallowed-tools=") and tok.split("=", 1)[1].strip():
+            has_tool_strip = True
+        elif tok == "--disallowed-tools" and idx + 1 < len(tokens) and tokens[idx + 1].strip():
+            has_tool_strip = True
+        elif tok == "--tools" and idx + 1 < len(tokens) and tokens[idx + 1] == "":
+            has_tool_strip = True
+        elif tok == "--tools=":
+            has_tool_strip = True
+    if not has_tool_strip:
+        issues.append("missing_tool_strip: headless reviewer argv must explicitly pass --disallowed-tools (or --tools '' / --no-tools)")
+
+    text = str(prompt or "")
+    if not text.strip():
+        issues.append("empty_prompt: headless reviewer prompt must be non-empty")
+    if len(text) > int(max_prompt_chars):
+        issues.append(f"prompt_too_large: {len(text)} chars exceeds per-chunk limit {int(max_prompt_chars)}")
+    m_search = HEADLESS_SEARCH_TRIGGER_RE.search(text)
+    if m_search:
+        issues.append(f"search_trigger_in_prompt: phrase {m_search.group(0)!r} may trigger server-side web-search stalls")
+
+    if not isinstance(timeout_sec, (int, float)) or isinstance(timeout_sec, bool) or timeout_sec <= 0:
+        issues.append(f"invalid_timeout: timeout_sec={timeout_sec!r} must be positive")
+    elif float(timeout_sec) >= float(max_timeout_sec):
+        issues.append(f"timeout_exceeds_deadline: timeout_sec={timeout_sec} >= max_timeout_sec={max_timeout_sec}")
+
+    return {"ok": len(issues) == 0, "issue_count": len(issues), "issues": issues}

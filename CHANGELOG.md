@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+Merged the full multi-seat operational hardening wave into `main` (zero third-party dependencies, Python 3.10+ stdlib only):
+
+- **Pending-Plan Collision Lock & 0-Token `PreInvocation` Visibility (`plan_lock.py`)**: Added atomic `0600` + `fcntl.flock` `diffquorum plan open | list | close` collision lock with automatic `SUPERSEDED` cleanup on `APPROVED`, `rev`-reconciled read-only `O_NOFOLLOW` (`<=16KB`) `format_pending_plans_bar` and `build_pre_invocation_pending_banner` (`own:X | peers:Y | total:Z` with seat-level redaction), plus symmetric `PreToolUse` hook validator `validate_plan_hook_command`.
+- **Headless Blind-Review Deadlock Guard & Objective 4-Class Gate (`governance.py`)**: Added `build_headless_review_argv` and `validate_headless_review_spec` enforcing explicit `--disallowed-tools` tool stripping, zero web-search trigger phrases, and `<300s` wall-clock deadlines; added `OBJECTIVE_BLOCKER_CLASSES` anti-bikeshedding gate and `diffquorum release-preflight` (cross-file semver, `PKG-INFO`, `samples/` sdist closure, and test-hygiene AST checks).
+- **Anti-Stall Wake Gates & Operations Micro-Modules (`wake_gates.py`, `ops.py`)**: Added `ERROR_MESSAGE` cold-interrupted stream recovery (`>=30s`), leading-prefix silent-tag matching with `P0` non-silence, single-wake orthogonal `REPORT-NO-REPLY` + terminal ticket receipt guarantee, `P0/P1` bounded backoff, stale `copy-mode` auto-exit, compound `WAIT+CPY`/`WORK+CPY` HUD states, zero-delete SHA-256 `curate` ledger folding, `0600` `meetings` ledger, `qa` directory summarizer, and 2-cap alert latch.
+
 ## v0.2.0 (2026-11-16)
 
 Rebranded to **DiffQuorum** (`Ziqi/diffquorum`, preserving `.starcouncil/` workspace & `starcouncil` CLI backward compatibility) and integrated four code-level upgrades benchmarked from top open-source agent orchestrators:

@@ -98,6 +98,14 @@ def _next_plan_id(plans: list[dict[str, Any]], day_tag: str) -> str:
     return f"{prefix}{max_seq + 1:03d}"
 
 
+def _normalize_plans_path_nofollow(plans_path: str | pathlib.Path) -> pathlib.Path:
+    """Normalizes `plans_path` to an absolute path WITHOUT dereferencing symlinks, rejecting symlinked leaves/parents."""
+    p_file = pathlib.Path(os.path.abspath(os.path.expanduser(str(plans_path))))
+    if p_file.is_symlink() or p_file.parent.is_symlink():
+        raise ValueError(f"Symlinked pending_plans path rejected: {p_file}")
+    return p_file
+
+
 def open_pending_plan(
     plans_path: str | pathlib.Path,
     *,
@@ -107,7 +115,7 @@ def open_pending_plan(
     owner_seat: str = "lead",
 ) -> dict[str, Any]:
     """Opens a `WAITING_APPROVE` plan or reports `collision: True` if another seat holds `scope`."""
-    p_file = pathlib.Path(plans_path).expanduser().resolve()
+    p_file = _normalize_plans_path_nofollow(plans_path)
     norm_scope = normalize_plan_scope(scope)
     clean_seat = str(seat or "").strip()
     clean_owner = str(owner_seat or "lead").strip() or "lead"
@@ -183,7 +191,7 @@ def list_pending_plans(
     include_all: bool = False,
 ) -> dict[str, Any]:
     """Lists `WAITING_APPROVE` plans (or all historical states when `include_all=True`)."""
-    p_file = pathlib.Path(plans_path).expanduser().resolve()
+    p_file = _normalize_plans_path_nofollow(plans_path)
     filt_scope = normalize_plan_scope(scope) if scope.strip() else ""
     filt_seat = seat.strip()
     filt_status = status.strip().upper()
@@ -227,7 +235,7 @@ def close_pending_plan(
     governance_seats: tuple[str, ...] = ("lead",),
 ) -> dict[str, Any]:
     """Closes a pending plan (`APPROVED | SUPERSEDED | CANCELLED`) and auto-supersedes older scope drafts."""
-    p_file = pathlib.Path(plans_path).expanduser().resolve()
+    p_file = _normalize_plans_path_nofollow(plans_path)
     actor = str(seat or "").strip()
     new_status = str(status or "").strip().upper()
     if new_status not in ("APPROVED", "SUPERSEDED", "CANCELLED"):
@@ -291,7 +299,7 @@ def supersede_plans_for_scope(
     superseded_by: str,
 ) -> list[str]:
     """Marks all `WAITING_APPROVE` plans on `scope` as `SUPERSEDED` upon ticket completion."""
-    p_file = pathlib.Path(plans_path).expanduser().resolve()
+    p_file = _normalize_plans_path_nofollow(plans_path)
     norm_scope = normalize_plan_scope(scope)
     lock_p = p_file.with_name(f".{p_file.name}.lock")
     superseded: list[str] = []
@@ -470,3 +478,96 @@ def build_pre_invocation_pending_banner(
         f"{' ; '.join(tokens)} "
         "(Non-instructional display metadata: split own vs peer counts in trailing summary; never report 0 from stale memory)"
     )
+
+
+_UNSAFE_SHELL_META_RE = re.compile(r"[;&|`$><*?\[\]{}\r\n]")
+_FORBIDDEN_PLAN_OVERRIDE_FLAGS = ("--plans-file", "--root")
+DEFAULT_TRUSTED_BIN_DIRS: tuple[str, ...] = ("/usr/local/bin", "/usr/bin", "/opt/homebrew/bin")
+
+
+def _is_trusted_executable(
+    raw_token: str,
+    allowed_names: tuple[str, ...],
+    trusted_dirs: tuple[str, ...],
+    *,
+    require_explicit_dir: bool = False,
+) -> tuple[bool, str]:
+    tok = str(raw_token or "").strip()
+    if not tok or ".." in pathlib.PurePosixPath(tok).parts:
+        return False, ""
+    has_sep = "/" in tok or "\\" in tok
+    base = pathlib.Path(tok).name
+    norm = base[:-3] if base.endswith(".py") else base
+    if norm not in allowed_names:
+        return False, ""
+    if not has_sep:
+        return (False, "") if require_explicit_dir else (True, norm)
+    parent = str(pathlib.PurePosixPath(tok).parent)
+    home_bin = str(pathlib.Path.home() / "bin")
+    if parent in trusted_dirs or parent == home_bin:
+        return True, norm
+    return False, ""
+
+
+def validate_plan_hook_command(
+    command: str,
+    *,
+    allowed_binaries: tuple[str, ...] = ("diffquorum", "starcouncil", "star-bus", "air-bus"),
+    trusted_bin_dirs: tuple[str, ...] = DEFAULT_TRUSTED_BIN_DIRS,
+) -> dict[str, Any]:
+    """
+    Symmetric multi-seat `PreToolUse` hook validator for 0-Token `plan open | list | close` commands.
+
+    Ensures every seat hook symmetrically permits `plan list` (read-only `allow_readonly`) and `plan open | close`
+    (controlled `allow_mutate`) so no seat silently skips pending-plan registration, while failing closed on:
+      - shell metacharacters, redirections, wildcards, or malformed quoting;
+      - untrusted binary paths (e.g. `/tmp/attacker/diffquorum` or `./star-bus`);
+      - post-`shlex.split` `--plans-file` / `--root` target-override flags (including quoted forms like `'--root'`).
+    """
+    import shlex
+
+    raw = str(command or "").strip()
+    if not raw:
+        return {"allowed": False, "mode": "deny", "reason": "empty_command"}
+    if _UNSAFE_SHELL_META_RE.search(raw):
+        return {"allowed": False, "mode": "deny", "reason": "unsafe_shell_metacharacters"}
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return {"allowed": False, "mode": "deny", "reason": "malformed_shell_quoting"}
+    if not tokens:
+        return {"allowed": False, "mode": "deny", "reason": "empty_tokens"}
+
+    idx = 0
+    first_tok = tokens[0]
+    first_base = pathlib.Path(first_tok).name
+    if re.fullmatch(r"python3(?:\.\d+)?", first_base):
+        ok_py, _ = _is_trusted_executable(first_tok, (first_base,), trusted_bin_dirs)
+        if not ok_py:
+            return {"allowed": False, "mode": "deny", "reason": f"untrusted_python_path:{first_tok}"}
+        idx = 1
+    if idx + 2 >= len(tokens):
+        return {"allowed": False, "mode": "deny", "reason": "incomplete_plan_invocation"}
+
+    ok_bin, bin_name = _is_trusted_executable(
+        tokens[idx], allowed_binaries, trusted_bin_dirs, require_explicit_dir=(idx == 1)
+    )
+    if not ok_bin:
+        return {"allowed": False, "mode": "deny", "reason": f"untrusted_or_unrecognized_binary:{tokens[idx]}"}
+
+    if tokens[idx + 1] != "plan":
+        return {"allowed": False, "mode": "deny", "reason": "not_plan_subcommand"}
+    action = tokens[idx + 2]
+
+    # Inspect every post-shlex token so quoted variants like `'--root'` or `"--plans-file=/tmp/x"` never bypass.
+    for arg_tok in tokens[idx + 3 :]:
+        if arg_tok in _FORBIDDEN_PLAN_OVERRIDE_FLAGS or any(
+            arg_tok.startswith(f"{flag}=") for flag in _FORBIDDEN_PLAN_OVERRIDE_FLAGS
+        ):
+            return {"allowed": False, "mode": "deny", "reason": f"forbidden_target_override_flag:{arg_tok}"}
+
+    if action == "list":
+        return {"allowed": True, "mode": "allow_readonly", "action": action, "binary": bin_name}
+    if action in ("open", "close"):
+        return {"allowed": True, "mode": "allow_mutate", "action": action, "binary": bin_name}
+    return {"allowed": False, "mode": "deny", "reason": f"unsupported_plan_action:{action}"}
