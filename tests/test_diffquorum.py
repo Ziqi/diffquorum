@@ -2339,6 +2339,176 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
                     report_scope="bad-scope",
                 )
 
+    def test_coexisting_plans_explicit_supersede_live_footer_and_colloquial_wait(self) -> None:
+        from diffquorum.plan_lock import (
+            close_pending_plan,
+            evaluate_stop_consistency_gate,
+            list_pending_plans,
+            open_pending_plan,
+            render_live_pending_footer_markdown,
+            reopen_pending_plan,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pfile = pathlib.Path(tmp) / "pending_plans.json"
+
+            # 1) Same-seat open_pending_plan coexists via bounded -2 / -3 scope suffixes instead of silently superseding
+            r1 = open_pending_plan(pfile, seat="worker_a", scope="release-prep", title="First task", kind="PLAN", report_scope="self")
+            r2 = open_pending_plan(pfile, seat="worker_a", scope="release-prep", title="Second task", kind="DECISION", report_scope="self")
+            self.assertTrue(r1["ok"] and r2["ok"])
+            self.assertEqual(r2["superseded_own_ids"], [])
+            self.assertEqual(r1["plan"]["scope"], "release-prep")
+            self.assertEqual(r2["plan"]["scope"], "release-prep-2")
+            self.assertEqual(list_pending_plans(pfile, seat="worker_a")["count"], 2)
+            self.assertIn("**Own Pending approvals (2):", r2["live_footer_markdown"])
+            self.assertIn("First task", r2["live_footer_markdown"])
+            self.assertIn("Second task", r2["live_footer_markdown"])
+
+            # Long 120-char scope truncates cleanly while staying valid <= 120 chars
+            long_scope = "a" * 120
+            rl1 = open_pending_plan(pfile, seat="worker_b", scope=long_scope, title="Long 1", kind="PLAN")
+            rl2 = open_pending_plan(pfile, seat="worker_b", scope=long_scope, title="Long 2", kind="PLAN")
+            self.assertEqual(len(rl1["plan"]["scope"]), 120)
+            self.assertLessEqual(len(rl2["plan"]["scope"]), 120)
+            self.assertTrue(rl2["plan"]["scope"].endswith("-2"))
+
+            # 2) Explicit --supersede validates atomically (format / missing / closed / auth) before mutating
+            with self.assertRaises(ValueError):
+                open_pending_plan(pfile, seat="worker_a", scope="release-prep", title="Bad id", supersede_ids=["not-a-plan-id"])
+            with self.assertRaises(KeyError):
+                open_pending_plan(pfile, seat="worker_a", scope="release-prep", title="Missing", supersede_ids=["PLN-20990101-999"])
+            with self.assertRaises(PermissionError):
+                open_pending_plan(
+                    pfile,
+                    seat="worker_b",
+                    scope="release-prep",
+                    title="Unauthorized hijack",
+                    supersede_ids=[r1["plan"]["plan_id"]],
+                )
+            # Failed supersede left r1 untouched
+            self.assertEqual(list_pending_plans(pfile, seat="worker_a")["count"], 2)
+
+            # Authorized explicit supersede replaces ONLY the named ID and preserves r2
+            r3 = open_pending_plan(
+                pfile,
+                seat="worker_a",
+                scope="release-prep",
+                title="First task revised",
+                supersede_ids=[r1["plan"]["plan_id"]],
+                report_scope="self",
+            )
+            self.assertEqual(r3["superseded_own_ids"], [r1["plan"]["plan_id"]])
+            self.assertEqual(r3["plan"]["scope"], "release-prep")
+            self.assertEqual(list_pending_plans(pfile, seat="worker_a")["count"], 2)
+
+            # Superseding an already-closed plan fails closed
+            with self.assertRaises(ValueError):
+                open_pending_plan(
+                    pfile,
+                    seat="worker_a",
+                    scope="release-prep",
+                    title="Already superseded",
+                    supersede_ids=[r1["plan"]["plan_id"]],
+                )
+
+            # 3) Reopening r1 coexists with r3 via -3 suffix instead of silently overwriting r3
+            re1 = reopen_pending_plan(pfile, seat="worker_a", plan_id=r1["plan"]["plan_id"], report_scope="self")
+            self.assertTrue(re1["ok"])
+            self.assertEqual(re1["superseded_own_ids"], [])
+            self.assertEqual(re1["plan"]["scope"], "release-prep-3")
+            self.assertEqual(list_pending_plans(pfile, seat="worker_a")["count"], 3)
+            self.assertIn("**Own Pending approvals (3):", re1["live_footer_markdown"])
+
+            # 4) Role-scoped live_footer_markdown (fleet / line / self + redaction)
+            open_pending_plan(pfile, seat="vault", scope="secret-scope", title="CONFIDENTIAL_XYZ", kind="CIRCUIT_BREAKER")
+            raw_doc = json.loads(pfile.read_text(encoding="utf-8"))
+            f_fleet = render_live_pending_footer_markdown("lead", raw_doc, redacted_seats={"vault"}, report_scope="fleet")
+            self.assertIn("**Pending approvals (own: 0 | peers: 6):", f_fleet)
+            self.assertIn("vault(1 pending)", f_fleet)
+            self.assertNotIn("CONFIDENTIAL_XYZ", f_fleet)
+            f_line = render_live_pending_footer_markdown(
+                "domain_lead",
+                raw_doc,
+                redacted_seats={"vault"},
+                report_scope="line",
+                line_seats={"domain_lead", "worker_a"},
+                line_label="APP-LINE",
+            )
+            self.assertIn("**Line Pending approvals [APP-LINE] (own: 0 | line_peers: 3 | total: 3; outside: 3):", f_line)
+            self.assertNotIn("CONFIDENTIAL_XYZ", f_line)
+            f_vault_self = render_live_pending_footer_markdown(
+                "vault", raw_doc, redacted_seats={"vault"}, allow_self_view=True, report_scope="self"
+            )
+            self.assertIn("CONFIDENTIAL_XYZ", f_vault_self)
+
+            # Close returns updated live_footer_markdown
+            cl = close_pending_plan(
+                pfile,
+                seat="worker_a",
+                plan_id=re1["plan"]["plan_id"],
+                status="CANCELLED",
+                report_scope="self",
+            )
+            self.assertIn("**Own Pending approvals (2):", cl["live_footer_markdown"])
+
+            # 5) CLI --supersede & --report-scope end-to-end
+            cli_p = root_p = pathlib.Path(tmp) / "cli_coexist.json"
+            c1 = json.loads(
+                self.run_cli(
+                    "plan", "open", "--plans-file", str(cli_p),
+                    "--seat", "worker_a", "--scope", "sync-doc", "--title", "Doc draft 1", "--report-scope", "self",
+                ).stdout.decode("utf-8")
+            )
+            c2 = json.loads(
+                self.run_cli(
+                    "plan", "open", "--plans-file", str(cli_p),
+                    "--seat", "worker_a", "--scope", "sync-doc", "--title", "Doc draft 2",
+                    "--supersede", c1["plan"]["plan_id"], "--report-scope", "self",
+                ).stdout.decode("utf-8")
+            )
+            self.assertEqual(c2["superseded_own_ids"], [c1["plan"]["plan_id"]])
+            self.assertIn("**Own Pending approvals (1):", c2["live_footer_markdown"])
+            cl_list = json.loads(
+                self.run_cli("plan", "list", "--plans-file", str(root_p), "--seat", "worker_a", "--report-scope", "self").stdout.decode("utf-8")
+            )
+            self.assertEqual(cl_list["count"], 1)
+            self.assertIn("**Own Pending approvals (1):", cl_list["live_footer_markdown"])
+
+            # 6) Colloquial Chinese decision phrases caught by Stop gate, code blocks never false-trigger
+            for cue_text in (
+                "关于命名方案你看怎么来定？",
+                "这两个目录结构你准备选哪个？",
+                "把旧别名一并清理是否可行？",
+                "这次改版要不要一起加上缓存层？",
+                "细节已整理完毕，确认后推进。",
+            ):
+                res = evaluate_stop_consistency_gate(
+                    response_text=cue_text, own_waiting_count=0, peer_waiting_count=0, report_scope="self"
+                )
+                self.assertEqual(res["decision"], "continue", f"Expected continue for {cue_text!r}")
+                self.assertEqual(res["inferred_kind"], "DECISION")
+            self.assertEqual(
+                evaluate_stop_consistency_gate(
+                    response_text="Updated regex for `怎么来定` and `是否可行`.\n```\n选哪个 / 确认后推进\n```\nAll green.",
+                    own_waiting_count=0,
+                    peer_waiting_count=0,
+                    report_scope="self",
+                )["decision"],
+                "allow",
+            )
+            for narrative_txt in (
+                "已按主理人确认后执行全部修改并完成验收。",
+                "经评审同意后开始部署，现已全部通过。",
+                "本轮已验证旧方案是否可行，结论不可行并已完成上线。",
+                "经确认同意后开始切流，现已恢复。",
+                "已讨论了要不要一起加缓存，结论暂不引入。",
+            ):
+                n_res = evaluate_stop_consistency_gate(
+                    response_text=narrative_txt, own_waiting_count=0, peer_waiting_count=0, report_scope="self"
+                )
+                self.assertEqual(n_res["decision"], "allow", f"False-positive on {narrative_txt!r}: {n_res}")
+                self.assertEqual(n_res["action"], "allow", f"Phantom auto_register on {narrative_txt!r}: {n_res}")
+
 
 if __name__ == "__main__":
     unittest.main()

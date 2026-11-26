@@ -274,6 +274,8 @@ def main(argv: list[str] | None = None) -> int:
     p_pln_open.add_argument("--scope", required=True)
     p_pln_open.add_argument("--title", required=True)
     p_pln_open.add_argument("--kind", default="PLAN", choices=("PLAN", "DECISION", "CIRCUIT_BREAKER", "INPUT_REQUIRED"))
+    p_pln_open.add_argument("--supersede", dest="supersede", action="append", default=[])
+    p_pln_open.add_argument("--report-scope", dest="report_scope", default="fleet", choices=("fleet", "line", "self"))
     p_pln_open.add_argument("--owner-seat", default="lead")
 
     p_pln_list = pln_sub.add_parser("list", help="查询当前 WAITING_APPROVE 待批/待决清单", allow_abbrev=False)
@@ -282,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     p_pln_list.add_argument("--seat", default="")
     p_pln_list.add_argument("--status", default="")
     p_pln_list.add_argument("--kind", default="")
+    p_pln_list.add_argument("--report-scope", dest="report_scope", default="fleet", choices=("fleet", "line", "self"))
     p_pln_list.add_argument("--all", action="store_true")
 
     p_pln_reopen = pln_sub.add_parser("reopen", help="中途遇熔断或路径二选一时原位重开已关单为 WAITING_APPROVE", allow_abbrev=False)
@@ -292,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
     p_pln_reopen.add_argument("--kind", default="", choices=("", "PLAN", "DECISION", "CIRCUIT_BREAKER", "INPUT_REQUIRED"))
     p_pln_reopen.add_argument("--title", default="")
     p_pln_reopen.add_argument("--note", default="")
+    p_pln_reopen.add_argument("--report-scope", dest="report_scope", default="fleet", choices=("fleet", "line", "self"))
 
     p_pln_close = pln_sub.add_parser("close", help="关闭待批方案 (APPROVED | SUPERSEDED | CANCELLED)", allow_abbrev=False)
     p_pln_close.add_argument("--plans-file", required=True)
@@ -300,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
     p_pln_close.add_argument("--scope", default="")
     p_pln_close.add_argument("--status", default="APPROVED", choices=("APPROVED", "SUPERSEDED", "CANCELLED"))
     p_pln_close.add_argument("--note", default="")
+    p_pln_close.add_argument("--report-scope", dest="report_scope", default="fleet", choices=("fleet", "line", "self"))
 
     p_qa = sub.add_parser("qa", help="纯只读席位最近一问一答目录摘要 (过滤 BUS-WAKE 与自检杂讯)", allow_abbrev=False)
     p_qa.add_argument("--records-json", required=True)
@@ -679,6 +684,8 @@ def main(argv: list[str] | None = None) -> int:
                         title=args.title,
                         owner_seat=args.owner_seat,
                         kind=args.kind,
+                        supersede_ids=args.supersede,
+                        report_scope=args.report_scope,
                     )
                 )
                 return 0
@@ -691,6 +698,7 @@ def main(argv: list[str] | None = None) -> int:
                         status=args.status,
                         kind=args.kind,
                         include_all=args.all,
+                        report_scope=args.report_scope,
                     )
                 )
                 return 0
@@ -704,6 +712,7 @@ def main(argv: list[str] | None = None) -> int:
                         kind=args.kind,
                         title=args.title,
                         note=args.note,
+                        report_scope=args.report_scope,
                     )
                 )
                 return 0
@@ -716,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
                         scope=args.scope,
                         status=args.status,
                         note=args.note,
+                        report_scope=args.report_scope,
                     )
                 )
                 return 0

@@ -915,6 +915,29 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     assert _pl.evaluate_stop_consistency_gate(response_text="ok\n**Line: line_peers:0**", own_waiting_count=0, peer_waiting_count=2, line_peer_waiting_count=1, report_scope="line")["decision"] == "continue"
     assert _pl.evaluate_stop_consistency_gate(response_text="ok\n**Pending: own:0 | peers:0**", own_waiting_count=0, peer_waiting_count=2, report_scope="self")["decision"] == "allow"
 
+    # Coexisting same-seat scopes, explicit supersede, live_footer_markdown & colloquial Stop wait coverage
+    cx_file = ws / "coexist_plans.json"
+    cx1 = _pl.open_pending_plan(cx_file, seat="w1", scope="s-dup", title="D1", report_scope="self")
+    cx2 = _pl.open_pending_plan(cx_file, seat="w1", scope="s-dup", title="D2", report_scope="self")
+    assert cx2["plan"]["scope"] == "s-dup-2" and cx2["superseded_own_ids"] == []
+    assert "**Own Pending approvals (2):" in cx2["live_footer_markdown"]
+    cx3 = _pl.open_pending_plan(cx_file, seat="w1", scope="s-dup", title="D3", supersede_ids=[cx1["plan"]["plan_id"]], report_scope="self")
+    assert cx3["superseded_own_ids"] == [cx1["plan"]["plan_id"]]
+    cx_re = _pl.reopen_pending_plan(cx_file, seat="w1", plan_id=cx1["plan"]["plan_id"], report_scope="self")
+    assert cx_re["plan"]["scope"] == "s-dup-3"
+    assert _pl.render_live_pending_footer_markdown("hub", None) == ""
+    assert _pl.render_live_pending_footer_markdown("hub", {"plans": []}, report_scope="fleet") == ""
+    assert _pl.render_live_pending_footer_markdown("lead", {"plans": []}, report_scope="line") == ""
+    assert _pl.render_live_pending_footer_markdown("w1", {"plans": []}, report_scope="self") == ""
+    cx_doc = json.loads(cx_file.read_text(encoding="utf-8"))
+    assert "**Line Pending approvals [L1]" in _pl.render_live_pending_footer_markdown("lead", cx_doc, report_scope="line", line_seats={"lead", "w1"}, line_label="L1")
+    _pl.open_pending_plan(cx_file, seat="vault", scope="v-sec", title="VSEC", kind="CIRCUIT_BREAKER")
+    cx_doc2 = json.loads(cx_file.read_text(encoding="utf-8"))
+    assert "vault(1 pending)" in _pl.render_live_pending_footer_markdown("hub", cx_doc2, redacted_seats={"vault"}, report_scope="fleet")
+    assert "vault(1 pending)" in _pl.render_live_pending_footer_markdown("lead", cx_doc2, redacted_seats={"vault"}, report_scope="line", line_seats={"lead", "vault"}, line_label="L1")
+    assert "vault(1 pending)" in _pl.render_live_pending_footer_markdown("vault", cx_doc2, redacted_seats={"vault"}, allow_self_view=False, report_scope="self")
+    assert _pl.evaluate_stop_consistency_gate(response_text="怎么来定这个目录？", own_waiting_count=0, peer_waiting_count=0, report_scope="self")["decision"] == "continue"
+
     shutil.rmtree(ws, ignore_errors=True)
 
 

@@ -1,6 +1,6 @@
 # Production Pitfalls & Engineering Fixes (`DiffQuorum` Lessons Learned)
 
-Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **19 major pitfalls** and the deterministic fixes built into this toolkit.
+Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **20 major pitfalls** and the deterministic fixes built into this toolkit.
 
 ---
 
@@ -180,3 +180,14 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
     - **`line`** (domain lead): receives only its own `line_seats` rollup (appending `outside:N` only while `line_total > 0`, returning `""` 0 bytes when its own line has `0` open items) and validates false-zero footers only against `own` + `line_peer_waiting_count`;
     - **`self`** (execution workers): receives only its own open items (`""` 0 bytes when `own == 0`), omits peer lists from footers, and validates only own unregistered pauses (`Intercept A`) and own false-zero footers — eliminating cross-window snapshot drift.
   - Keep per-seat launch configurations strictly free of cross-workspace `--add-dir` mounts to peer hook-bearing directories; when renaming seats, preserve original physical birth directories via POSIX symlinks + session rename and hand any cross-boundary cutover command to the operator rather than weakening guards.
+
+## 20. Silent Same-Seat `SUPERSEDED` Swallowing, Half-Turn Footer Drift & Colloquial Decision Misses (`plan_lock.py` & `cli.py`)
+
+- **What broke**:
+  1. **Silent Same-Seat Plan Swallowing**: Previously, `plan open` on a seat that already held a `WAITING_APPROVE` record on the same scope silently overwrote the earlier pending plan to `SUPERSEDED`. Whenever one seat legitimately submitted two related items under a broad scope, the first awaiting approval disappeared without operator sign-off.
+  2. **Half-Turn `PreInvocation` Lag**: `PreInvocation` fires at the start of a turn before the agent calls `plan open` or `plan close` mid-turn. Relying solely on the turn-start banner caused agents to print stale counts in their trailing footer even right after mutating `pending_plans.json`.
+  3. **Colloquial Decision Phrases Slipping Past `Stop`**: Operators and agents frequently pause with conversational phrasing (e.g., `"怎么来定"` / `"选哪个"` / `"是否可行"` / `"要不要一起"` / `"确认后推进"`) that bypassed formal-only decision regexes.
+- **Root-cause fix (`open_pending_plan`, `reopen_pending_plan`, `render_live_pending_footer_markdown`, `_STOP_WAIT_DECISION_RE`)**:
+  - **Coexistence by default + explicit `--supersede`**: Removed automatic same-seat `SUPERSEDED` overwriting in `plan open` and `plan reopen`. Colliding same-seat scopes automatically receive bounded suffixes (`<scope>-2`, `<scope>-3`, <= 120 chars) so multiple open items coexist safely; replacing an earlier item requires explicit `--supersede PLN-YYYYMMDD-NNN` validated atomically (format, existence, `WAITING_APPROVE` state, and seat/governance authorization) before any mutation occurs.
+  - **Exact `live_footer_markdown` on every `plan` command**: `plan open | list | reopen | close` now compute and return a ready-to-paste role-scoped `live_footer_markdown` (`fleet` / `line` / `self`, honoring sensitive-seat redaction) directly from the post-write state, eliminating half-turn footer drift.
+  - **Expanded colloquial `Stop` decision cues**: Extended `_STOP_WAIT_DECISION_RE` to catch everyday Chinese decision-pause phrasing while still stripping fenced/inline code blocks first so technical explanations never false-trigger.

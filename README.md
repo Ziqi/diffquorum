@@ -13,7 +13,7 @@
 
 **Zero-dependency multi-agent session coordination (`<400B` pointer blackboard, 6-gate modal-aware idle wakeup), Stage-2 blind anti-fake-quorum verifier & 0-token pitfall ratchet for AI coding agents.** *(Formerly `StarCouncil`; seamlessly supports `.starcouncil/` workspaces and `starcouncil` CLI shims.)*
 
-Language: **English** | [简体中文 (Simplified Chinese)](./README.zh-CN.md) | [19 Production Pitfalls & Fixes](./docs/PITFALLS_AND_FIXES.md)
+Language: **English** | [简体中文 (Simplified Chinese)](./README.zh-CN.md) | [20 Production Pitfalls & Fixes](./docs/PITFALLS_AND_FIXES.md)
 
 ---
 

@@ -16,6 +16,7 @@ from typing import Any
 from .blackboard import atomic_write_json, utc_iso
 
 PLAN_SCOPE_RE = re.compile(r"^[a-z0-9][a-z0-9_./:-]{0,119}$")
+STRICT_PLAN_ID_RE = re.compile(r"^PLN-\d{8}-\d{3,}$")
 VALID_PLAN_STATUSES = frozenset({"WAITING_APPROVE", "APPROVED", "SUPERSEDED", "CANCELLED"})
 VALID_PLAN_KINDS: tuple[str, ...] = ("PLAN", "DECISION", "CIRCUIT_BREAKER", "INPUT_REQUIRED")
 VALID_REPORT_SCOPES: tuple[str, ...] = ("fleet", "line", "self")
@@ -142,6 +143,119 @@ def _normalize_plans_path_nofollow(plans_path: str | pathlib.Path) -> pathlib.Pa
     return p_file
 
 
+def _allocate_coexisting_scope(base_scope: str, active_scopes: set[str]) -> str:
+    """Allocates a coexisting scope (`<scope>-2`, `<scope>-3`, ...) bounded to 120 chars when `base_scope` is active."""
+    if base_scope not in active_scopes:
+        return base_scope
+    idx = 2
+    while True:
+        suffix = f"-{idx}"
+        prefix = base_scope[: max(1, 120 - len(suffix))].rstrip("-_./:") or base_scope[:1]
+        cand = f"{prefix}{suffix}"
+        if cand not in active_scopes and PLAN_SCOPE_RE.fullmatch(cand):
+            return cand
+        idx += 1
+
+
+def render_live_pending_footer_markdown(
+    seat: str,
+    doc: dict[str, Any] | None,
+    *,
+    redacted_seats: set[str] | frozenset[str] | None = None,
+    allow_self_view: bool = True,
+    report_scope: str = "fleet",
+    line_seats: set[str] | frozenset[str] | tuple[str, ...] | list[str] | None = None,
+    line_label: str = "",
+) -> str:
+    """Renders an exact ready-to-paste role-scoped Markdown pending-approval footer directly from live `doc`."""
+    if not isinstance(doc, dict):
+        return ""
+    eff_scope = normalize_report_scope(report_scope, default="fleet")
+    self_seat = str(seat or "").strip()
+    eff_line_seats = (
+        {str(s).strip() for s in line_seats if str(s).strip()} | {self_seat}
+        if line_seats is not None
+        else {self_seat}
+    )
+    redacted = set(redacted_seats) if redacted_seats else set()
+
+    own_cnt = 0
+    peer_cnt = 0
+    line_peer_cnt = 0
+    red_counts: dict[str, int] = {}
+    red_line_counts: dict[str, int] = {}
+    ordered: list[tuple[bool, bool, bool, str, str]] = []
+    for rec in doc.get("plans") or []:
+        if not isinstance(rec, dict) or str(rec.get("status") or "").strip().upper() != "WAITING_APPROVE":
+            continue
+        rec_seat = str(rec.get("seat") or "").strip() or "seat"
+        is_own = rec_seat == self_seat
+        in_line = is_own or (rec_seat in eff_line_seats)
+        if is_own:
+            own_cnt += 1
+        else:
+            peer_cnt += 1
+            if in_line:
+                line_peer_cnt += 1
+        if rec_seat in redacted and not (allow_self_view and is_own):
+            red_counts[rec_seat] = red_counts.get(rec_seat, 0) + 1
+            if in_line:
+                red_line_counts[rec_seat] = red_line_counts.get(rec_seat, 0) + 1
+            ordered.append((True, is_own, in_line, rec_seat, ""))
+        else:
+            raw_pid = str(rec.get("plan_id") or "").strip()
+            safe_pid = raw_pid if STRICT_PLAN_ID_RE.fullmatch(raw_pid) else "PLN"
+            safe_title = sanitize_plan_banner_title(str(rec.get("title") or ""), max_chars=28)
+            raw_kind = str(rec.get("kind") or "PLAN").strip().upper()
+            ktag = PLAN_KIND_SHORT_TAGS.get(raw_kind, "PLAN")
+            badge = f"[{ktag}]" if ktag != "PLAN" else ""
+            tok = f"{rec_seat}{badge}({safe_pid}:{safe_title})" if safe_title else f"{rec_seat}{badge}({safe_pid})"
+            ordered.append((False, is_own, in_line, rec_seat, tok))
+
+    tokens: list[str] = []
+    own_tokens: list[str] = []
+    line_tokens: list[str] = []
+    seen_red: set[str] = set()
+    seen_red_own: set[str] = set()
+    seen_red_line: set[str] = set()
+    for is_red, is_own, in_line, rec_seat, tok in ordered:
+        if is_red:
+            if rec_seat not in seen_red:
+                tokens.append(f"{rec_seat}({red_counts[rec_seat]} pending)")
+                seen_red.add(rec_seat)
+            if is_own and rec_seat not in seen_red_own:
+                own_tokens.append(f"{rec_seat}({own_cnt} pending)")
+                seen_red_own.add(rec_seat)
+            if in_line and rec_seat not in seen_red_line:
+                line_tokens.append(f"{rec_seat}({red_line_counts[rec_seat]} pending)")
+                seen_red_line.add(rec_seat)
+        else:
+            tokens.append(tok)
+            if is_own:
+                own_tokens.append(tok)
+            if in_line:
+                line_tokens.append(tok)
+
+    if eff_scope == "fleet":
+        if own_cnt + peer_cnt <= 0:
+            return ""
+        return f"**Pending approvals (own: {own_cnt} | peers: {peer_cnt}): {' ; '.join(tokens)}**"
+    if eff_scope == "line":
+        line_total = own_cnt + line_peer_cnt
+        if line_total <= 0:
+            return ""
+        outside_cnt = max(0, peer_cnt - line_peer_cnt)
+        out_note = f"; outside: {outside_cnt}" if outside_cnt > 0 else ""
+        lbl = sanitize_plan_banner_title(line_label, max_chars=20) or "LINE"
+        return (
+            f"**Line Pending approvals [{lbl}] (own: {own_cnt} | line_peers: {line_peer_cnt} | total: {line_total}{out_note}): "
+            f"{' ; '.join(line_tokens)}**"
+        )
+    if own_cnt <= 0:
+        return ""
+    return f"**Own Pending approvals ({own_cnt}): {' ; '.join(own_tokens)}**"
+
+
 def open_pending_plan(
     plans_path: str | pathlib.Path,
     *,
@@ -150,25 +264,58 @@ def open_pending_plan(
     title: str,
     owner_seat: str = "lead",
     kind: str = "PLAN",
+    supersede_ids: list[str] | tuple[str, ...] | None = None,
+    governance_seats: tuple[str, ...] = ("lead",),
+    report_scope: str = "fleet",
+    redacted_seats: set[str] | frozenset[str] | None = None,
+    line_seats: set[str] | frozenset[str] | tuple[str, ...] | list[str] | None = None,
+    line_label: str = "",
 ) -> dict[str, Any]:
-    """Opens a `WAITING_APPROVE` plan/decision/circuit-breaker or reports `collision: True` if another seat holds `scope`."""
+    """Opens a `WAITING_APPROVE` plan/decision/circuit-breaker with same-seat coexistence & explicit `--supersede`."""
     p_file = _normalize_plans_path_nofollow(plans_path)
     norm_scope = normalize_plan_scope(scope)
     norm_kind = normalize_plan_kind(kind)
+    eff_report_scope = normalize_report_scope(report_scope, default="fleet")
     clean_seat = str(seat or "").strip()
     clean_owner = str(owner_seat or "lead").strip() or "lead"
     clean_title = str(title or "").strip()
     if not clean_seat or not clean_title:
         raise ValueError("Both seat and title must be non-empty")
 
+    supersede_req: list[str] = []
+    for raw_id in (supersede_ids or ()):
+        pid_s = str(raw_id or "").strip()
+        if not pid_s:
+            continue
+        if not STRICT_PLAN_ID_RE.fullmatch(pid_s):
+            raise ValueError(f"Invalid supersede plan_id: {pid_s!r}")
+        if pid_s not in supersede_req:
+            supersede_req.append(pid_s)
+
     lock_p = p_file.with_name(f".{p_file.name}.lock")
     with _PlanFileLock(lock_p):
         doc = _read_plans_doc_locked(p_file)
         plans = list(doc.get("plans") or [])
+
+        supersede_targets: list[dict[str, Any]] = []
+        for spid in supersede_req:
+            found = [r for r in plans if isinstance(r, dict) and str(r.get("plan_id") or "") == spid]
+            if not found:
+                raise KeyError(f"Supersede target not found: {spid}")
+            trec = found[-1]
+            if str(trec.get("status") or "").upper() != "WAITING_APPROVE":
+                raise ValueError(f"Supersede target is not WAITING_APPROVE: {spid}")
+            allowed = set(governance_seats) | {str(trec.get("seat") or ""), str(trec.get("owner_seat") or "")}
+            if clean_seat not in allowed:
+                raise PermissionError(f"Seat {clean_seat!r} is not authorized to supersede plan {spid!r}")
+            supersede_targets.append(trec)
+        supersede_id_set = {str(r.get("plan_id") or "") for r in supersede_targets}
+
         conflicts = [
             rec
             for rec in plans
             if rec.get("status") == "WAITING_APPROVE"
+            and str(rec.get("plan_id") or "") not in supersede_id_set
             and rec.get("scope") == norm_scope
             and str(rec.get("seat") or "") != clean_seat
         ]
@@ -180,27 +327,37 @@ def open_pending_plan(
                 "seat": clean_seat,
                 "primary_approval_seat": clean_owner,
                 "conflicts": conflicts,
+                "live_footer_markdown": render_live_pending_footer_markdown(
+                    clean_seat,
+                    doc,
+                    redacted_seats=redacted_seats,
+                    report_scope=eff_report_scope,
+                    line_seats=line_seats,
+                    line_label=line_label,
+                ),
             }
 
         ts = utc_iso()
         day_tag = ts[:10].replace("-", "")
         new_id = _next_plan_id(plans, day_tag)
         superseded_own: list[str] = []
-        for rec in plans:
-            if (
-                rec.get("status") == "WAITING_APPROVE"
-                and rec.get("scope") == norm_scope
-                and str(rec.get("seat") or "") == clean_seat
-            ):
-                rec["status"] = "SUPERSEDED"
-                rec["superseded_by"] = new_id
-                rec["updated_at"] = ts
-                superseded_own.append(str(rec.get("plan_id") or ""))
+        for trec in supersede_targets:
+            trec["status"] = "SUPERSEDED"
+            trec["superseded_by"] = new_id
+            trec["updated_at"] = ts
+            superseded_own.append(str(trec.get("plan_id") or ""))
+
+        active_scopes = {
+            str(rec.get("scope") or "")
+            for rec in plans
+            if isinstance(rec, dict) and str(rec.get("status") or "").upper() == "WAITING_APPROVE"
+        }
+        effective_scope = _allocate_coexisting_scope(norm_scope, active_scopes)
 
         new_rec = {
             "plan_id": new_id,
             "seat": clean_seat,
-            "scope": norm_scope,
+            "scope": effective_scope,
             "owner_seat": clean_owner,
             "kind": norm_kind,
             "title": clean_title,
@@ -211,6 +368,14 @@ def open_pending_plan(
         plans.append(new_rec)
         doc["plans"] = plans
         _write_plans_doc_locked(p_file, doc)
+        live_footer = render_live_pending_footer_markdown(
+            clean_seat,
+            doc,
+            redacted_seats=redacted_seats,
+            report_scope=eff_report_scope,
+            line_seats=line_seats,
+            line_label=line_label,
+        )
 
     return {
         "ok": True,
@@ -218,6 +383,7 @@ def open_pending_plan(
         "storage_path": str(p_file),
         "plan": new_rec,
         "superseded_own_ids": superseded_own,
+        "live_footer_markdown": live_footer,
     }
 
 
@@ -229,13 +395,18 @@ def list_pending_plans(
     status: str = "",
     kind: str = "",
     include_all: bool = False,
+    report_scope: str = "fleet",
+    redacted_seats: set[str] | frozenset[str] | None = None,
+    line_seats: set[str] | frozenset[str] | tuple[str, ...] | list[str] | None = None,
+    line_label: str = "",
 ) -> dict[str, Any]:
-    """Lists `WAITING_APPROVE` items (or all historical states when `include_all=True`)."""
+    """Lists `WAITING_APPROVE` items (or all historical states when `include_all=True`) plus `live_footer_markdown`."""
     p_file = _normalize_plans_path_nofollow(plans_path)
     filt_scope = normalize_plan_scope(scope) if scope.strip() else ""
     filt_seat = seat.strip()
     filt_status = status.strip().upper()
     filt_kind = normalize_plan_kind(kind) if kind.strip() else ""
+    eff_report_scope = normalize_report_scope(report_scope, default="fleet")
     if filt_status and filt_status not in VALID_PLAN_STATUSES:
         raise ValueError(f"Unsupported plan status filter: {filt_status}")
 
@@ -265,6 +436,14 @@ def list_pending_plans(
         "storage_path": str(p_file),
         "count": len(filtered),
         "plans": filtered,
+        "live_footer_markdown": render_live_pending_footer_markdown(
+            filt_seat or "lead",
+            doc,
+            redacted_seats=redacted_seats,
+            report_scope=eff_report_scope,
+            line_seats=line_seats,
+            line_label=line_label,
+        ),
     }
 
 
@@ -278,6 +457,10 @@ def reopen_pending_plan(
     title: str = "",
     note: str = "",
     governance_seats: tuple[str, ...] = ("lead",),
+    report_scope: str = "fleet",
+    redacted_seats: set[str] | frozenset[str] | None = None,
+    line_seats: set[str] | frozenset[str] | tuple[str, ...] | list[str] | None = None,
+    line_label: str = "",
 ) -> dict[str, Any]:
     """Reopens a closed (`APPROVED | SUPERSEDED | CANCELLED`) item back to `WAITING_APPROVE` in place (zero gap)."""
     p_file = _normalize_plans_path_nofollow(plans_path)
@@ -285,6 +468,7 @@ def reopen_pending_plan(
     tid = plan_id.strip()
     tscope = normalize_plan_scope(scope) if scope.strip() else ""
     new_kind = normalize_plan_kind(kind) if kind.strip() else ""
+    eff_report_scope = normalize_report_scope(report_scope, default="fleet")
     if not tid and not tscope:
         raise ValueError("reopen_pending_plan requires plan_id or scope")
 
@@ -315,22 +499,31 @@ def reopen_pending_plan(
             and str(rec.get("seat") or "") != p_seat
         ]
         if conflicts:
-            return {"ok": False, "collision": True, "scope": rec_scope, "seat": p_seat, "conflicts": conflicts}
+            return {
+                "ok": False,
+                "collision": True,
+                "scope": rec_scope,
+                "seat": p_seat,
+                "conflicts": conflicts,
+                "live_footer_markdown": render_live_pending_footer_markdown(
+                    actor,
+                    doc,
+                    redacted_seats=redacted_seats,
+                    report_scope=eff_report_scope,
+                    line_seats=line_seats,
+                    line_label=line_label,
+                ),
+            }
 
         ts = utc_iso()
         prev_status = str(target.get("status") or "")
-        superseded_own: list[str] = []
-        for rec in plans:
-            if (
-                rec is not target
-                and rec.get("status") == "WAITING_APPROVE"
-                and rec.get("scope") == rec_scope
-                and str(rec.get("seat") or "") == p_seat
-            ):
-                rec["status"] = "SUPERSEDED"
-                rec["superseded_by"] = str(target.get("plan_id") or "")
-                rec["updated_at"] = ts
-                superseded_own.append(str(rec.get("plan_id") or ""))
+        other_active_scopes = {
+            str(rec.get("scope") or "")
+            for rec in plans
+            if rec is not target and str(rec.get("status") or "").upper() == "WAITING_APPROVE"
+        }
+        if rec_scope in other_active_scopes:
+            target["scope"] = _allocate_coexisting_scope(rec_scope, other_active_scopes)
 
         target["status"] = "WAITING_APPROVE"
         target["kind"] = new_kind or str(target.get("kind") or "PLAN").strip().upper() or "PLAN"
@@ -345,8 +538,22 @@ def reopen_pending_plan(
         target["updated_at"] = ts
         doc["plans"] = plans
         _write_plans_doc_locked(p_file, doc)
+        live_footer = render_live_pending_footer_markdown(
+            actor,
+            doc,
+            redacted_seats=redacted_seats,
+            report_scope=eff_report_scope,
+            line_seats=line_seats,
+            line_label=line_label,
+        )
 
-    return {"ok": True, "collision": False, "plan": target, "superseded_own_ids": superseded_own}
+    return {
+        "ok": True,
+        "collision": False,
+        "plan": target,
+        "superseded_own_ids": [],
+        "live_footer_markdown": live_footer,
+    }
 
 
 def close_pending_plan(
@@ -358,11 +565,16 @@ def close_pending_plan(
     status: str = "APPROVED",
     note: str = "",
     governance_seats: tuple[str, ...] = ("lead",),
+    report_scope: str = "fleet",
+    redacted_seats: set[str] | frozenset[str] | None = None,
+    line_seats: set[str] | frozenset[str] | tuple[str, ...] | list[str] | None = None,
+    line_label: str = "",
 ) -> dict[str, Any]:
     """Closes a pending plan (`APPROVED | SUPERSEDED | CANCELLED`) and auto-supersedes older scope drafts."""
     p_file = _normalize_plans_path_nofollow(plans_path)
     actor = str(seat or "").strip()
     new_status = str(status or "").strip().upper()
+    eff_report_scope = normalize_report_scope(report_scope, default="fleet")
     if new_status not in ("APPROVED", "SUPERSEDED", "CANCELLED"):
         raise ValueError(f"Invalid close status {status!r}; expected APPROVED, SUPERSEDED, or CANCELLED")
     tid = plan_id.strip()
@@ -409,11 +621,20 @@ def close_pending_plan(
 
         doc["plans"] = plans
         _write_plans_doc_locked(p_file, doc)
+        live_footer = render_live_pending_footer_markdown(
+            actor,
+            doc,
+            redacted_seats=redacted_seats,
+            report_scope=eff_report_scope,
+            line_seats=line_seats,
+            line_label=line_label,
+        )
 
     return {
         "ok": True,
         "plan": target,
         "superseded_plan_ids": superseded_ids,
+        "live_footer_markdown": live_footer,
     }
 
 
@@ -445,7 +666,6 @@ def supersede_plans_for_scope(
 
 
 PENDING_PLANS_MAX_READ_BYTES = 524288  # 512 KiB (prevents silent drop on active multi-seat fleets)
-STRICT_PLAN_ID_RE = re.compile(r"^PLN-\d{8}-\d{3,}$")
 TITLE_TAG_PREFIX_RE = re.compile(r"^(?:\s*\[[^\]]{1,42}\]\s*)+")
 UNSAFE_BANNER_CHARS_RE = re.compile(r"[\x00-\x1f\x7f<>\[\]`|]+")
 
@@ -787,7 +1007,13 @@ _STOP_WAIT_CB_RE = re.compile(
     re.IGNORECASE,
 )
 _STOP_WAIT_DECISION_RE = re.compile(
-    r"(?:(?:请您|请你|交主理人|等你|等待您?)(?:拍板|定夺|选定|选择方案|选择路径|二选一)|请选择(?:方案|路径)|"
+    r"(?:(?:请您|请你|交主理人|交给你|交给您|需要你|需要您|等你|等待[你您]?)(?:来)?(?:拍板|定夺|选定|选择方案|选择路径|二选一)|请选择(?:方案|路径)|"
+    r"(?:(?<![已曾])(?:怎么(?:来)?定|选哪个|定哪个)[^\n。！!；;]{0,18}[？?]|"
+    r"是否可行\s*(?:[？?]|[，,]\s*(?:(?:你|您)?(?:确认|同意|点头)后|请|等你|等待|回复))|"
+    r"要不要(?:一起|一并|顺手)[^\n。！!；;]{0,24}[？?]|"
+    r"(?:(?:你|您)(?:确认|同意|点头)后(?:我)?(?:再)?|(?<![按经由在被于已曾获])(?:确认|同意|点头)后(?:我)?再)"
+    r"(?:推进|执行|开始|启动|落地|动手)(?![了过完毕着])(?![^\n。！!；;]{0,20}(?:已完成|已执行|已上线|已恢复|已通过|全部通过|已交付))|"
+    r"(?:^|[，,。；;\n]\s*)(?:确认|同意|点头)后(?:我)?(?:推进|执行|开始|启动|落地|动手)\s*(?:[。！!？?]|$))|"
     r"\bplease\s+(?:choose|decide|pick)\s+(?:between|option|path)\b)",
     re.IGNORECASE,
 )
