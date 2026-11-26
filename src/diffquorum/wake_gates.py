@@ -469,10 +469,18 @@ def evaluate_six_gates(snapshot: dict[str, Any], now_ts: float | None = None) ->
     awaiting_approve = bool(snapshot.get("transcript_awaiting_human_approve")) or is_awaiting_human_approve(
         str(snapshot.get("transcript_last_text") or "")
     )
-    if awaiting_approve:
-        tx_mtime = float(snapshot.get("transcript_mtime_ts") or 0.0)
-        newest_ticket_ts = float(snapshot.get("newest_ready_ticket_ts") or 0.0)
-        if newest_ticket_ts <= 0.0 or newest_ticket_ts <= tx_mtime:
+    has_pending_plan = bool(snapshot.get("has_waiting_pending_plan"))
+    if awaiting_approve or has_pending_plan:
+        try:
+            tx_mtime = float(snapshot.get("transcript_mtime_ts") or 0.0)
+            plan_ts = float(snapshot.get("pending_plan_updated_ts") or 0.0)
+            newest_ticket_ts = float(snapshot.get("newest_ready_ticket_ts") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return {"wake": False, "gate": "gate4", "reason": "AWAITING_HUMAN_APPROVE"}
+        if not (math.isfinite(tx_mtime) and math.isfinite(plan_ts) and math.isfinite(newest_ticket_ts)):
+            return {"wake": False, "gate": "gate4", "reason": "AWAITING_HUMAN_APPROVE"}
+        guard_ts = max(tx_mtime if awaiting_approve else 0.0, plan_ts if has_pending_plan else 0.0)
+        if newest_ticket_ts <= 0.0 or newest_ticket_ts <= guard_ts:
             return {"wake": False, "gate": "gate4", "reason": "AWAITING_HUMAN_APPROVE"}
 
     # Gate 5: Per-seat sliding 120s rate limit

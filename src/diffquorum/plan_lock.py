@@ -17,6 +17,23 @@ from .blackboard import atomic_write_json, utc_iso
 
 PLAN_SCOPE_RE = re.compile(r"^[a-z0-9][a-z0-9_./:-]{0,119}$")
 VALID_PLAN_STATUSES = frozenset({"WAITING_APPROVE", "APPROVED", "SUPERSEDED", "CANCELLED"})
+VALID_PLAN_KINDS: tuple[str, ...] = ("PLAN", "DECISION", "CIRCUIT_BREAKER", "INPUT_REQUIRED")
+PLAN_KIND_SHORT_TAGS: dict[str, str] = {
+    "PLAN": "PLAN",
+    "DECISION": "DEC",
+    "CIRCUIT_BREAKER": "CB",
+    "INPUT_REQUIRED": "INP",
+}
+PLAN_MAX_CLOSED_RETAIN = 200
+
+
+def normalize_plan_kind(raw_kind: str | None) -> str:
+    val = str(raw_kind or "PLAN").strip().upper()
+    if not val:
+        return "PLAN"
+    if val not in VALID_PLAN_KINDS:
+        raise ValueError(f"Unsupported plan kind {raw_kind!r}; expected one of {VALID_PLAN_KINDS}")
+    return val
 
 
 class _PlanFileLock:
@@ -80,6 +97,12 @@ def _write_plans_doc_locked(plans_path: pathlib.Path, doc: dict[str, Any]) -> No
     plans_path.parent.mkdir(parents=True, exist_ok=True)
     if plans_path.parent.is_symlink() or plans_path.is_symlink():
         raise ValueError(f"Refusing symlinked pending_plans path: {plans_path}")
+    raw_plans = list(doc.get("plans") or [])
+    waiting = [r for r in raw_plans if isinstance(r, dict) and str(r.get("status") or "").upper() == "WAITING_APPROVE"]
+    closed = [r for r in raw_plans if isinstance(r, dict) and str(r.get("status") or "").upper() != "WAITING_APPROVE"]
+    if len(closed) > PLAN_MAX_CLOSED_RETAIN:
+        kept = {id(r) for r in waiting} | {id(r) for r in closed[-PLAN_MAX_CLOSED_RETAIN:]}
+        doc["plans"] = [r for r in raw_plans if id(r) in kept]
     doc["rev"] = int(doc.get("rev") or 0) + 1
     doc["updated_at"] = utc_iso()
     atomic_write_json(plans_path, doc)
@@ -113,10 +136,12 @@ def open_pending_plan(
     scope: str,
     title: str,
     owner_seat: str = "lead",
+    kind: str = "PLAN",
 ) -> dict[str, Any]:
-    """Opens a `WAITING_APPROVE` plan or reports `collision: True` if another seat holds `scope`."""
+    """Opens a `WAITING_APPROVE` plan/decision/circuit-breaker or reports `collision: True` if another seat holds `scope`."""
     p_file = _normalize_plans_path_nofollow(plans_path)
     norm_scope = normalize_plan_scope(scope)
+    norm_kind = normalize_plan_kind(kind)
     clean_seat = str(seat or "").strip()
     clean_owner = str(owner_seat or "lead").strip() or "lead"
     clean_title = str(title or "").strip()
@@ -164,6 +189,7 @@ def open_pending_plan(
             "seat": clean_seat,
             "scope": norm_scope,
             "owner_seat": clean_owner,
+            "kind": norm_kind,
             "title": clean_title,
             "created_at": ts,
             "updated_at": ts,
@@ -188,13 +214,15 @@ def list_pending_plans(
     scope: str = "",
     seat: str = "",
     status: str = "",
+    kind: str = "",
     include_all: bool = False,
 ) -> dict[str, Any]:
-    """Lists `WAITING_APPROVE` plans (or all historical states when `include_all=True`)."""
+    """Lists `WAITING_APPROVE` items (or all historical states when `include_all=True`)."""
     p_file = _normalize_plans_path_nofollow(plans_path)
     filt_scope = normalize_plan_scope(scope) if scope.strip() else ""
     filt_seat = seat.strip()
     filt_status = status.strip().upper()
+    filt_kind = normalize_plan_kind(kind) if kind.strip() else ""
     if filt_status and filt_status not in VALID_PLAN_STATUSES:
         raise ValueError(f"Unsupported plan status filter: {filt_status}")
 
@@ -214,6 +242,9 @@ def list_pending_plans(
             continue
         if filt_seat and str(rec.get("seat") or "") != filt_seat:
             continue
+        rec_kind = str(rec.get("kind") or "PLAN").strip().upper() or "PLAN"
+        if filt_kind and rec_kind != filt_kind:
+            continue
         filtered.append(rec)
 
     return {
@@ -222,6 +253,87 @@ def list_pending_plans(
         "count": len(filtered),
         "plans": filtered,
     }
+
+
+def reopen_pending_plan(
+    plans_path: str | pathlib.Path,
+    *,
+    seat: str,
+    plan_id: str = "",
+    scope: str = "",
+    kind: str = "",
+    title: str = "",
+    note: str = "",
+    governance_seats: tuple[str, ...] = ("lead",),
+) -> dict[str, Any]:
+    """Reopens a closed (`APPROVED | SUPERSEDED | CANCELLED`) item back to `WAITING_APPROVE` in place (zero gap)."""
+    p_file = _normalize_plans_path_nofollow(plans_path)
+    actor = str(seat or "").strip()
+    tid = plan_id.strip()
+    tscope = normalize_plan_scope(scope) if scope.strip() else ""
+    new_kind = normalize_plan_kind(kind) if kind.strip() else ""
+    if not tid and not tscope:
+        raise ValueError("reopen_pending_plan requires plan_id or scope")
+
+    lock_p = p_file.with_name(f".{p_file.name}.lock")
+    with _PlanFileLock(lock_p):
+        doc = _read_plans_doc_locked(p_file)
+        plans = list(doc.get("plans") or [])
+        matched = [
+            rec
+            for rec in plans
+            if (tid and rec.get("plan_id") == tid) or (not tid and tscope and rec.get("scope") == tscope)
+        ]
+        if not matched:
+            raise KeyError("No matching plan found to reopen")
+        target = matched[-1]
+        p_seat = str(target.get("seat") or "")
+        allowed = set(governance_seats) | {p_seat, str(target.get("owner_seat") or "")}
+        if actor not in allowed:
+            raise PermissionError(f"Seat {actor!r} is not authorized to reopen plan {target.get('plan_id')!r}")
+
+        rec_scope = str(target.get("scope") or "")
+        conflicts = [
+            rec
+            for rec in plans
+            if rec is not target
+            and rec.get("status") == "WAITING_APPROVE"
+            and rec.get("scope") == rec_scope
+            and str(rec.get("seat") or "") != p_seat
+        ]
+        if conflicts:
+            return {"ok": False, "collision": True, "scope": rec_scope, "seat": p_seat, "conflicts": conflicts}
+
+        ts = utc_iso()
+        prev_status = str(target.get("status") or "")
+        superseded_own: list[str] = []
+        for rec in plans:
+            if (
+                rec is not target
+                and rec.get("status") == "WAITING_APPROVE"
+                and rec.get("scope") == rec_scope
+                and str(rec.get("seat") or "") == p_seat
+            ):
+                rec["status"] = "SUPERSEDED"
+                rec["superseded_by"] = str(target.get("plan_id") or "")
+                rec["updated_at"] = ts
+                superseded_own.append(str(rec.get("plan_id") or ""))
+
+        target["status"] = "WAITING_APPROVE"
+        target["kind"] = new_kind or str(target.get("kind") or "PLAN").strip().upper() or "PLAN"
+        if title.strip():
+            target["title"] = title.strip()
+        if note.strip():
+            target["note"] = note.strip()
+        target["reopened_from_status"] = prev_status
+        target["reopened_by"] = actor
+        target["reopened_at"] = ts
+        target["reopen_count"] = int(target.get("reopen_count") or 0) + 1
+        target["updated_at"] = ts
+        doc["plans"] = plans
+        _write_plans_doc_locked(p_file, doc)
+
+    return {"ok": True, "collision": False, "plan": target, "superseded_own_ids": superseded_own}
 
 
 def close_pending_plan(
@@ -319,25 +431,35 @@ def supersede_plans_for_scope(
     return superseded
 
 
-PENDING_PLANS_MAX_READ_BYTES = 16384
+PENDING_PLANS_MAX_READ_BYTES = 524288  # 512 KiB (prevents silent drop on active multi-seat fleets)
 STRICT_PLAN_ID_RE = re.compile(r"^PLN-\d{8}-\d{3,}$")
 TITLE_TAG_PREFIX_RE = re.compile(r"^(?:\s*\[[^\]]{1,42}\]\s*)+")
 UNSAFE_BANNER_CHARS_RE = re.compile(r"[\x00-\x1f\x7f<>\[\]`|]+")
 
 
 def _read_plans_doc_readonly_bounded(path: pathlib.Path) -> dict[str, Any] | None:
-    """Pure read-only `O_RDONLY | O_NOFOLLOW` (`<=16KB`) reader that never creates locks or mutates disk."""
+    """Pure read-only `O_RDONLY | O_NOFOLLOW` (`<=512KB`) reader that never creates locks or mutates disk."""
     try:
         if path.is_symlink() or not path.exists():
             return None
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > PENDING_PLANS_MAX_READ_BYTES:
                 return None
-            raw = os.read(fd, PENDING_PLANS_MAX_READ_BYTES)
+            chunks: list[bytes] = []
+            total = 0
+            while total <= PENDING_PLANS_MAX_READ_BYTES:
+                part = os.read(fd, min(65536, PENDING_PLANS_MAX_READ_BYTES + 1 - total))
+                if not part:
+                    break
+                chunks.append(part)
+                total += len(part)
         finally:
             os.close(fd)
+        raw = b"".join(chunks)
+        if len(raw) > PENDING_PLANS_MAX_READ_BYTES:
+            return None
         doc = json.loads(raw.decode("utf-8", errors="replace"))
     except Exception:
         return None
@@ -404,8 +526,11 @@ def format_pending_plans_bar(
             red_counts[seat] = red_counts.get(seat, 0) + 1
             ordered.append((True, seat, ""))
         else:
+            raw_kind = str(rec.get("kind") or "PLAN").strip().upper()
+            ktag = PLAN_KIND_SHORT_TAGS.get(raw_kind, "PLAN")
+            badge = f"[{ktag}]" if ktag != "PLAN" else ""
             t = sanitize_plan_banner_title(str(rec.get("title") or ""), max_chars=title_cap) or str(rec.get("plan_id") or "PLAN")
-            ordered.append((False, seat, f"{seat}:{t}"))
+            ordered.append((False, seat, f"{seat}{badge}:{t}"))
     if total <= 0:
         return ""
     tokens: list[str] = []
@@ -428,11 +553,12 @@ def build_pre_invocation_pending_banner(
     *,
     mirror_path: str | pathlib.Path | None = None,
     redacted_seats: set[str] | frozenset[str] | None = None,
+    allow_self_view: bool = True,
 ) -> str:
     """
-    Zero-Token `PreInvocation` hook helper: returns `""` (0 bytes) when no `WAITING_APPROVE` plans exist;
-    otherwise emits a 1-line summary explicitly splitting `own` vs `peers` counts so agents never claim
-    "0 pending approvals" from stale single-seat memory while peer seats have open plans.
+    Zero-Token `PreInvocation` hook helper: returns `""` (0 bytes) when no `WAITING_APPROVE` items exist;
+    otherwise emits a 1-line summary explicitly splitting `own` vs `peers` counts (with `DEC/CB/INP` badges)
+    while redacting sensitive seats for peers (optionally allowing a sensitive seat to view its own open items).
     """
     self_seat = str(seat or "").strip()
     doc = load_reconciled_pending_plans_ro(primary_path, mirror_path=mirror_path)
@@ -447,18 +573,22 @@ def build_pre_invocation_pending_banner(
         if not isinstance(rec, dict) or str(rec.get("status") or "").strip().upper() != "WAITING_APPROVE":
             continue
         rec_seat = str(rec.get("seat") or "").strip() or "seat"
-        if rec_seat == self_seat:
+        is_own = rec_seat == self_seat
+        if is_own:
             own_cnt += 1
         else:
             peer_cnt += 1
-        if rec_seat in redacted:
+        if rec_seat in redacted and not (allow_self_view and is_own):
             red_counts[rec_seat] = red_counts.get(rec_seat, 0) + 1
             ordered.append((True, rec_seat, ""))
         else:
             raw_pid = str(rec.get("plan_id") or "").strip()
             safe_pid = raw_pid if STRICT_PLAN_ID_RE.fullmatch(raw_pid) else "PLN"
             safe_title = sanitize_plan_banner_title(str(rec.get("title") or ""), max_chars=28)
-            tok = f"{rec_seat}({safe_pid}:{safe_title})" if safe_title else f"{rec_seat}({safe_pid})"
+            raw_kind = str(rec.get("kind") or "PLAN").strip().upper()
+            ktag = PLAN_KIND_SHORT_TAGS.get(raw_kind, "PLAN")
+            badge = f"[{ktag}]" if ktag != "PLAN" else ""
+            tok = f"{rec_seat}{badge}({safe_pid}:{safe_title})" if safe_title else f"{rec_seat}{badge}({safe_pid})"
             ordered.append((False, rec_seat, tok))
 
     total = own_cnt + peer_cnt
@@ -504,7 +634,7 @@ def _is_trusted_executable(
         return (False, "") if require_explicit_dir else (True, norm)
     parent = str(pathlib.PurePosixPath(tok).parent)
     home_bin = str(pathlib.Path.home() / "bin")
-    if parent in trusted_dirs or parent == home_bin:
+    if parent in trusted_dirs or parent in (home_bin, "~/bin"):
         return True, norm
     return False, ""
 
@@ -568,6 +698,172 @@ def validate_plan_hook_command(
 
     if action == "list":
         return {"allowed": True, "mode": "allow_readonly", "action": action, "binary": bin_name}
-    if action in ("open", "close"):
+    if action in ("open", "close", "reopen"):
         return {"allowed": True, "mode": "allow_mutate", "action": action, "binary": bin_name}
     return {"allowed": False, "mode": "deny", "reason": f"unsupported_plan_action:{action}"}
+
+
+_FENCED_CODE_BLOCK_RE = re.compile(r"(`{3,}|~{3,})[\s\S]*?\1")
+_INLINE_CODE_SPAN_RE = re.compile(r"`[^`\n]+`")
+_TRAILING_PENDING_FOOTER_RE = re.compile(r"^\s*\*\*(?:当前待你拍板清单|Pending approvals).*$", re.MULTILINE | re.IGNORECASE)
+_STOP_WAIT_PLAN_RE = re.compile(
+    r"(?:请先审核上面的计划|回复[“\"『]?\s*Approve\s*[”\"』]?后(?:我再|开始|执行|再)|"
+    r"\breply\s+['\"]?approve['\"]?\s+to\s+(?:proceed|execute)\b|\bawaiting\s+your\s+approval\b)",
+    re.IGNORECASE,
+)
+_STOP_WAIT_CB_RE = re.compile(
+    r"(?:(?:强制|触发|进入)(?:熔断|人工门禁)[^\n。！？!?]{0,60}(?:等待|请|需|拍板|定夺|介入|处理)|"
+    r"\bcircuit[- ]breaker\s+triggered\b[^\n.!?]{0,60}\b(?:awaiting|waiting|please)\b)",
+    re.IGNORECASE,
+)
+_STOP_WAIT_DECISION_RE = re.compile(
+    r"(?:(?:请您|请你|交主理人|等你|等待您?)(?:拍板|定夺|选定|选择方案|选择路径|二选一)|请选择(?:方案|路径)|"
+    r"\bplease\s+(?:choose|decide|pick)\s+(?:between|option|path)\b)",
+    re.IGNORECASE,
+)
+_STOP_WAIT_INPUT_RE = re.compile(
+    r"(?:请(?:你|您)(?:先)?(?:补充|提供|确认)[^\n。！？!?]{0,30}(?:后(?:我)?再继续|后再执行|才能继续)|"
+    r"\bplease\s+provide\b[^\n.!?]{0,40}\bbefore\s+(?:I\s+)?continu)",
+    re.IGNORECASE,
+)
+_STOP_FOOTER_OWN_ZERO_RE = re.compile(r"(?:本席\s*[`*]*\s*0\s*[`*]*\s*项|\bown\s*[:=]\s*0\b)", re.IGNORECASE)
+_STOP_FOOTER_PEER_ZERO_RE = re.compile(r"(?:全机他席\s*[`*]*\s*0\s*[`*]*\s*项|\bpeers?\s*[:=]\s*0\b)", re.IGNORECASE)
+_STOP_FOOTER_ALL_ZERO_RE = re.compile(r"(?:(?:当前|全机)(?:均)?(?:无|没有|0\s*项)待(?:你|您)?(?:拍板|批|决)|\b0\s+pending\s+approvals?\b)", re.IGNORECASE)
+
+FLAT_HOOK_EVENTS = frozenset({"SessionStart", "PreInvocation", "PostInvocation", "Stop"})
+GROUPED_HOOK_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
+
+
+def evaluate_stop_consistency_gate(
+    *,
+    response_text: str,
+    own_waiting_count: int,
+    peer_waiting_count: int,
+    termination_reason: str = "NO_TOOL_CALL",
+    fully_idle: bool = True,
+    continuation_active: bool = False,
+    readonly_auto_register: bool = False,
+) -> dict[str, Any]:
+    """
+    Zero-Token `Stop` lifecycle hook consistency evaluator:
+      1. Fires ONLY when `termination_reason == "NO_TOOL_CALL"` and `fully_idle is True`;
+      2. Strips fenced & inline code blocks before checking whether the response body asks for
+         human approval/decision/circuit-breaker/input while `own_waiting_count == 0` -> returns
+         `decision="continue"` (or `action="auto_register"` for shell-less seats or when `continuation_active=True`);
+      3. Checks the trailing 600 chars for false-zero own/peer footer claims when `continuation_active=False`;
+      4. Hard 1-retry anti-loop invariant: NEVER returns `decision="continue"` when `continuation_active=True`.
+    """
+    if str(termination_reason or "").strip() != "NO_TOOL_CALL" or not fully_idle:
+        return {"decision": "allow", "action": "allow", "reason": ""}
+    text = str(response_text or "")
+    if not text.strip():
+        return {"decision": "allow", "action": "allow", "reason": ""}
+
+    if int(own_waiting_count) == 0:
+        body_clean = _TRAILING_PENDING_FOOTER_RE.sub("", _INLINE_CODE_SPAN_RE.sub(" ", _FENCED_CODE_BLOCK_RE.sub(" ", text)))
+        matched_kind = ""
+        matched_cue = ""
+        for kind, pat in (
+            ("PLAN", _STOP_WAIT_PLAN_RE),
+            ("CIRCUIT_BREAKER", _STOP_WAIT_CB_RE),
+            ("DECISION", _STOP_WAIT_DECISION_RE),
+            ("INPUT_REQUIRED", _STOP_WAIT_INPUT_RE),
+        ):
+            m = pat.search(body_clean)
+            if m:
+                matched_kind = kind
+                matched_cue = " ".join(m.group(0).split())[:48]
+                break
+        if matched_kind:
+            if readonly_auto_register or continuation_active:
+                return {
+                    "decision": "allow",
+                    "action": "auto_register",
+                    "inferred_kind": matched_kind,
+                    "matched_cue": matched_cue,
+                    "reason": "",
+                }
+            return {
+                "decision": "continue",
+                "action": "continue",
+                "inferred_kind": matched_kind,
+                "matched_cue": matched_cue,
+                "reason": (
+                    f"Stop consistency gate: response pauses for human action ({matched_kind}: {matched_cue!r}) "
+                    "while own_waiting_count == 0; register via `plan open --kind ...` or `plan reopen` first."
+                ),
+            }
+
+    if not continuation_active:
+        footer_tail = text[-600:]
+        if int(own_waiting_count) > 0 and (_STOP_FOOTER_OWN_ZERO_RE.search(footer_tail) or _STOP_FOOTER_ALL_ZERO_RE.search(footer_tail)):
+            return {
+                "decision": "continue",
+                "action": "continue",
+                "reason": (
+                    f"Stop consistency gate: footer reports 0 own pending items while own_waiting_count == {int(own_waiting_count)}; "
+                    "close completed items or correct the trailing summary."
+                ),
+            }
+        if int(peer_waiting_count) > 0 and (_STOP_FOOTER_PEER_ZERO_RE.search(footer_tail) or _STOP_FOOTER_ALL_ZERO_RE.search(footer_tail)):
+            return {
+                "decision": "continue",
+                "action": "continue",
+                "reason": (
+                    f"Stop consistency gate: footer reports 0 peer pending items while peer_waiting_count == {int(peer_waiting_count)}; "
+                    "correct the trailing summary against live pending_plans.json."
+                ),
+            }
+
+    return {"decision": "allow", "action": "allow", "reason": ""}
+
+
+def validate_hooks_json_schema(doc: Any) -> dict[str, Any]:
+    """
+    Validates lifecycle `hooks.json` structural compliance:
+      - Flat events (`SessionStart`, `PreInvocation`, `PostInvocation`, `Stop`) MUST be flat handler lists
+        (no `matcher`/`hooks` wrapper dict);
+      - Tool events (`PreToolUse`, `PostToolUse`) MUST be grouped dicts containing `matcher` (str) and non-empty `hooks`.
+    """
+    issues: list[str] = []
+    if not isinstance(doc, dict) or not doc:
+        return {"ok": False, "issue_count": 1, "issues": ["hooks_json_root_must_be_non_empty_object"]}
+    known = FLAT_HOOK_EVENTS | GROUPED_HOOK_EVENTS
+    for hook_name, spec in doc.items():
+        if not isinstance(spec, dict):
+            issues.append(f"{hook_name}: hook spec must be an object")
+            continue
+        for ev_name, entries in spec.items():
+            if ev_name == "enabled":
+                if not isinstance(entries, bool):
+                    issues.append(f"{hook_name}.enabled: must be boolean")
+                continue
+            if ev_name not in known:
+                continue
+            if not isinstance(entries, list):
+                issues.append(f"{hook_name}.{ev_name}: must be a list")
+                continue
+            if ev_name in FLAT_HOOK_EVENTS:
+                for idx, item in enumerate(entries):
+                    if not isinstance(item, dict):
+                        issues.append(f"{hook_name}.{ev_name}[{idx}]: handler must be an object")
+                        continue
+                    if "matcher" in item or "hooks" in item:
+                        issues.append(f"{hook_name}.{ev_name}[{idx}]: flat event must not wrap handlers in matcher/hooks group")
+                    if not str(item.get("command") or "").strip():
+                        issues.append(f"{hook_name}.{ev_name}[{idx}]: missing non-empty command")
+            else:
+                for idx, grp in enumerate(entries):
+                    if not isinstance(grp, dict):
+                        issues.append(f"{hook_name}.{ev_name}[{idx}]: group must be an object")
+                        continue
+                    if not isinstance(grp.get("matcher"), str):
+                        issues.append(f"{hook_name}.{ev_name}[{idx}]: grouped event requires string matcher")
+                    sub_hooks = grp.get("hooks")
+                    if not isinstance(sub_hooks, list) or not sub_hooks:
+                        issues.append(f"{hook_name}.{ev_name}[{idx}]: grouped event requires non-empty hooks list")
+                        continue
+                    for h_i, h in enumerate(sub_hooks):
+                        if not isinstance(h, dict) or not str(h.get("command") or "").strip():
+                            issues.append(f"{hook_name}.{ev_name}[{idx}].hooks[{h_i}]: missing non-empty command")
+    return {"ok": len(issues) == 0, "issue_count": len(issues), "issues": issues}

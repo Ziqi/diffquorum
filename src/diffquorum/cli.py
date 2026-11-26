@@ -46,7 +46,7 @@ from .governance import (
     verify_model_identity,
 )
 from .ops import collect_ast_imports, curate_ledger, list_meetings, record_meeting, render_dual_hud, run_readonly_probe, summarize_qa_directory
-from .plan_lock import close_pending_plan, list_pending_plans, open_pending_plan
+from .plan_lock import close_pending_plan, list_pending_plans, open_pending_plan, reopen_pending_plan
 from .policy import (
     _read_json_nofollow_bounded,
     audit_master_dictionary_drift,
@@ -267,19 +267,30 @@ def main(argv: list[str] | None = None) -> int:
     p_pln = sub.add_parser("plan", help="0-Token 待批方案撞车锁 (open | list | close)", allow_abbrev=False)
     pln_sub = p_pln.add_subparsers(dest="plan_action", required=True)
 
-    p_pln_open = pln_sub.add_parser("open", help="登记待批方案并在同 scope 已存在他席草稿时返回 collision:true", allow_abbrev=False)
+    p_pln_open = pln_sub.add_parser("open", help="登记待批/待决方案并在同 scope 已存在他席草稿时返回 collision:true", allow_abbrev=False)
     p_pln_open.add_argument("--plans-file", required=True)
     p_pln_open.add_argument("--seat", required=True)
     p_pln_open.add_argument("--scope", required=True)
     p_pln_open.add_argument("--title", required=True)
+    p_pln_open.add_argument("--kind", default="PLAN", choices=("PLAN", "DECISION", "CIRCUIT_BREAKER", "INPUT_REQUIRED"))
     p_pln_open.add_argument("--owner-seat", default="lead")
 
-    p_pln_list = pln_sub.add_parser("list", help="查询当前 WAITING_APPROVE 待批方案清单", allow_abbrev=False)
+    p_pln_list = pln_sub.add_parser("list", help="查询当前 WAITING_APPROVE 待批/待决清单", allow_abbrev=False)
     p_pln_list.add_argument("--plans-file", required=True)
     p_pln_list.add_argument("--scope", default="")
     p_pln_list.add_argument("--seat", default="")
     p_pln_list.add_argument("--status", default="")
+    p_pln_list.add_argument("--kind", default="")
     p_pln_list.add_argument("--all", action="store_true")
+
+    p_pln_reopen = pln_sub.add_parser("reopen", help="中途遇熔断或路径二选一时原位重开已关单为 WAITING_APPROVE", allow_abbrev=False)
+    p_pln_reopen.add_argument("--plans-file", required=True)
+    p_pln_reopen.add_argument("--seat", required=True)
+    p_pln_reopen.add_argument("--plan-id", default="")
+    p_pln_reopen.add_argument("--scope", default="")
+    p_pln_reopen.add_argument("--kind", default="", choices=("", "PLAN", "DECISION", "CIRCUIT_BREAKER", "INPUT_REQUIRED"))
+    p_pln_reopen.add_argument("--title", default="")
+    p_pln_reopen.add_argument("--note", default="")
 
     p_pln_close = pln_sub.add_parser("close", help="关闭待批方案 (APPROVED | SUPERSEDED | CANCELLED)", allow_abbrev=False)
     p_pln_close.add_argument("--plans-file", required=True)
@@ -655,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
                         scope=args.scope,
                         title=args.title,
                         owner_seat=args.owner_seat,
+                        kind=args.kind,
                     )
                 )
                 return 0
@@ -665,7 +677,21 @@ def main(argv: list[str] | None = None) -> int:
                         scope=args.scope,
                         seat=args.seat,
                         status=args.status,
+                        kind=args.kind,
                         include_all=args.all,
+                    )
+                )
+                return 0
+            if args.plan_action == "reopen":
+                _out(
+                    reopen_pending_plan(
+                        args.plans_file,
+                        seat=args.seat,
+                        plan_id=args.plan_id,
+                        scope=args.scope,
+                        kind=args.kind,
+                        title=args.title,
+                        note=args.note,
                     )
                 )
                 return 0

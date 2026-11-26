@@ -464,11 +464,12 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
             ["release-preflight", "--repo-root", str(REPO_ROOT)],
             ["review", "--root", str(cli_ws), "--level", "2", "--tree-hash", "deadbeef02", "--blocker", "Tone nit", "--blocker-class", "style"],
             ["archive", "--repo-root", str(mini_repo), "--verify"],
-            ["plan", "open", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "lead", "--scope", "router-v1", "--title", "Draft A"],
-            ["plan", "open", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "lead", "--scope", "router-v1", "--title", "Draft A2"],
+            ["plan", "open", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "lead", "--scope", "router-v1", "--title", "Draft A", "--kind", "PLAN"],
+            ["plan", "open", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "lead", "--scope", "router-v1", "--title", "Draft A2", "--kind", "DECISION"],
             ["plan", "open", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "worker", "--scope", "router-v1", "--title", "Competing"],
-            ["plan", "list", "--plans-file", str(temp_root / "cov_plans.json"), "--scope", "router-v1"],
+            ["plan", "list", "--plans-file", str(temp_root / "cov_plans.json"), "--scope", "router-v1", "--kind", "DECISION"],
             ["plan", "close", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "lead", "--scope", "router-v1", "--status", "APPROVED", "--note", "ship"],
+            ["plan", "reopen", "--plans-file", str(temp_root / "cov_plans.json"), "--seat", "lead", "--scope", "router-v1", "--kind", "CIRCUIT_BREAKER", "--title", "Reopened", "--note", "cb"],
             ["plan", "list", "--plans-file", str(temp_root / "cov_plans.json"), "--all"],
             ["qa", "--records-json", json.dumps([{"seat": "lead", "user_inputs": ["[BUS-WAKE]", "Check deploy status"], "last_reply": "All green"}])],
             ["meetings", "list", "--ledger", str(temp_root / "cov_meetings.jsonl"), "--digest"],
@@ -559,8 +560,46 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     sym_p.symlink_to(p_ban)
     assert plk.build_pre_invocation_pending_banner("builder", sym_p) == ""
     big_p = temp_root / "big_plans.json"
-    big_p.write_text('{"rev":9,"plans":[{"seat":"lead","status":"WAITING_APPROVE","title":"' + ("Z" * 17000) + '"}]}', encoding="utf-8")
+    big_p.write_text('{"rev":9,"plans":[{"seat":"lead","status":"WAITING_APPROVE","title":"' + ("Z" * 530000) + '"}]}', encoding="utf-8")
     assert plk.build_pre_invocation_pending_banner("builder", big_p) == ""
+
+    # Exercise kind, reopen, Stop consistency gate, hooks.json schema & Gate 4 pending plan check
+    assert plk.normalize_plan_kind("") == "PLAN"
+    try:
+        plk.normalize_plan_kind("INVALID_KIND")
+    except ValueError:
+        pass
+    p_re = temp_root / "reopen_plans.json"
+    rp1 = plk.open_pending_plan(p_re, seat="lead", scope="re-sc", title="Draft", kind="DECISION")
+    plk.close_pending_plan(p_re, seat="lead", plan_id=rp1["plan"]["plan_id"], status="APPROVED")
+    assert plk.reopen_pending_plan(p_re, seat="lead", plan_id=rp1["plan"]["plan_id"], kind="INPUT_REQUIRED", title="Re", note="n")["ok"] is True
+    plk.close_pending_plan(p_re, seat="lead", plan_id=rp1["plan"]["plan_id"], status="CANCELLED")
+    plk.open_pending_plan(p_re, seat="worker", scope="re-sc", title="Other", kind="PLAN")
+    assert plk.reopen_pending_plan(p_re, seat="lead", plan_id=rp1["plan"]["plan_id"])["collision"] is True
+    for bad_re in (
+        lambda: plk.reopen_pending_plan(p_re, seat="lead"),
+        lambda: plk.reopen_pending_plan(p_re, seat="lead", plan_id="PLN-NOPE"),
+        lambda: plk.reopen_pending_plan(p_re, seat="stranger", plan_id=rp1["plan"]["plan_id"]),
+    ):
+        try:
+            bad_re()
+        except (ValueError, KeyError, PermissionError):
+            pass
+    assert plk.validate_plan_hook_command("~/bin/star-bus plan reopen --seat lead --scope x")["allowed"] is True
+    assert plk.evaluate_stop_consistency_gate(response_text="hi", own_waiting_count=0, peer_waiting_count=0, termination_reason="TOOL_CALL")["decision"] == "allow"
+    assert plk.evaluate_stop_consistency_gate(response_text="", own_waiting_count=0, peer_waiting_count=0)["decision"] == "allow"
+    assert plk.evaluate_stop_consistency_gate(response_text="请你拍板方案", own_waiting_count=0, peer_waiting_count=0)["decision"] == "continue"
+    assert plk.evaluate_stop_consistency_gate(response_text="请你拍板方案", own_waiting_count=0, peer_waiting_count=0, readonly_auto_register=True)["action"] == "auto_register"
+    assert plk.evaluate_stop_consistency_gate(response_text="ok **当前待你拍板清单（本席 0 项 | 全机他席 0 项）**", own_waiting_count=1, peer_waiting_count=0)["decision"] == "continue"
+    assert plk.evaluate_stop_consistency_gate(response_text="ok **当前待你拍板清单（本席 0 项 | 全机他席 0 项）**", own_waiting_count=0, peer_waiting_count=1)["decision"] == "continue"
+    assert plk.evaluate_stop_consistency_gate(response_text="all done", own_waiting_count=0, peer_waiting_count=0)["decision"] == "allow"
+    assert plk.validate_hooks_json_schema({"h": {"enabled": True, "PreInvocation": [{"command": "py h.py"}], "PreToolUse": [{"matcher": "*", "hooks": [{"command": "py g.py"}]}]}})["ok"] is True
+    assert plk.validate_hooks_json_schema({})["ok"] is False
+    assert plk.validate_hooks_json_schema({"b": "bad", "h": {"enabled": "no", "Unknown": 1, "PreInvocation": ["x", {"matcher": "*"}], "Stop": "notlist", "PreToolUse": ["x", {"matcher": 1, "hooks": []}, {"matcher": "*", "hooks": [{}]}]}})["ok"] is False
+    assert wg.evaluate_six_gates(dict(base_snap, has_waiting_pending_plan=True, pending_plan_updated_ts=500.0, newest_ready_ticket_ts=400.0), now_ts=1000.0)["wake"] is False
+    assert wg.evaluate_six_gates(dict(base_snap, has_waiting_pending_plan=True, pending_plan_updated_ts=500.0, newest_ready_ticket_ts=600.0), now_ts=1000.0)["wake"] is True
+    assert wg.evaluate_six_gates(dict(base_snap, has_waiting_pending_plan=True, pending_plan_updated_ts=float("nan"), newest_ready_ticket_ts=600.0), now_ts=1000.0)["wake"] is False
+    assert wg.evaluate_six_gates(dict(base_snap, has_waiting_pending_plan=True, pending_plan_updated_ts="bad", newest_ready_ticket_ts=600.0), now_ts=1000.0)["wake"] is False
 
     assert plk.validate_plan_hook_command("diffquorum plan list")["allowed"] is True
     assert plk.validate_plan_hook_command("python3 /usr/local/bin/star-bus.py plan open --seat s1 --scope x --title t")["allowed"] is True

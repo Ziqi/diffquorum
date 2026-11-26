@@ -144,3 +144,16 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
 
 - **What broke**: A non-daemon shell command (such as an orphaned `ssh ... tail -f` monitor) hung silently inside an agent's background task drawer long after the agent's own turn (`PLANNER_RESPONSE:DONE`) had finished. Because Gate 3/4 treated every non-daemon `RUNNING` entry as active work, the seat stayed permanently deadlocked on `NON_DAEMON_TASK_RUNNING` (`code=BG`) for hours and ignored incoming high-priority `[BUS-WAKE]` tickets.
 - **Root-cause fix (`wake_gates.py`: `is_stale_bg_quiescent_for_unblock`)**: Exempt a hung non-daemon background task from Gate 3/4 blocking **only** when BOTH the transcript AND every regular `.log`/`.json` background task artifact have had zero writes for `>= 180s` (`STALE_BG_TASK_UNBLOCK_SECONDS`, failing closed on symlinks, non-regular files, and any active log `< 180s`). Actively running jobs remain 100% protected while zombie background commands stop deadlocking cross-seat wakeups.
+
+## 17. Silent Pending-Decision Drift, 16KB Read-Cap Cutoff & Flat vs Grouped `hooks.json` Schema (`plan_lock.py`)
+
+- **What broke**: Across multi-seat fleets, pending human decisions silently disappeared from dashboards and turn-start banners for five compounding reasons:
+  1. `plan open` only registered formal `PLAN` drafts, leaving `DECISION`, `CIRCUIT_BREAKER`, and `INPUT_REQUIRED` pauses invisible to the shared ledger and HUD.
+  2. Closing a plan on `Approve` then pausing mid-execution on a follow-up question or circuit breaker had no atomic `plan reopen` transition.
+  3. Read-only `PreInvocation` / HUD readers capped `pending_plans.json` at `16 KiB`, so as soon as historical closed plans pushed the file above `16 KiB` (e.g., ~30+ entries), every reader silently returned `None` (`0` pending items) with no warning.
+  4. Lifecycle `hooks.json` files sometimes wrapped flat events (`SessionStart`, `PreInvocation`, `PostInvocation`, `Stop`) inside `{matcher, hooks}` groups meant only for `PreToolUse`/`PostToolUse`, silently disabling the hook on startup.
+  5. Without a turn-end `Stop` consistency gate, an agent could still emit "awaiting your approval" with `own_waiting == 0` or a stale "0 pending" footer while open items existed.
+- **Root-cause fix (`plan_lock.py`, `cli.py`, `wake_gates.py`)**:
+  - Extended `plan open` / `plan list` with `--kind {PLAN,DECISION,CIRCUIT_BREAKER,INPUT_REQUIRED}` (`[DEC]/[CB]/[INP]` badges), added atomic in-place `plan reopen` (zero visibility gap + cross-seat collision check), and bounded retained closed history to the latest `200` items while never dropping any `WAITING_APPROVE` record.
+  - Raised read-only `PENDING_PLANS_MAX_READ_BYTES` from `16 KiB` to `512 KiB` with bounded chunked reads, and allowed `plan reopen` + `~/bin/` in `validate_plan_hook_command`.
+  - Added `evaluate_stop_consistency_gate` (fires ONLY on `NO_TOOL_CALL` + `fully_idle`, strips fenced/inline code before matching human-pause cues, catches false-zero own/peer footers, enforces a hard `continuation_active` 1-retry anti-loop guard, and supports `readonly_auto_register` for shell-less seats) plus `validate_hooks_json_schema` (enforcing flat vs grouped event schemas) and Gate 4 `has_waiting_pending_plan` wakeup protection.

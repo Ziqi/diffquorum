@@ -1399,7 +1399,7 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
             self.assertEqual(build_pre_invocation_pending_banner("builder", sym), "")
             big = root / "big.json"
             big.write_text(
-                '{"rev":99,"plans":[{"seat":"lead","status":"WAITING_APPROVE","title":"' + ("A" * 17000) + '"}]}',
+                '{"rev":99,"plans":[{"seat":"lead","status":"WAITING_APPROVE","title":"' + ("A" * 530000) + '"}]}',
                 encoding="utf-8",
             )
             self.assertEqual(build_pre_invocation_pending_banner("builder", big), "")
@@ -1821,6 +1821,219 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
                 self.run_cli("dict-check", "--dict", str(dict_p), "--target", str(troot), check=False).returncode,
                 2,
             )
+
+    def test_pending_kinds_reopen_stop_consistency_gate_and_hooks_json_schema(self) -> None:
+        from diffquorum.plan_lock import (
+            PLAN_MAX_CLOSED_RETAIN,
+            build_pre_invocation_pending_banner,
+            close_pending_plan,
+            evaluate_stop_consistency_gate,
+            format_pending_plans_bar,
+            list_pending_plans,
+            open_pending_plan,
+            reopen_pending_plan,
+            validate_hooks_json_schema,
+            validate_plan_hook_command,
+        )
+        from diffquorum.wake_gates import evaluate_six_gates
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            pfile = root / "pending_plans.json"
+
+            # 1) All 4 kinds (PLAN / DECISION / CIRCUIT_BREAKER / INPUT_REQUIRED) + badges + 512KB tolerance
+            r_dec = open_pending_plan(pfile, seat="lead", scope="route-choice", title="Pick option A or B", kind="DECISION")
+            r_cb = open_pending_plan(pfile, seat="worker", scope="billing-gate", title="Quota circuit breaker", kind="CIRCUIT_BREAKER")
+            r_inp = open_pending_plan(pfile, seat="vault", scope="secret-input", title="CONFIDENTIAL_INPUT", kind="INPUT_REQUIRED")
+            self.assertEqual(r_dec["plan"]["kind"], "DECISION")
+            self.assertEqual(r_cb["plan"]["kind"], "CIRCUIT_BREAKER")
+            self.assertEqual(r_inp["plan"]["kind"], "INPUT_REQUIRED")
+            self.assertEqual(list_pending_plans(pfile, kind="DECISION")["count"], 1)
+
+            banner_peer = build_pre_invocation_pending_banner("lead", pfile, redacted_seats={"vault"})
+            self.assertIn("lead[DEC](", banner_peer)
+            self.assertIn("worker[CB](", banner_peer)
+            self.assertIn("vault(1 pending)", banner_peer)
+            self.assertNotIn("CONFIDENTIAL_INPUT", banner_peer)
+
+            # Sensitive seat can view its own pending item when allow_self_view=True
+            banner_self = build_pre_invocation_pending_banner("vault", pfile, redacted_seats={"vault"}, allow_self_view=True)
+            self.assertIn("vault[INP](", banner_self)
+            self.assertIn("CONFIDENTIAL_INPUT", banner_self)
+
+            bar = format_pending_plans_bar(pfile, width=120, redacted_seats={"vault"})
+            self.assertIn("lead[DEC]:", bar)
+            self.assertIn("worker[CB]:", bar)
+            self.assertIn("vault(1 pending)", bar)
+            self.assertNotIn("CONFIDENTIAL_INPUT", bar)
+
+            # 2) Close then reopen in place (zero gap + collision check + auth check)
+            close_pending_plan(pfile, seat="lead", plan_id=r_dec["plan"]["plan_id"], status="APPROVED")
+            self.assertEqual(list_pending_plans(pfile, kind="DECISION")["count"], 0)
+            with self.assertRaises(PermissionError):
+                reopen_pending_plan(pfile, seat="outsider", plan_id=r_dec["plan"]["plan_id"])
+            re_ok = reopen_pending_plan(
+                pfile,
+                seat="lead",
+                plan_id=r_dec["plan"]["plan_id"],
+                kind="CIRCUIT_BREAKER",
+                title="Reopened on mid-flight gate",
+                note="Need confirmation",
+            )
+            self.assertTrue(re_ok["ok"] and not re_ok["collision"])
+            self.assertEqual(re_ok["plan"]["status"], "WAITING_APPROVE")
+            self.assertEqual(re_ok["plan"]["kind"], "CIRCUIT_BREAKER")
+            self.assertEqual(re_ok["plan"]["reopen_count"], 1)
+
+            # Cross-seat collision when reopening a closed scope already claimed by another seat
+            close_pending_plan(pfile, seat="lead", plan_id=r_dec["plan"]["plan_id"], status="CANCELLED")
+            open_pending_plan(pfile, seat="worker", scope="route-choice", title="Worker took scope", kind="PLAN")
+            re_col = reopen_pending_plan(pfile, seat="lead", plan_id=r_dec["plan"]["plan_id"])
+            self.assertFalse(re_col["ok"])
+            self.assertTrue(re_col["collision"])
+
+            # 3) CLI plan open --kind / list --kind / reopen
+            cli_p = root / "cli_plans.json"
+            self.assertEqual(
+                self.run_cli(
+                    "plan", "open", "--plans-file", str(cli_p),
+                    "--seat", "lead", "--scope", "cli-dec", "--title", "CLI Decision", "--kind", "DECISION",
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli("plan", "list", "--plans-file", str(cli_p), "--kind", "DECISION").returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli(
+                    "plan", "close", "--plans-file", str(cli_p),
+                    "--seat", "lead", "--scope", "cli-dec", "--status", "APPROVED",
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                self.run_cli(
+                    "plan", "reopen", "--plans-file", str(cli_p),
+                    "--seat", "lead", "--scope", "cli-dec", "--kind", "INPUT_REQUIRED", "--note", "Need key",
+                ).returncode,
+                0,
+            )
+            self.assertEqual(list_pending_plans(cli_p, kind="INPUT_REQUIRED")["count"], 1)
+
+            # 4) Hook allowlist permits `plan reopen` and `~/bin/`
+            self.assertEqual(
+                validate_plan_hook_command("~/bin/star-bus plan reopen --seat lead --scope cli-dec")["mode"],
+                "allow_mutate",
+            )
+
+            # 5) Stop consistency gate: Intercept A/B, code-block stripping, readonly_auto_register, 1-retry anti-loop
+            # Ignored when termination_reason != NO_TOOL_CALL or not fully_idle
+            self.assertEqual(
+                evaluate_stop_consistency_gate(
+                    response_text="请先审核上面的计划，回复 Approve 后我再开始执行。",
+                    own_waiting_count=0,
+                    peer_waiting_count=0,
+                    termination_reason="TOOL_CALL",
+                )["decision"],
+                "allow",
+            )
+            # Quoted inside fenced or inline code block -> NOT a false positive
+            self.assertEqual(
+                evaluate_stop_consistency_gate(
+                    response_text="Updated regex for `请先审核上面的计划`.\n```\nReply Approve to proceed\n```\nDone.",
+                    own_waiting_count=0,
+                    peer_waiting_count=0,
+                )["decision"],
+                "allow",
+            )
+            # Intercept A: unregistered DECISION while own_waiting == 0 -> continue
+            stop_a = evaluate_stop_consistency_gate(
+                response_text="目前有两套架构方案，请你拍板选定方案 A 还是方案 B。",
+                own_waiting_count=0,
+                peer_waiting_count=0,
+            )
+            self.assertEqual(stop_a["decision"], "continue")
+            self.assertEqual(stop_a["inferred_kind"], "DECISION")
+            # Shell-less readonly seat OR continuation_active=True -> auto_register + allow (never infinite loop!)
+            stop_ro = evaluate_stop_consistency_gate(
+                response_text="目前有两套架构方案，请你拍板选定方案 A 还是方案 B。",
+                own_waiting_count=0,
+                peer_waiting_count=0,
+                readonly_auto_register=True,
+            )
+            self.assertEqual(stop_ro["decision"], "allow")
+            self.assertEqual(stop_ro["action"], "auto_register")
+            stop_loop = evaluate_stop_consistency_gate(
+                response_text="目前有两套架构方案，请你拍板选定方案 A 还是方案 B。",
+                own_waiting_count=0,
+                peer_waiting_count=0,
+                continuation_active=True,
+            )
+            self.assertEqual(stop_loop["decision"], "allow")
+            self.assertEqual(stop_loop["action"], "auto_register")
+            # Intercept B: false-zero peer footer while peer_waiting == 2 -> continue on first pass, allow on continuation
+            stop_b = evaluate_stop_consistency_gate(
+                response_text="已完成检查。\n\n**当前待你拍板清单（本席 0 项 | 全机他席 0 项）：无**",
+                own_waiting_count=0,
+                peer_waiting_count=2,
+            )
+            self.assertEqual(stop_b["decision"], "continue")
+            self.assertEqual(
+                evaluate_stop_consistency_gate(
+                    response_text="已完成检查。\n\n**当前待你拍板清单（本席 0 项 | 全机他席 0 项）：无**",
+                    own_waiting_count=0,
+                    peer_waiting_count=2,
+                    continuation_active=True,
+                )["decision"],
+                "allow",
+            )
+
+            # 6) hooks.json flat vs grouped schema validator
+            good_hooks = {
+                "sync": {
+                    "enabled": True,
+                    "PreInvocation": [{"command": "python3 hook.py"}],
+                    "Stop": [{"command": "python3 hook.py"}],
+                    "PreToolUse": [{"matcher": "run_command", "hooks": [{"command": "python3 guard.py"}]}],
+                }
+            }
+            self.assertTrue(validate_hooks_json_schema(good_hooks)["ok"])
+            bad_hooks = {
+                "broken": {
+                    "PreInvocation": [{"matcher": "*", "hooks": [{"command": "python3 hook.py"}]}],
+                    "Stop": [{"matcher": "*", "hooks": [{"command": "python3 hook.py"}]}],
+                }
+            }
+            bad_res = validate_hooks_json_schema(bad_hooks)
+            self.assertFalse(bad_res["ok"])
+            self.assertIn("flat event must not wrap", "\n".join(bad_res["issues"]))
+
+            # 7) Gate 4 pending_plans wakeup protection (protects any open WAITING_APPROVE kind unless strictly newer ticket)
+            snap_pending = {
+                "pane_in_mode": 0,
+                "pane_fg": "agy",
+                "client_activity_ts": 100.0,
+                "capture_lines": [">", "? for shortcuts"],
+                "cursor_x": 2,
+                "transcript_last_type": "PLANNER_RESPONSE",
+                "transcript_last_status": "DONE",
+                "transcript_has_tool_calls": False,
+                "has_waiting_pending_plan": True,
+                "pending_plan_updated_ts": 500.0,
+                "newest_ready_ticket_ts": 400.0,
+            }
+            g_blk = evaluate_six_gates(snap_pending, now_ts=1000.0)
+            self.assertFalse(g_blk["wake"])
+            self.assertEqual(g_blk["reason"], "AWAITING_HUMAN_APPROVE")
+            g_ok = evaluate_six_gates({**snap_pending, "newest_ready_ticket_ts": 600.0}, now_ts=1000.0)
+            self.assertTrue(g_ok["wake"], g_ok)
+            g_nan = evaluate_six_gates({**snap_pending, "pending_plan_updated_ts": float("nan"), "newest_ready_ticket_ts": 600.0}, now_ts=1000.0)
+            self.assertFalse(g_nan["wake"])
+            self.assertEqual(g_nan["reason"], "AWAITING_HUMAN_APPROVE")
+
+            # 8) Retention cap retains all WAITING_APPROVE + bounded latest closed entries
+            self.assertEqual(PLAN_MAX_CLOSED_RETAIN, 200)
 
 
 if __name__ == "__main__":
