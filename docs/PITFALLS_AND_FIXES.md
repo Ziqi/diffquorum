@@ -1,6 +1,6 @@
 # Production Pitfalls & Engineering Fixes (`DiffQuorum` Lessons Learned)
 
-Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **18 major pitfalls** and the deterministic fixes built into this toolkit.
+Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **19 major pitfalls** and the deterministic fixes built into this toolkit.
 
 ---
 
@@ -168,3 +168,15 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
   - Extended `R3_CRITICAL_DOMAINS` with `commercial_flagship_deliverable` so flagship non-code proposals receive the same parallel dual-blind `R3` rigor as critical code.
   - Added Stage-3 `B0–B2` post-launch zero-context blind evaluation (`diffquorum blind-eval-check`): strictly non-blocking (`is_blocking_live_service=False`), capped at `1` round feeding directly into the next-version backlog, requiring `leaked_internal_context=False`, a genuine public HTTP(S) URL or `public-artifact:<slug>` entrypoint (rejecting `localhost`, loopback, RFC1918/CGNAT/link-local/Fake-IP ranges, `file://`, and local paths), distinct cross-family evaluators, and zero lightweight models.
   - Upgraded `is_explicit_approval_text` with a fail-closed space/comma clause splitter (`TRAILING_REST_APPROVAL_SPLIT_RE`) that accepts affirmative `<selection> 其他/其余 approve` phrasing while immediately rejecting any negation, restriction (`除了`/`只做`/`先别`), question, or revocation.
+
+## 19. Stale Cross-Window Pending Snapshots & Cross-Workspace Hook Bleed (`plan_lock.py`)
+
+- **What broke**:
+  1. **Stale Cross-Window Pending-List Snapshots**: Printing the entire fleet's pending-approval list at the end of every worker seat's turn meant idle panes immediately displayed outdated counts whenever another seat got approved — creating conflicting pending tallies across windows and noisy token overhead.
+  2. **Cross-Workspace `--add-dir` Hook Bleed**: Launching a worker session with a sibling workspace mounted via `--add-dir` loaded the sibling workspace's local `PreToolUse` hooks into the wrong seat and unexpectedly blocked legitimate own-workspace shell commands.
+- **Root-cause fix (`build_pre_invocation_pending_banner` & `evaluate_stop_consistency_gate` `report_scope`)**:
+  - Added role-scoped pending reporting (`report_scope="fleet" | "line" | "self"`, `line_seats`, `line_label`) while keeping the underlying `pending_plans.json` ledger and real-time terminal HUD 100% fleet-wide:
+    - **`fleet`** (global coordinator): receives full `own` vs `peers` split and validates both own and peer false-zero footers;
+    - **`line`** (domain lead): receives only its own `line_seats` rollup (appending `outside:N` only while `line_total > 0`, returning `""` 0 bytes when its own line has `0` open items) and validates false-zero footers only against `own` + `line_peer_waiting_count`;
+    - **`self`** (execution workers): receives only its own open items (`""` 0 bytes when `own == 0`), omits peer lists from footers, and validates only own unregistered pauses (`Intercept A`) and own false-zero footers — eliminating cross-window snapshot drift.
+  - Keep per-seat launch configurations strictly free of cross-workspace `--add-dir` mounts to peer hook-bearing directories; when renaming seats, preserve original physical birth directories via POSIX symlinks + session rename and hand any cross-boundary cutover command to the operator rather than weakening guards.

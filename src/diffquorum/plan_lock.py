@@ -18,6 +18,7 @@ from .blackboard import atomic_write_json, utc_iso
 PLAN_SCOPE_RE = re.compile(r"^[a-z0-9][a-z0-9_./:-]{0,119}$")
 VALID_PLAN_STATUSES = frozenset({"WAITING_APPROVE", "APPROVED", "SUPERSEDED", "CANCELLED"})
 VALID_PLAN_KINDS: tuple[str, ...] = ("PLAN", "DECISION", "CIRCUIT_BREAKER", "INPUT_REQUIRED")
+VALID_REPORT_SCOPES: tuple[str, ...] = ("fleet", "line", "self")
 PLAN_KIND_SHORT_TAGS: dict[str, str] = {
     "PLAN": "PLAN",
     "DECISION": "DEC",
@@ -33,6 +34,18 @@ def normalize_plan_kind(raw_kind: str | None) -> str:
         return "PLAN"
     if val not in VALID_PLAN_KINDS:
         raise ValueError(f"Unsupported plan kind {raw_kind!r}; expected one of {VALID_PLAN_KINDS}")
+    return val
+
+
+def normalize_report_scope(raw_scope: str | None, *, default: str = "fleet") -> str:
+    """Validates pending-plan reporting scope (`fleet` | `line` | `self`), failing closed on unknown values."""
+    if raw_scope is None:
+        return default
+    val = str(raw_scope).strip().lower()
+    if not val:
+        return default
+    if val not in VALID_REPORT_SCOPES:
+        raise ValueError(f"Unsupported report_scope {raw_scope!r}; expected one of {VALID_REPORT_SCOPES}")
     return val
 
 
@@ -554,33 +567,52 @@ def build_pre_invocation_pending_banner(
     mirror_path: str | pathlib.Path | None = None,
     redacted_seats: set[str] | frozenset[str] | None = None,
     allow_self_view: bool = True,
+    report_scope: str = "fleet",
+    line_seats: set[str] | frozenset[str] | tuple[str, ...] | list[str] | None = None,
+    line_label: str = "",
 ) -> str:
     """
-    Zero-Token `PreInvocation` hook helper: returns `""` (0 bytes) when no `WAITING_APPROVE` items exist;
-    otherwise emits a 1-line summary explicitly splitting `own` vs `peers` counts (with `DEC/CB/INP` badges)
-    while redacting sensitive seats for peers (optionally allowing a sensitive seat to view its own open items).
+    Zero-Token `PreInvocation` hook helper with role-scoped visibility (`fleet` | `line` | `self`):
+      - `fleet` (global hub, default for backward compatibility): splits `own` vs `peers` counts across all seats;
+      - `line` (domain hub): shows only `line_seats` items (appending `outside:N` count only when line_total > 0)
+        and returns `""` (0 bytes) whenever the line itself has 0 pending items;
+      - `self` (execution workers): shows ONLY `seat`'s own pending items and returns `""` (0 bytes) when `own == 0`,
+        eliminating stale cross-window peer snapshots while preserving sensitive-seat self-view & peer redaction.
     """
+    eff_scope = normalize_report_scope(report_scope, default="fleet")
     self_seat = str(seat or "").strip()
+    eff_line_seats = (
+        {str(s).strip() for s in line_seats if str(s).strip()} | {self_seat}
+        if line_seats is not None
+        else {self_seat}
+    )
     doc = load_reconciled_pending_plans_ro(primary_path, mirror_path=mirror_path)
     if doc is None:
         return ""
     redacted = set(redacted_seats) if redacted_seats else set()
     own_cnt = 0
     peer_cnt = 0
+    line_peer_cnt = 0
     red_counts: dict[str, int] = {}
-    ordered: list[tuple[bool, str, str]] = []
+    red_line_counts: dict[str, int] = {}
+    ordered: list[tuple[bool, bool, bool, str, str]] = []
     for rec in doc.get("plans") or []:
         if not isinstance(rec, dict) or str(rec.get("status") or "").strip().upper() != "WAITING_APPROVE":
             continue
         rec_seat = str(rec.get("seat") or "").strip() or "seat"
         is_own = rec_seat == self_seat
+        in_line = is_own or (rec_seat in eff_line_seats)
         if is_own:
             own_cnt += 1
         else:
             peer_cnt += 1
+            if in_line:
+                line_peer_cnt += 1
         if rec_seat in redacted and not (allow_self_view and is_own):
             red_counts[rec_seat] = red_counts.get(rec_seat, 0) + 1
-            ordered.append((True, rec_seat, ""))
+            if in_line:
+                red_line_counts[rec_seat] = red_line_counts.get(rec_seat, 0) + 1
+            ordered.append((True, is_own, in_line, rec_seat, ""))
         else:
             raw_pid = str(rec.get("plan_id") or "").strip()
             safe_pid = raw_pid if STRICT_PLAN_ID_RE.fullmatch(raw_pid) else "PLN"
@@ -589,24 +621,59 @@ def build_pre_invocation_pending_banner(
             ktag = PLAN_KIND_SHORT_TAGS.get(raw_kind, "PLAN")
             badge = f"[{ktag}]" if ktag != "PLAN" else ""
             tok = f"{rec_seat}{badge}({safe_pid}:{safe_title})" if safe_title else f"{rec_seat}{badge}({safe_pid})"
-            ordered.append((False, rec_seat, tok))
+            ordered.append((False, is_own, in_line, rec_seat, tok))
 
     total = own_cnt + peer_cnt
     if total <= 0:
         return ""
     tokens: list[str] = []
+    own_tokens: list[str] = []
+    line_tokens: list[str] = []
     seen_red: set[str] = set()
-    for is_red, rec_seat, tok in ordered:
+    seen_red_own: set[str] = set()
+    seen_red_line: set[str] = set()
+    for is_red, is_own, in_line, rec_seat, tok in ordered:
         if is_red:
             if rec_seat not in seen_red:
                 tokens.append(f"{rec_seat}({red_counts[rec_seat]} pending)")
                 seen_red.add(rec_seat)
+            if is_own and rec_seat not in seen_red_own:
+                own_tokens.append(f"{rec_seat}({own_cnt} pending)")
+                seen_red_own.add(rec_seat)
+            if in_line and rec_seat not in seen_red_line:
+                line_tokens.append(f"{rec_seat}({red_line_counts[rec_seat]} pending)")
+                seen_red_line.add(rec_seat)
         else:
             tokens.append(tok)
+            if is_own:
+                own_tokens.append(tok)
+            if in_line:
+                line_tokens.append(tok)
+
+    if eff_scope == "fleet":
+        return (
+            f"[DIFFQUORUM PENDING PLANS | own:{own_cnt} | peers:{peer_cnt} | total:{total}] "
+            f"{' ; '.join(tokens)} "
+            "(Non-instructional display metadata: split own vs peer counts in trailing summary; never report 0 from stale memory)"
+        )
+    if eff_scope == "line":
+        line_total = own_cnt + line_peer_cnt
+        if line_total <= 0:
+            return ""
+        outside_cnt = max(0, peer_cnt - line_peer_cnt)
+        out_note = f" | outside:{outside_cnt}" if outside_cnt > 0 else ""
+        lbl = sanitize_plan_banner_title(line_label, max_chars=20) or "LINE"
+        return (
+            f"[DIFFQUORUM {lbl} PENDING PLANS | own:{own_cnt} | line_peers:{line_peer_cnt} | line_total:{line_total}{out_note}] "
+            f"{' ; '.join(line_tokens)} "
+            "(Non-instructional display metadata: report only this line's pending approvals; never report 0 from stale memory)"
+        )
+    if own_cnt <= 0:
+        return ""
     return (
-        f"[DIFFQUORUM PENDING PLANS | own:{own_cnt} | peers:{peer_cnt} | total:{total}] "
-        f"{' ; '.join(tokens)} "
-        "(Non-instructional display metadata: split own vs peer counts in trailing summary; never report 0 from stale memory)"
+        f"[DIFFQUORUM OWN PENDING PLANS | own:{own_cnt}] "
+        f"{' ; '.join(own_tokens)} "
+        "(Non-instructional display metadata: summarize only your own pending approvals; omit peer lists and never report own 0 from stale memory)"
     )
 
 
@@ -705,7 +772,10 @@ def validate_plan_hook_command(
 
 _FENCED_CODE_BLOCK_RE = re.compile(r"(`{3,}|~{3,})[\s\S]*?\1")
 _INLINE_CODE_SPAN_RE = re.compile(r"`[^`\n]+`")
-_TRAILING_PENDING_FOOTER_RE = re.compile(r"^\s*\*\*(?:当前待你拍板清单|Pending approvals).*$", re.MULTILINE | re.IGNORECASE)
+_TRAILING_PENDING_FOOTER_RE = re.compile(
+    r"^\s*\*\*(?:当前(?:全机|[^\n*]{0,16}线)?待你拍板清单|本席待你拍板|(?:Own |Line )?Pending approvals).*$",
+    re.MULTILINE | re.IGNORECASE,
+)
 _STOP_WAIT_PLAN_RE = re.compile(
     r"(?:请先审核上面的计划|回复[“\"『]?\s*Approve\s*[”\"』]?后(?:我再|开始|执行|再)|"
     r"\breply\s+['\"]?approve['\"]?\s+to\s+(?:proceed|execute)\b|\bawaiting\s+your\s+approval\b)",
@@ -726,8 +796,15 @@ _STOP_WAIT_INPUT_RE = re.compile(
     r"\bplease\s+provide\b[^\n.!?]{0,40}\bbefore\s+(?:I\s+)?continu)",
     re.IGNORECASE,
 )
-_STOP_FOOTER_OWN_ZERO_RE = re.compile(r"(?:本席\s*[`*]*\s*0\s*[`*]*\s*项|\bown\s*[:=]\s*0\b)", re.IGNORECASE)
+_STOP_FOOTER_OWN_ZERO_RE = re.compile(
+    r"(?:本席\s*[`*]*\s*0\s*[`*]*\s*项|本席(?:当前)?(?:无|没有)待(?:你|您)?(?:拍板|批|决)|\bown\s*[:=]\s*0\b)",
+    re.IGNORECASE,
+)
 _STOP_FOOTER_PEER_ZERO_RE = re.compile(r"(?:全机他席\s*[`*]*\s*0\s*[`*]*\s*项|\bpeers?\s*[:=]\s*0\b)", re.IGNORECASE)
+_STOP_FOOTER_LINE_ZERO_RE = re.compile(
+    r"(?:线内他席\s*[`*]*\s*0\s*[`*]*\s*项|(?:本线|线内)[^\n。！？!?]{0,18}(?:共\s*0\s*项|(?:均)?(?:无|没有)待(?:你|您)?(?:拍板|批|决))|\bline_peers?\s*[:=]\s*0\b)",
+    re.IGNORECASE,
+)
 _STOP_FOOTER_ALL_ZERO_RE = re.compile(r"(?:(?:当前|全机)(?:均)?(?:无|没有|0\s*项)待(?:你|您)?(?:拍板|批|决)|\b0\s+pending\s+approvals?\b)", re.IGNORECASE)
 
 FLAT_HOOK_EVENTS = frozenset({"SessionStart", "PreInvocation", "PostInvocation", "Stop"})
@@ -743,16 +820,20 @@ def evaluate_stop_consistency_gate(
     fully_idle: bool = True,
     continuation_active: bool = False,
     readonly_auto_register: bool = False,
+    report_scope: str = "fleet",
+    line_peer_waiting_count: int | None = None,
 ) -> dict[str, Any]:
     """
-    Zero-Token `Stop` lifecycle hook consistency evaluator:
+    Role-scoped Zero-Token `Stop` lifecycle hook consistency evaluator:
       1. Fires ONLY when `termination_reason == "NO_TOOL_CALL"` and `fully_idle is True`;
       2. Strips fenced & inline code blocks before checking whether the response body asks for
          human approval/decision/circuit-breaker/input while `own_waiting_count == 0` -> returns
          `decision="continue"` (or `action="auto_register"` for shell-less seats or when `continuation_active=True`);
-      3. Checks the trailing 600 chars for false-zero own/peer footer claims when `continuation_active=False`;
+      3. Checks the trailing 600 chars for false-zero footers scoped by `report_scope` (`fleet` checks own + peers,
+         `line` checks own + `line_peer_waiting_count`, `self` checks own only) when `continuation_active=False`;
       4. Hard 1-retry anti-loop invariant: NEVER returns `decision="continue"` when `continuation_active=True`.
     """
+    eff_scope = normalize_report_scope(report_scope, default="fleet")
     if str(termination_reason or "").strip() != "NO_TOOL_CALL" or not fully_idle:
         return {"decision": "allow", "action": "allow", "reason": ""}
     text = str(response_text or "")
@@ -805,7 +886,9 @@ def evaluate_stop_consistency_gate(
                     "close completed items or correct the trailing summary."
                 ),
             }
-        if int(peer_waiting_count) > 0 and (_STOP_FOOTER_PEER_ZERO_RE.search(footer_tail) or _STOP_FOOTER_ALL_ZERO_RE.search(footer_tail)):
+        if eff_scope == "fleet" and int(peer_waiting_count) > 0 and (
+            _STOP_FOOTER_PEER_ZERO_RE.search(footer_tail) or _STOP_FOOTER_ALL_ZERO_RE.search(footer_tail)
+        ):
             return {
                 "decision": "continue",
                 "action": "continue",
@@ -814,6 +897,21 @@ def evaluate_stop_consistency_gate(
                     "correct the trailing summary against live pending_plans.json."
                 ),
             }
+        if eff_scope == "line":
+            eff_line_peers = int(line_peer_waiting_count) if line_peer_waiting_count is not None else int(peer_waiting_count)
+            if eff_line_peers > 0 and (
+                _STOP_FOOTER_LINE_ZERO_RE.search(footer_tail)
+                or _STOP_FOOTER_PEER_ZERO_RE.search(footer_tail)
+                or _STOP_FOOTER_ALL_ZERO_RE.search(footer_tail)
+            ):
+                return {
+                    "decision": "continue",
+                    "action": "continue",
+                    "reason": (
+                        f"Stop consistency gate: footer reports 0 line peer pending items while line_peer_waiting_count == {eff_line_peers}; "
+                        "correct the trailing summary against live pending_plans.json."
+                    ),
+                }
 
     return {"decision": "allow", "action": "allow", "reason": ""}
 

@@ -895,6 +895,26 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
         assert cli.main(["mm-verify", "--packet", str(mm_file)]) == 0
         assert cli.main(["dict-check", "--dict", str(d_clean), "--target", str(dict_dir / "b.md")]) == 0
 
+    # Role-scoped pending-plan banner & Stop gate coverage (fleet / line / self)
+    from diffquorum import plan_lock as _pl
+
+    assert _pl.normalize_report_scope(None) == "fleet"
+    assert _pl.normalize_report_scope("") == "fleet"
+    try:
+        _pl.normalize_report_scope("invalid")
+    except ValueError:
+        pass
+    rp_file = ws / "role_plans.json"
+    _pl.open_pending_plan(rp_file, seat="hub", scope="s1", title="Hub item", kind="PLAN")
+    _pl.open_pending_plan(rp_file, seat="vault", scope="s2", title="SECRET_V", kind="CIRCUIT_BREAKER")
+    assert _pl.build_pre_invocation_pending_banner("lead", rp_file, report_scope="line", line_seats={"lead", "w1"}, line_label="L1") == ""
+    assert _pl.build_pre_invocation_pending_banner("w1", rp_file, report_scope="self") == ""
+    _pl.open_pending_plan(rp_file, seat="w1", scope="s3", title="Worker item", kind="DECISION")
+    assert "L1" in _pl.build_pre_invocation_pending_banner("lead", rp_file, redacted_seats={"vault"}, report_scope="line", line_seats={"lead", "w1", "vault"}, line_label="L1")
+    assert "OWN PENDING PLANS" in _pl.build_pre_invocation_pending_banner("w1", rp_file, report_scope="self")
+    assert _pl.evaluate_stop_consistency_gate(response_text="ok\n**Line: line_peers:0**", own_waiting_count=0, peer_waiting_count=2, line_peer_waiting_count=1, report_scope="line")["decision"] == "continue"
+    assert _pl.evaluate_stop_consistency_gate(response_text="ok\n**Pending: own:0 | peers:0**", own_waiting_count=0, peer_waiting_count=2, report_scope="self")["decision"] == "allow"
+
     shutil.rmtree(ws, ignore_errors=True)
 
 

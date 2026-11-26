@@ -2189,6 +2189,156 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
         ):
             self.assertFalse(is_explicit_approval_text(bad_txt), f"Must reject {bad_txt!r}")
 
+    def test_role_scoped_pending_banner_and_stop_gate(self) -> None:
+        from diffquorum.plan_lock import (
+            VALID_REPORT_SCOPES,
+            build_pre_invocation_pending_banner,
+            evaluate_stop_consistency_gate,
+            normalize_report_scope,
+            open_pending_plan,
+        )
+
+        self.assertEqual(VALID_REPORT_SCOPES, ("fleet", "line", "self"))
+        self.assertEqual(normalize_report_scope(None), "fleet")
+        self.assertEqual(normalize_report_scope(""), "fleet")
+        self.assertEqual(normalize_report_scope(" LINE "), "line")
+        with self.assertRaises(ValueError):
+            normalize_report_scope("unknown-scope")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pfile = pathlib.Path(tmp) / "pending_plans.json"
+            open_pending_plan(pfile, seat="fleet_hub", scope="global-release", title="Global rollout plan", kind="PLAN")
+            open_pending_plan(pfile, seat="redacted_vault", scope="vault-gate", title="TOP_SECRET_VAULT", kind="CIRCUIT_BREAKER")
+
+            # 1) When domain line has 0 open items and worker_a has 0 open items -> both emit "" (0 bytes); fleet_hub sees all
+            b_fleet = build_pre_invocation_pending_banner(
+                "fleet_hub", pfile, redacted_seats={"redacted_vault"}, report_scope="fleet"
+            )
+            self.assertIn("own:1 | peers:1 | total:2", b_fleet)
+            self.assertIn("redacted_vault(1 pending)", b_fleet)
+            self.assertNotIn("TOP_SECRET_VAULT", b_fleet)
+
+            self.assertEqual(
+                build_pre_invocation_pending_banner(
+                    "domain_lead",
+                    pfile,
+                    redacted_seats={"redacted_vault"},
+                    report_scope="line",
+                    line_seats={"domain_lead", "worker_a", "worker_b"},
+                    line_label="ML-LINE",
+                ),
+                "",
+            )
+            self.assertEqual(
+                build_pre_invocation_pending_banner("worker_a", pfile, redacted_seats={"redacted_vault"}, report_scope="self"),
+                "",
+            )
+
+            # 2) Add line peer & worker items -> line sees line items + outside count; worker sees own only; vault retains self-view
+            open_pending_plan(pfile, seat="worker_b", scope="model-fork", title="Select training branch", kind="DECISION")
+            open_pending_plan(pfile, seat="worker_a", scope="ci-fix", title="Patch pipeline", kind="PLAN")
+
+            b_line = build_pre_invocation_pending_banner(
+                "domain_lead",
+                pfile,
+                redacted_seats={"redacted_vault"},
+                report_scope="line",
+                line_seats={"domain_lead", "worker_a", "worker_b"},
+                line_label="ML-LINE",
+            )
+            self.assertIn("[DIFFQUORUM ML-LINE PENDING PLANS | own:0 | line_peers:2 | line_total:2 | outside:2]", b_line)
+            self.assertIn("worker_b[DEC](", b_line)
+            self.assertIn("worker_a(", b_line)
+            self.assertNotIn("Global rollout plan", b_line)
+            self.assertNotIn("TOP_SECRET_VAULT", b_line)
+
+            # Redacted seat placed inside a line stays redacted to line peers
+            b_line_red = build_pre_invocation_pending_banner(
+                "domain_lead",
+                pfile,
+                redacted_seats={"redacted_vault"},
+                report_scope="line",
+                line_seats={"domain_lead", "redacted_vault"},
+                line_label="SEC-LINE",
+            )
+            self.assertIn("redacted_vault(1 pending)", b_line_red)
+            self.assertNotIn("TOP_SECRET_VAULT", b_line_red)
+
+            b_self = build_pre_invocation_pending_banner("worker_a", pfile, redacted_seats={"redacted_vault"}, report_scope="self")
+            self.assertIn("[DIFFQUORUM OWN PENDING PLANS | own:1]", b_self)
+            self.assertIn("worker_a(", b_self)
+            self.assertNotIn("worker_b", b_self)
+            self.assertNotIn("Global rollout plan", b_self)
+            self.assertNotIn("TOP_SECRET_VAULT", b_self)
+
+            b_vault_self = build_pre_invocation_pending_banner(
+                "redacted_vault", pfile, redacted_seats={"redacted_vault"}, allow_self_view=True, report_scope="self"
+            )
+            self.assertIn("TOP_SECRET_VAULT", b_vault_self)
+            b_vault_red = build_pre_invocation_pending_banner(
+                "redacted_vault", pfile, redacted_seats={"redacted_vault"}, allow_self_view=False, report_scope="self"
+            )
+            self.assertIn("redacted_vault(1 pending)", b_vault_red)
+            self.assertNotIn("TOP_SECRET_VAULT", b_vault_red)
+
+            # 3) Role-scoped Stop consistency gate
+            # self scope: never blocks over peer false-zero when own==0; still catches own false-zero & Intercept A
+            self.assertEqual(
+                evaluate_stop_consistency_gate(
+                    response_text="Done.\n**Pending approvals: own:0 | peers:0**",
+                    own_waiting_count=0,
+                    peer_waiting_count=3,
+                    report_scope="self",
+                )["decision"],
+                "allow",
+            )
+            self.assertEqual(
+                evaluate_stop_consistency_gate(
+                    response_text="Done.\n**Own pending approvals: own:0**",
+                    own_waiting_count=1,
+                    peer_waiting_count=3,
+                    report_scope="self",
+                )["decision"],
+                "continue",
+            )
+            self.assertEqual(
+                evaluate_stop_consistency_gate(
+                    response_text="Please choose option A or B before proceeding.",
+                    own_waiting_count=0,
+                    peer_waiting_count=3,
+                    report_scope="self",
+                )["decision"],
+                "continue",
+            )
+            # line scope: blocks false-zero when line_peer_waiting_count > 0, allows when line_peer_waiting_count == 0
+            self.assertEqual(
+                evaluate_stop_consistency_gate(
+                    response_text="Done.\n**Line pending approvals: line_peers:0**",
+                    own_waiting_count=0,
+                    peer_waiting_count=2,
+                    line_peer_waiting_count=0,
+                    report_scope="line",
+                )["decision"],
+                "allow",
+            )
+            self.assertEqual(
+                evaluate_stop_consistency_gate(
+                    response_text="Done.\n**Line pending approvals: line_peers:0**",
+                    own_waiting_count=0,
+                    peer_waiting_count=2,
+                    line_peer_waiting_count=1,
+                    report_scope="line",
+                )["decision"],
+                "continue",
+            )
+            with self.assertRaises(ValueError):
+                evaluate_stop_consistency_gate(
+                    response_text="Done.",
+                    own_waiting_count=0,
+                    peer_waiting_count=0,
+                    report_scope="bad-scope",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
