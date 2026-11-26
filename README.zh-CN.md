@@ -13,7 +13,7 @@
 
 **零第三方依赖（纯 Python 3.10+ 标准库）的跨会话指针黑板协作、Stage-2 匿名盲审防假会、六门禁防误触唤醒与 `<1s` 派活前零消耗预检工具。**（原名 `StarCouncil`，向下兼容 `.starcouncil/` 工作区与 `starcouncil` CLI 入口。）
 
-语言：[English](./README.md) | **简体中文** | [实战踩坑与修复实录（15 大核心经验）](./docs/PITFALLS_AND_FIXES.md)
+语言：[English](./README.md) | **简体中文** | [实战踩坑与修复实录（16 大核心经验）](./docs/PITFALLS_AND_FIXES.md)
 
 ---
 

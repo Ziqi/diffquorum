@@ -1452,16 +1452,45 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
                 supersede_plans_for_scope(leaf_link, "sym-test", superseded_by="TKT-1")
             self.assertFalse(real_target.exists())
 
-        # 2) Headless blind-review CLI tool-stripping, search-phrase blocking & <300s timeout guard
+        # 2) Headless blind-review CLI tool-stripping, X/social search blocking & <300s timeout guard
         clean_prompt = "Audit the provided unified diff for objective defects only."
         argv = build_headless_review_argv("reviewer-cli", model="frontier-reasoner", prompt=clean_prompt)
         self.assertIn("--disallowed-tools", argv)
+        self.assertIn("x_keyword_search", argv[argv.index("--disallowed-tools") + 1])
         ok_spec = validate_headless_review_spec(argv=argv, prompt=clean_prompt, timeout_sec=180)
         self.assertTrue(ok_spec["ok"], ok_spec)
 
+        argv_all_off = build_headless_review_argv(
+            "reviewer-cli",
+            model="frontier-reasoner",
+            prompt=clean_prompt,
+            disable_all_tools=True,
+            system_prompt_override="Static diff review only. Do not invoke any search tools.",
+        )
+        self.assertIn("--tools", argv_all_off)
+        self.assertIn("--system-prompt-override", argv_all_off)
+        self.assertTrue(validate_headless_review_spec(argv=argv_all_off, prompt=clean_prompt, timeout_sec=180)["ok"])
+
+        # Partial --disable-web-search without stripping server-side X/social search must fail closed
+        partial_web_only = validate_headless_review_spec(
+            argv=["reviewer-cli", "--disable-web-search", "--disallowed-tools", "Bash,WebSearch", clean_prompt],
+            prompt=clean_prompt,
+            timeout_sec=120,
+        )
+        self.assertFalse(partial_web_only["ok"])
+        self.assertIn("incomplete_web_only_strip", "\n".join(partial_web_only["issues"]))
+        # Pairing --disable-web-search with --tools "" passes cleanly
+        self.assertTrue(
+            validate_headless_review_spec(
+                argv=["reviewer-cli", "--disable-web-search", "--tools", "", clean_prompt],
+                prompt=clean_prompt,
+                timeout_sec=120,
+            )["ok"]
+        )
+
         bad_spec = validate_headless_review_spec(
             argv=["reviewer-cli", "--print", clean_prompt],
-            prompt="Please web_search the latest docs and audit this diff.",
+            prompt="Please web_search and x_keyword_search the latest docs and audit this diff.",
             timeout_sec=360,
         )
         self.assertFalse(bad_spec["ok"])
@@ -1469,9 +1498,39 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
         self.assertIn("missing_tool_strip", joined)
         self.assertIn("search_trigger_in_prompt", joined)
         self.assertIn("timeout_exceeds_deadline", joined)
+        self.assertFalse(validate_headless_review_spec(argv=argv, prompt=clean_prompt, timeout_sec=float("nan"))["ok"])
 
         with self.assertRaises(ValueError):
             build_headless_review_argv("reviewer-cli", model="m1", prompt="p", disallowed_tools=())
+
+        # 3) Stale non-daemon background drawer task deadlock exemption (>=180s transcript + task log quiescence)
+        from diffquorum.wake_gates import is_stale_bg_quiescent_for_unblock
+
+        self.assertTrue(is_stale_bg_quiescent_for_unblock(transcript_age_sec=240.0, task_log_ages_sec=[210.0, 190.0]))
+        self.assertFalse(is_stale_bg_quiescent_for_unblock(transcript_age_sec=240.0, task_log_ages_sec=[45.0]))
+        self.assertFalse(is_stale_bg_quiescent_for_unblock(transcript_age_sec=90.0, task_log_ages_sec=[300.0]))
+        self.assertFalse(is_stale_bg_quiescent_for_unblock(transcript_age_sec=float("nan"), task_log_ages_sec=[300.0]))
+
+        base_snap = {
+            "pane_in_mode": 0,
+            "pane_fg": "agy",
+            "client_activity_ts": 900.0,
+            "capture_lines": [">", "? for shortcuts"],
+            "cursor_x": 2,
+            "transcript_last_type": "PLANNER_RESPONSE",
+            "transcript_last_status": "DONE",
+            "transcript_has_tool_calls": False,
+            "transcript_mtime_ts": 700.0,
+            "running_tasks": [{"isDaemon": False, "status": "running", "description": "ssh remote tail -f"}],
+            "allow_stale_bg_unblock": True,
+        }
+        # Active task log (<180s) stays protected on Gate 4
+        blocked_snap = evaluate_six_gates({**base_snap, "task_log_ages_sec": [30.0]}, now_ts=1000.0)
+        self.assertFalse(blocked_snap["wake"])
+        self.assertEqual(blocked_snap["reason"], "NON_DAEMON_TASK_RUNNING")
+        # Both transcript (300s) and task logs (220s) silent >=180s -> deadlock unblocked
+        unblocked_snap = evaluate_six_gates({**base_snap, "task_log_ages_sec": [220.0]}, now_ts=1000.0)
+        self.assertTrue(unblocked_snap["wake"], unblocked_snap)
 
     def test_governance_policy_suite_discussion_blast_radius_mm_and_master_dict(self) -> None:
         from diffquorum.policy import (

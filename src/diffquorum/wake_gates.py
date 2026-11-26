@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from typing import Any
@@ -18,6 +19,7 @@ RETRY_COOLDOWN_SECONDS = 30.0
 MAX_MESSAGE_WAKE_AGE_SECONDS = 7200.0   # PF-021: 2h cap for plain chat messages
 MAX_TICKET_WAKE_AGE_SECONDS = 86400.0   # PF-021: 24h cap for blocked PENDING tickets
 COLD_INTERRUPTED_QUIESCENCE_SECONDS = 30.0
+STALE_BG_TASK_UNBLOCK_SECONDS = 180.0
 
 SILENT_FIRST_LINE_PREFIXES = ("【TERMINAL-ACK】", "【INFO-SYNC")
 SUPPORTED_AGENT_COMMANDS = frozenset({"agy", "antigravity", "claude", "codex", "opencode"})
@@ -338,6 +340,47 @@ def _has_active_foreground_tasks(tasks: list[dict[str, Any]]) -> bool:
     return False
 
 
+def is_stale_bg_quiescent_for_unblock(
+    *,
+    transcript_age_sec: float | None,
+    task_log_ages_sec: list[float] | tuple[float, ...] = (),
+    threshold_sec: float = STALE_BG_TASK_UNBLOCK_SECONDS,
+) -> bool:
+    """
+    Exempts hung non-daemon background commands (e.g. a silent `ssh ... tail -f`) from
+    permanently deadlocking Gate 3/4 wakeups ONLY when BOTH the transcript AND every
+    background task log/metadata file have had zero writes for `>= threshold_sec` (default 180s).
+    """
+    if isinstance(threshold_sec, bool) or not isinstance(threshold_sec, (int, float)):
+        return False
+    try:
+        thresh = float(threshold_sec)
+    except OverflowError:
+        return False
+    if not math.isfinite(thresh) or thresh <= 0.0:
+        return False
+    if transcript_age_sec is None or isinstance(transcript_age_sec, bool) or not isinstance(transcript_age_sec, (int, float)):
+        return False
+    try:
+        tx_a = float(transcript_age_sec)
+    except OverflowError:
+        return False
+    if not math.isfinite(tx_a) or tx_a < thresh:
+        return False
+    if not isinstance(task_log_ages_sec, (list, tuple)):
+        return False
+    for raw_age in task_log_ages_sec:
+        if isinstance(raw_age, bool) or not isinstance(raw_age, (int, float)):
+            return False
+        try:
+            age_f = float(raw_age)
+        except OverflowError:
+            return False
+        if not math.isfinite(age_f) or age_f < thresh:
+            return False
+    return True
+
+
 def is_cold_interrupted_idle(
     last_type: str,
     last_status: str,
@@ -413,7 +456,16 @@ def evaluate_six_gates(snapshot: dict[str, Any], now_ts: float | None = None) ->
     if not normal_idle and not is_cold_interrupted_idle(last_type, last_status, tx_age):
         return {"wake": False, "gate": "gate4", "reason": "TRANSCRIPT_NOT_IDLE"}
     if _has_active_foreground_tasks(list(snapshot.get("running_tasks") or [])):
-        return {"wake": False, "gate": "gate4", "reason": "NON_DAEMON_TASK_RUNNING"}
+        stale_unblock = False
+        if snapshot.get("allow_stale_bg_unblock") is True and "task_log_ages_sec" in snapshot:
+            thresh_val = snapshot.get("stale_bg_threshold_sec", STALE_BG_TASK_UNBLOCK_SECONDS)
+            stale_unblock = is_stale_bg_quiescent_for_unblock(
+                transcript_age_sec=tx_age,
+                task_log_ages_sec=snapshot.get("task_log_ages_sec"),
+                threshold_sec=thresh_val,
+            )
+        if not stale_unblock:
+            return {"wake": False, "gate": "gate4", "reason": "NON_DAEMON_TASK_RUNNING"}
     awaiting_approve = bool(snapshot.get("transcript_awaiting_human_approve")) or is_awaiting_human_approve(
         str(snapshot.get("transcript_last_text") or "")
     )

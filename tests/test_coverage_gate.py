@@ -588,12 +588,21 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
 
     h_argv = gov.build_headless_review_argv("reviewer-cli", model="m1", prompt="Static diff check")
     assert gov.validate_headless_review_spec(argv=h_argv, prompt="Static diff check", timeout_sec=180)["ok"] is True
+    h_all_off = gov.build_headless_review_argv(
+        "reviewer-cli", model="m1", prompt="Static diff check", disable_all_tools=True, system_prompt_override="No search."
+    )
+    assert gov.validate_headless_review_spec(argv=h_all_off, prompt="Static diff check", timeout_sec=120)["ok"] is True
     assert gov.validate_headless_review_spec(argv=["reviewer-cli", "--no-tools"], prompt="Static diff check", timeout_sec=120)["ok"] is True
     assert gov.validate_headless_review_spec(argv=["reviewer-cli", "--tools", ""], prompt="Static diff check", timeout_sec=120)["ok"] is True
     assert gov.validate_headless_review_spec(argv=["reviewer-cli", "--tools="], prompt="Static diff check", timeout_sec=120)["ok"] is True
     assert gov.validate_headless_review_spec(argv=["reviewer-cli", "--disallowed-tools=Bash"], prompt="Static diff check", timeout_sec=120)["ok"] is True
+    assert gov.validate_headless_review_spec(argv=["reviewer-cli", "--disable-web-search", "--disallowed-tools", "Bash"], prompt="Static diff check", timeout_sec=120)["ok"] is False
     assert gov.validate_headless_review_spec(argv=["reviewer-cli"], prompt="", timeout_sec=0)["ok"] is False
-    assert gov.validate_headless_review_spec(argv=["reviewer-cli"], prompt="web_search " + ("x" * 120), timeout_sec=400, max_prompt_chars=50)["ok"] is False
+    assert gov.validate_headless_review_spec(argv=["reviewer-cli"], prompt="x_keyword_search " + ("x" * 120), timeout_sec=400, max_prompt_chars=50)["ok"] is False
+    assert wg.is_stale_bg_quiescent_for_unblock(transcript_age_sec=200.0, task_log_ages_sec=[190.0]) is True
+    assert wg.is_stale_bg_quiescent_for_unblock(transcript_age_sec=200.0, task_log_ages_sec=[20.0]) is False
+    assert wg.is_stale_bg_quiescent_for_unblock(transcript_age_sec=None, task_log_ages_sec=[200.0]) is False
+    assert wg.is_stale_bg_quiescent_for_unblock(transcript_age_sec=200.0, task_log_ages_sec=[200.0], threshold_sec=-1) is False
     for bad_argv_call in (
         lambda: gov.build_headless_review_argv("", model="m1", prompt="p"),
         lambda: gov.build_headless_review_argv("cli", model="m1", prompt="p", disallowed_tools=()),
