@@ -904,3 +904,64 @@ def scan_native_message_events_cursor(
         "skipped_seqs": skipped_seqs,
         "next_cursor_seq": next_cursor,
     }
+
+
+NATIVE_SEND_MESSAGE_DEDUP_WINDOW_SECONDS = 2.0
+
+
+def classify_native_message_flags(message_text: str) -> tuple[bool, bool]:
+    """
+    Pure leading-prefix classifier returning `(is_silent, is_report_no_reply)` with zero prose stored.
+    Orthogonal `REPORT-NO-REPLY` always takes precedence over silent prefixes.
+    """
+    first_non_empty = next((ln for ln in str(message_text or "").splitlines() if ln.strip()), "")
+    if not first_non_empty:
+        return False, False
+    is_report_nr = bool(REPORT_NO_REPLY_PREFIX_RE.match(first_non_empty))
+    is_silent = bool(not is_report_nr and SILENT_LEADING_PREFIX_RE.match(first_non_empty))
+    return is_silent, is_report_nr
+
+
+def should_dedup_native_message_event(
+    recent_events: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    from_conv_id: str,
+    recipient: str,
+    msg_sha256_12: str,
+    msg_len: int,
+    now_ts: float,
+    window_sec: float = NATIVE_SEND_MESSAGE_DEDUP_WINDOW_SECONDS,
+) -> int | None:
+    """
+    Cross-hook idempotency check for `NATIVE_SEND_MESSAGE` audit logs.
+    Returns the existing `seq` when both a workspace guard and a global `PreToolUse(send_message)`
+    hook observe the same `(from_conv_id, recipient, msg_sha256_12, msg_len)` within `window_sec`.
+    """
+    if isinstance(window_sec, bool) or not isinstance(window_sec, (int, float)) or not math.isfinite(float(window_sec)) or float(window_sec) < 0.0:
+        raise ValueError("window_sec must be a finite non-negative number")
+    if isinstance(now_ts, bool) or not isinstance(now_ts, (int, float)) or not math.isfinite(float(now_ts)):
+        raise ValueError("now_ts must be a finite number")
+
+    norm_from = str(from_conv_id or "").strip()
+    norm_to = str(recipient or "").strip()
+    norm_sha = str(msg_sha256_12 or "").strip()
+    now_f = float(now_ts)
+    win_f = float(window_sec)
+
+    for rec in reversed(list(recent_events or ())):
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("event") or "").strip().upper() != "NATIVE_SEND_MESSAGE":
+            continue
+        if (
+            str(rec.get("from_conv_id") or "").strip() == norm_from
+            and str(rec.get("recipient") or "").strip() == norm_to
+            and str(rec.get("msg_sha256_12") or "").strip() == norm_sha
+            and rec.get("msg_len") == msg_len
+        ):
+            rec_ep = _parse_event_epoch(rec)
+            if rec_ep is not None and abs(now_f - rec_ep) <= win_f:
+                raw_seq = rec.get("seq")
+                if isinstance(raw_seq, int) and not isinstance(raw_seq, bool) and raw_seq > 0:
+                    return raw_seq
+    return None

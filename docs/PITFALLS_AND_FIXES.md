@@ -1,6 +1,6 @@
 # Production Pitfalls & Engineering Fixes (`DiffQuorum` Lessons Learned)
 
-Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **23 major pitfalls** and the deterministic fixes built into this toolkit.
+Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **24 major pitfalls** and the deterministic fixes built into this toolkit.
 
 ---
 
@@ -216,3 +216,14 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
 - **Root-cause fix (Deterministic Multi-Desktop & Session Rename Hygiene)**:
   - Keep `com.apple.dock mru-spaces` disabled (`false`) and use maximized non-fullscreen windows per logical business line so Desktop indices remain strictly pinned.
   - Whenever renaming a live `tmux` seat session, always pair `tmux rename-session` with `tmux rename-window -t "=<session>:0" <short-name>` and keep the logical seat symlink path as the primary `cwd` on future spawns while preserving the underlying physical directory (`PF-001`) so active session transcripts never lose continuity.
+
+## 24. Hookless Multi-Directory Seat Blind Spots & Cross-Hook `send_message` Duplication (`wake_gates.py` / `plan_lock.py`)
+
+- **What broke**:
+  1. Multi-directory seats (such as training or cross-repo engineering seats intentionally deployed without a restrictive workspace `.agents/hooks.json`) and custom-guard isolated seats did not invoke the central workspace `PreToolUse` guard, leaving their peer `send_message` calls absent from `events.jsonl` and excluded from the `24h` persistent-cursor wakeup bridge (`scan_native_message_events_cursor`).
+  2. Naively adding a broad global `PreToolUse` hook (`"matcher": ".*"`) would intercept `write_file`/`edit_file`/`run_command` across hookless multi-directory seats, while adding a `send_message` global hook without cross-hook idempotency would write duplicate `#seq` entries on seats carrying both workspace and global hooks.
+  3. Uniform fleet audits that demanded the exact same clean-room guard on hubs, isolated seats, and multi-directory seats produced false negatives on legitimate heterogeneous fleets.
+- **Root-cause fix (`classify_native_message_flags` + `should_dedup_native_message_event` + `has_send_message_pretool_hook` + `audit_seat_hook_contract`)**:
+  - **Strict `send_message`-Only Global `PreToolUse` Redline**: `has_send_message_pretool_hook` verifies an enabled global `PreToolUse` entry matches `send_message` while failing closed if ANY enabled global `PreToolUse` matcher intercepts `write_file`, `edit_file`, or `run_command`.
+  - **Cross-Hook `2.0s` Atomic Dedup**: `should_dedup_native_message_event` deduplicates `(from_conv_id, recipient, msg_sha256_12, msg_len)` within `2.0s` under the shared event lock so dual-hook seats emit exactly one zero-prose `#seq` record (`is_silent` / `is_report_no_reply` from `classify_native_message_flags`).
+  - **Role-Aware Contract Auditing**: `audit_seat_hook_contract` validates each seat against its actual role profile (`platform_hub`, `isolated_guard`, `multidir_global_hook`, `cleanroom_line`) and guarantees `send_message_emitter_ready` across 100% of the fleet.

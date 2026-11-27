@@ -2649,6 +2649,219 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
             self.assertFalse(bad_flag["ok"])
             self.assertEqual(bad_flag["violation_count"], 2)
 
+    def test_global_send_message_dedup_and_role_aware_hook_audit(self) -> None:
+        from diffquorum.plan_lock import audit_seat_hook_contract, has_send_message_pretool_hook
+        from diffquorum.wake_gates import classify_native_message_flags, should_dedup_native_message_event
+
+        # 1) Pure boolean leading-prefix classification
+        self.assertEqual(classify_native_message_flags(""), (False, False))
+        self.assertEqual(classify_native_message_flags("Hello peer"), (False, False))
+        self.assertEqual(classify_native_message_flags("【INFO-SYNC】status snapshot"), (True, False))
+        self.assertEqual(classify_native_message_flags("【REPORT-NO-REPLY】done\nbody 【INFO-SYNC】"), (False, True))
+
+        # 2) Cross-hook 2.0s dedup helper
+        recent = [
+            "not-a-dict",
+            {"seq": 9, "event": "TICKET_UPDATE", "from_conv_id": "c1", "recipient": "c2"},
+            {
+                "seq": 10,
+                "event": "NATIVE_SEND_MESSAGE",
+                "from_conv_id": "c1",
+                "recipient": "c2",
+                "msg_sha256_12": "abcdef123456",
+                "msg_len": 42,
+                "ts_epoch": 1700000100.0,
+            },
+        ]
+        self.assertEqual(
+            should_dedup_native_message_event(
+                recent, from_conv_id="c1", recipient="c2", msg_sha256_12="abcdef123456", msg_len=42, now_ts=1700000101.5
+            ),
+            10,
+        )
+        self.assertIsNone(
+            should_dedup_native_message_event(
+                recent, from_conv_id="c1", recipient="c2", msg_sha256_12="abcdef123456", msg_len=42, now_ts=1700000105.0
+            )
+        )
+        self.assertIsNone(
+            should_dedup_native_message_event(
+                recent, from_conv_id="c1", recipient="c3", msg_sha256_12="abcdef123456", msg_len=42, now_ts=1700000101.0
+            )
+        )
+        with self.assertRaises(ValueError):
+            should_dedup_native_message_event(
+                recent, from_conv_id="c1", recipient="c2", msg_sha256_12="a", msg_len=1, now_ts=1.0, window_sec=-1.0
+            )
+        with self.assertRaises(ValueError):
+            should_dedup_native_message_event(
+                recent, from_conv_id="c1", recipient="c2", msg_sha256_12="a", msg_len=1, now_ts=float("nan")
+            )
+
+        # 3) Global PreToolUse(send_message) redline: NEVER match write_file/edit_file/run_command
+        good_global = {
+            "pending-sync": {
+                "enabled": True,
+                "PreInvocation": [{"type": "command", "command": "python3 /opt/pending-hook.py", "timeout": 5}],
+                "Stop": [{"type": "command", "command": "python3 /opt/pending-hook.py", "timeout": 5}],
+                "PreToolUse": [
+                    {
+                        "matcher": "send_message",
+                        "hooks": [{"type": "command", "command": "python3 /opt/pending-hook.py", "timeout": 5}],
+                    }
+                ],
+            }
+        }
+        self.assertTrue(has_send_message_pretool_hook(good_global))
+        self.assertFalse(has_send_message_pretool_hook("bad"))
+        self.assertFalse(
+            has_send_message_pretool_hook(
+                {
+                    "disabled": {"enabled": False, "PreToolUse": [{"matcher": "send_message", "hooks": [{"command": "python3 /opt/pending-hook.py"}]}]},
+                    "empty_matcher": {"enabled": True, "PreToolUse": [{"matcher": "", "hooks": [{"command": "python3 /opt/pending-hook.py"}]}]},
+                }
+            )
+        )
+        # Regex-invalid matcher falls back safely to pipe split; wildcard matcher fails closed
+        bad_regex_global = {
+            "sync": {
+                "enabled": True,
+                "PreToolUse": [{"matcher": "[send_message|send_message", "hooks": [{"command": "python3 /opt/pending-hook.py"}]}],
+            }
+        }
+        self.assertTrue(has_send_message_pretool_hook(bad_regex_global))
+        wildcard_global = {
+            "sync": {
+                "enabled": True,
+                "PreInvocation": [{"command": "python3 /opt/pending-hook.py"}],
+                "Stop": [{"command": "python3 /opt/pending-hook.py"}],
+                "PreToolUse": [{"matcher": ".*", "hooks": [{"command": "python3 /opt/pending-hook.py"}]}],
+            }
+        }
+        self.assertFalse(has_send_message_pretool_hook(wildcard_global))
+
+        # 4) Role-aware seat hook contract auditor across all 4 profiles
+        hub_local = {
+            "hub": {
+                "enabled": True,
+                "PreInvocation": [{"command": "python3 ./guard.py"}],
+                "PreToolUse": [{"matcher": "send_message", "hooks": [{"command": "python3 ./guard.py"}]}],
+            }
+        }
+        iso_local = {
+            "iso": {
+                "enabled": True,
+                "PreToolUse": [{"matcher": "write_file", "hooks": [{"command": "python3 ./isolated_guard.py"}]}],
+            }
+        }
+        clean_local = {
+            "clean": {
+                "enabled": True,
+                "PreToolUse": [
+                    {"matcher": "send_message", "hooks": [{"command": "python3 ./guard.py"}]},
+                    {"matcher": "write_file", "hooks": [{"command": "python3 ./cleanroom.py"}]},
+                ],
+            }
+        }
+        self.assertTrue(
+            audit_seat_hook_contract(
+                role_profile="platform_hub",
+                local_hooks_doc=hub_local,
+                global_hooks_doc=good_global,
+                expected_local_markers=("guard.py",),
+            )["ok"]
+        )
+        self.assertTrue(
+            audit_seat_hook_contract(
+                role_profile="isolated_guard",
+                local_hooks_doc=iso_local,
+                global_hooks_doc=good_global,
+                expected_local_markers=("isolated_guard.py",),
+            )["ok"]
+        )
+        self.assertTrue(
+            audit_seat_hook_contract(
+                role_profile="multidir_global_hook",
+                local_hooks_doc=None,
+                global_hooks_doc=good_global,
+            )["ok"]
+        )
+        self.assertTrue(
+            audit_seat_hook_contract(
+                role_profile="cleanroom_line",
+                local_hooks_doc=clean_local,
+                global_hooks_doc=good_global,
+                expected_local_markers=("guard.py", "cleanroom.py"),
+            )["ok"]
+        )
+
+        # Negative cases: unknown role, empty expected_local_markers, PreInvocation-only without global send_message, disabled hook, broken schema
+        with self.assertRaises(ValueError):
+            audit_seat_hook_contract(role_profile="invalid_role", local_hooks_doc=None, global_hooks_doc=good_global)
+        for strict_role, doc_sample in (
+            ("platform_hub", hub_local),
+            ("isolated_guard", iso_local),
+            ("cleanroom_line", clean_local),
+        ):
+            res_empty = audit_seat_hook_contract(
+                role_profile=strict_role,
+                local_hooks_doc=doc_sample,
+                global_hooks_doc=good_global,
+                expected_local_markers=(),
+            )
+            self.assertFalse(res_empty["ok"], f"{strict_role} must fail closed when expected_local_markers is empty")
+            self.assertIn("missing_expected_local_markers", res_empty["issues"])
+        pre_only_local = {"hub": {"enabled": True, "PreInvocation": [{"command": "python3 ./guard.py"}]}}
+        g_no_send = {
+            "pending-sync": {
+                "enabled": True,
+                "PreInvocation": [{"command": "python3 /opt/pending-hook.py"}],
+                "Stop": [{"command": "python3 /opt/pending-hook.py"}],
+            }
+        }
+        res_no_emit = audit_seat_hook_contract(
+            role_profile="platform_hub",
+            local_hooks_doc=pre_only_local,
+            global_hooks_doc=g_no_send,
+            expected_local_markers=("guard.py",),
+        )
+        self.assertFalse(res_no_emit["ok"])
+        self.assertFalse(res_no_emit["send_message_emitter_ready"])
+        self.assertIn("missing_send_message_emitter", res_no_emit["issues"])
+        disabled_local = {"hub": {"enabled": False, "PreToolUse": [{"matcher": "send_message", "hooks": [{"command": "python3 ./guard.py"}]}]}}
+        self.assertFalse(
+            audit_seat_hook_contract(
+                role_profile="platform_hub",
+                local_hooks_doc=disabled_local,
+                global_hooks_doc=good_global,
+                expected_local_markers=("guard.py",),
+            )["ok"]
+        )
+        bad_local = {"iso": {"SessionStart": [{"matcher": ".*", "hooks": [{"command": "python3 ./isolated_guard.py"}]}]}}
+        self.assertFalse(
+            audit_seat_hook_contract(
+                role_profile="multidir_global_hook",
+                local_hooks_doc=bad_local,
+                global_hooks_doc=wildcard_global,
+            )["ok"]
+        )
+        self.assertFalse(
+            audit_seat_hook_contract(
+                role_profile="isolated_guard",
+                local_hooks_doc=None,
+                global_hooks_doc=wildcard_global,
+                expected_local_markers=("isolated_guard.py",),
+            )["ok"]
+        )
+        self.assertFalse(
+            audit_seat_hook_contract(
+                role_profile="cleanroom_line",
+                local_hooks_doc=hub_local,
+                global_hooks_doc=good_global,
+                expected_local_markers=("guard.py", "cleanroom.py"),
+            )["ok"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

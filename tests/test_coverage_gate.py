@@ -983,6 +983,66 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     assert _pl.audit_launch_args_for_hook_bleed(["cli", "--add-dir", str(hb_own), f"--add-dir={hb_clean}"], own_workspace=hb_own, peer_workspaces=[hb_peer])["ok"] is True
     assert _pl.audit_launch_args_for_hook_bleed(["cli", "--add-dir", str(hb_peer), f"--additional-dir={hb_ext}", "--add-dir", "--add-dir="], own_workspace=hb_own, peer_workspaces=[hb_peer])["ok"] is False
 
+    # Cross-hook send_message dedup & role-aware hook contract coverage
+    assert wg.classify_native_message_flags("") == (False, False)
+    assert wg.classify_native_message_flags("【INFO-SYNC】x") == (True, False)
+    assert wg.classify_native_message_flags("【REPORT-NO-REPLY】x") == (False, True)
+    dedup_rec = [
+        "bad",
+        {"seq": 1, "event": "OTHER"},
+        {"seq": 10, "event": "NATIVE_SEND_MESSAGE", "from_conv_id": "c1", "recipient": "c2", "msg_sha256_12": "abc", "msg_len": 3, "ts_epoch": 100.0},
+    ]
+    assert wg.should_dedup_native_message_event(dedup_rec, from_conv_id="c1", recipient="c2", msg_sha256_12="abc", msg_len=3, now_ts=101.0) == 10
+    assert wg.should_dedup_native_message_event(dedup_rec, from_conv_id="c1", recipient="c2", msg_sha256_12="abc", msg_len=3, now_ts=105.0) is None
+    for bad_kw in ({"now_ts": 1.0, "window_sec": -1.0}, {"now_ts": float("nan"), "window_sec": 2.0}):
+        try:
+            wg.should_dedup_native_message_event(dedup_rec, from_conv_id="c1", recipient="c2", msg_sha256_12="abc", msg_len=3, **bad_kw)
+        except ValueError:
+            pass
+    g_ok = {
+        "sync": {
+            "enabled": True,
+            "PreInvocation": [{"command": "python3 /opt/pending-hook.py"}],
+            "Stop": [{"command": "python3 /opt/pending-hook.py"}],
+            "PreToolUse": [{"matcher": "send_message", "hooks": [{"command": "python3 /opt/pending-hook.py"}]}],
+        }
+    }
+    g_wild = {
+        "sync": {
+            "enabled": True,
+            "PreInvocation": [{"command": "python3 /opt/pending-hook.py"}],
+            "Stop": [{"command": "python3 /opt/pending-hook.py"}],
+            "PreToolUse": [{"matcher": ".*", "hooks": [{"command": "python3 /opt/pending-hook.py"}]}],
+        }
+    }
+    assert _pl.has_send_message_pretool_hook(g_ok) is True
+    assert _pl.has_send_message_pretool_hook(g_wild) is False
+    assert _pl.has_send_message_pretool_hook("bad") is False
+    assert _pl.has_send_message_pretool_hook({"d": {"enabled": False, "PreToolUse": [{"matcher": "send_message", "hooks": [{"command": "python3 /opt/pending-hook.py"}]}]}, "e": {"enabled": True, "PreToolUse": [{"matcher": "", "hooks": [{"command": "python3 /opt/pending-hook.py"}]}]}}) is False
+    assert _pl.has_send_message_pretool_hook({"r": {"enabled": True, "PreToolUse": [{"matcher": "[send_message|send_message", "hooks": [{"command": "python3 /opt/pending-hook.py"}]}]}}) is True
+    l_hub = {"h": {"enabled": True, "PreInvocation": [{"command": "python3 ./guard.py"}], "PreToolUse": [{"matcher": "send_message", "hooks": [{"command": "python3 ./guard.py"}]}]}}
+    l_pre_only = {"h": {"enabled": True, "PreInvocation": [{"command": "python3 ./guard.py"}]}}
+    l_disabled = {"h": {"enabled": False, "PreToolUse": [{"matcher": "send_message", "hooks": [{"command": "python3 ./guard.py"}]}]}}
+    l_iso = {"i": {"enabled": True, "PreToolUse": [{"matcher": "write_file", "hooks": [{"command": "python3 ./iso.py"}]}]}}
+    l_bad = {"i": {"SessionStart": [{"matcher": ".*", "hooks": [{"command": "python3 ./iso.py"}]}]}}
+    g_no_send = {"sync": {"enabled": True, "PreInvocation": [{"command": "python3 /opt/pending-hook.py"}], "Stop": [{"command": "python3 /opt/pending-hook.py"}]}}
+    assert _pl.has_enabled_pretool_send_message("bad") is False
+    assert _pl.has_enabled_pretool_send_message(l_disabled) is False
+    assert _pl.audit_seat_hook_contract(role_profile="platform_hub", local_hooks_doc=l_hub, global_hooks_doc=g_ok, expected_local_markers=("guard.py",))["ok"] is True
+    assert _pl.audit_seat_hook_contract(role_profile="platform_hub", local_hooks_doc=l_hub, global_hooks_doc=g_ok, expected_local_markers=())["ok"] is False
+    assert _pl.audit_seat_hook_contract(role_profile="platform_hub", local_hooks_doc=l_pre_only, global_hooks_doc=g_no_send, expected_local_markers=("guard.py",))["ok"] is False
+    assert _pl.audit_seat_hook_contract(role_profile="isolated_guard", local_hooks_doc=l_iso, global_hooks_doc=g_ok, expected_local_markers=("iso.py",))["ok"] is True
+    assert _pl.audit_seat_hook_contract(role_profile="isolated_guard", local_hooks_doc=l_iso, global_hooks_doc=g_ok, expected_local_markers=())["ok"] is False
+    assert _pl.audit_seat_hook_contract(role_profile="multidir_global_hook", local_hooks_doc=None, global_hooks_doc=g_ok)["ok"] is True
+    assert _pl.audit_seat_hook_contract(role_profile="cleanroom_line", local_hooks_doc=l_hub, global_hooks_doc=g_ok, expected_local_markers=("guard.py", "missing.py"))["ok"] is False
+    assert _pl.audit_seat_hook_contract(role_profile="multidir_global_hook", local_hooks_doc=l_bad, global_hooks_doc=g_wild)["ok"] is False
+    assert _pl.audit_seat_hook_contract(role_profile="isolated_guard", local_hooks_doc=None, global_hooks_doc=g_wild, expected_local_markers=("iso.py",))["ok"] is False
+    assert _pl.audit_seat_hook_contract(role_profile="platform_hub", local_hooks_doc=None, global_hooks_doc=g_wild)["ok"] is False
+    try:
+        _pl.audit_seat_hook_contract(role_profile="unknown", local_hooks_doc=None, global_hooks_doc=g_ok)
+    except ValueError:
+        pass
+
     shutil.rmtree(ws, ignore_errors=True)
 
 

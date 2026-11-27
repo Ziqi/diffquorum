@@ -1298,3 +1298,195 @@ def audit_launch_args_for_hook_bleed(
         "violation_count": len(violations),
         "violations": violations,
     }
+
+
+_FORBIDDEN_GLOBAL_PRETOOL_TOOLS: tuple[str, ...] = ("write_file", "edit_file", "run_command")
+VALID_SEAT_HOOK_ROLE_PROFILES: tuple[str, ...] = (
+    "platform_hub",
+    "isolated_guard",
+    "multidir_global_hook",
+    "cleanroom_line",
+)
+
+
+def _matcher_matches_tool_name(matcher: str, tool_name: str) -> bool:
+    pat = str(matcher or "").strip()
+    if not pat:
+        return False
+    try:
+        return bool(re.fullmatch(pat, tool_name))
+    except re.error:
+        return tool_name in pat.split("|")
+
+
+def has_send_message_pretool_hook(
+    hooks_doc: Any,
+    *,
+    command_markers: tuple[str, ...] = ("pending-hook.py",),
+) -> bool:
+    """
+    Verifies a global `hooks.json` document wires a lightweight `PreToolUse` `send_message`
+    audit hook while NEVER matching/intercepting `write_file`, `edit_file`, or `run_command`.
+    """
+    if not isinstance(hooks_doc, dict) or not validate_hooks_json_schema(hooks_doc).get("ok"):
+        return False
+    found_send_msg = False
+    markers = tuple(m for m in (command_markers or ()) if str(m).strip())
+    for spec in hooks_doc.values():
+        if not isinstance(spec, dict) or spec.get("enabled") is False:
+            continue
+        for grp in spec.get("PreToolUse") or []:
+            if not isinstance(grp, dict):
+                continue
+            matcher = str(grp.get("matcher") or "").strip()
+            if not matcher:
+                continue
+            if any(_matcher_matches_tool_name(matcher, bad) for bad in _FORBIDDEN_GLOBAL_PRETOOL_TOOLS):
+                return False
+            if _matcher_matches_tool_name(matcher, "send_message"):
+                for h in grp.get("hooks") or []:
+                    cmd = str((h or {}).get("command") or "") if isinstance(h, dict) else ""
+                    if cmd and (not markers or any(m in cmd for m in markers)):
+                        found_send_msg = True
+    return found_send_msg
+
+
+def _extract_enabled_hook_commands(hooks_doc: Any) -> list[str]:
+    if not isinstance(hooks_doc, dict):
+        return []
+    cmds: list[str] = []
+    for spec in hooks_doc.values():
+        if not isinstance(spec, dict) or spec.get("enabled") is False:
+            continue
+        for ev in FLAT_HOOK_EVENTS:
+            for item in spec.get(ev) or []:
+                if isinstance(item, dict):
+                    c = str(item.get("command") or "").strip()
+                    if c:
+                        cmds.append(c)
+        for ev in GROUPED_HOOK_EVENTS:
+            for grp in spec.get(ev) or []:
+                if not isinstance(grp, dict):
+                    continue
+                for h in grp.get("hooks") or []:
+                    if isinstance(h, dict):
+                        c = str(h.get("command") or "").strip()
+                        if c:
+                            cmds.append(c)
+    return cmds
+
+
+def has_enabled_pretool_send_message(
+    hooks_doc: Any,
+    *,
+    command_markers: tuple[str, ...] = (),
+) -> bool:
+    """Returns True only when an enabled `PreToolUse` group matches `send_message` with a verified command."""
+    if not isinstance(hooks_doc, dict) or not validate_hooks_json_schema(hooks_doc).get("ok"):
+        return False
+    markers = tuple(m for m in (command_markers or ()) if str(m).strip())
+    for spec in hooks_doc.values():
+        if not isinstance(spec, dict) or spec.get("enabled") is False:
+            continue
+        for grp in spec.get("PreToolUse") or []:
+            if not isinstance(grp, dict):
+                continue
+            if not _matcher_matches_tool_name(str(grp.get("matcher") or ""), "send_message"):
+                continue
+            for h in grp.get("hooks") or []:
+                if not isinstance(h, dict):
+                    continue
+                cmd = str(h.get("command") or "").strip()
+                if cmd and (not markers or any(m in cmd for m in markers)):
+                    return True
+    return False
+
+
+def audit_seat_hook_contract(
+    *,
+    role_profile: str,
+    local_hooks_doc: Any,
+    global_hooks_doc: Any,
+    expected_local_markers: tuple[str, ...] = (),
+    global_command_markers: tuple[str, ...] = ("pending-hook.py",),
+) -> dict[str, Any]:
+    """
+    Role-aware hook & `send_message` audit contract across heterogeneous fleet seats:
+      - `platform_hub`: valid local `hooks.json` + non-empty `expected_local_markers` in enabled hook commands + active `send_message` PreToolUse emitter (local or global).
+      - `isolated_guard`: valid local `hooks.json` + non-empty `expected_local_markers` in enabled hook commands + global `PreToolUse(send_message)`.
+      - `multidir_global_hook`: optional local `hooks.json` (must be schema-valid if present) + active global
+        `PreInvocation` + `Stop` + `PreToolUse(send_message)` without global file/shell interception.
+      - `cleanroom_line`: valid local `hooks.json` + non-empty `expected_local_markers` in enabled hook commands + active `send_message` PreToolUse emitter (local or global).
+    """
+    role = str(role_profile or "").strip().lower()
+    if role not in VALID_SEAT_HOOK_ROLE_PROFILES:
+        raise ValueError(f"Unsupported role_profile {role_profile!r}; expected one of {VALID_SEAT_HOOK_ROLE_PROFILES}")
+
+    issues: list[str] = []
+    gchk = validate_hooks_json_schema(global_hooks_doc) if isinstance(global_hooks_doc, dict) else {"ok": False, "issues": ["missing_global_hooks"]}
+    has_global_pre_stop = isinstance(global_hooks_doc, dict) and any(
+        isinstance(spec, dict)
+        and spec.get("enabled") is not False
+        and bool(spec.get("PreInvocation"))
+        and bool(spec.get("Stop"))
+        for spec in global_hooks_doc.values()
+    )
+    global_hooks_ok = bool(gchk.get("ok") and has_global_pre_stop)
+    global_send_msg_ok = has_send_message_pretool_hook(global_hooks_doc, command_markers=global_command_markers)
+    if not global_hooks_ok:
+        issues.append("global_pre_stop_invalid")
+
+    has_local = local_hooks_doc is not None
+    local_schema_ok = False
+    enabled_cmds: list[str] = []
+    local_send_msg_ok = False
+    if has_local:
+        lchk = validate_hooks_json_schema(local_hooks_doc)
+        local_schema_ok = bool(lchk.get("ok"))
+        if not local_schema_ok:
+            issues.extend(str(x) for x in lchk.get("issues") or [])
+        else:
+            enabled_cmds = _extract_enabled_hook_commands(local_hooks_doc)
+            local_send_msg_ok = has_enabled_pretool_send_message(local_hooks_doc)
+
+    req_markers = tuple(str(m).strip() for m in (expected_local_markers or ()) if str(m).strip())
+    missing_markers = [m for m in req_markers if not any(m in c for c in enabled_cmds)]
+
+    if role == "multidir_global_hook":
+        if has_local and not local_schema_ok:
+            issues.append("local_hooks_schema_invalid")
+        if not global_send_msg_ok:
+            issues.append("missing_global_send_message_hook")
+        emitter_ready = global_send_msg_ok
+    elif role == "isolated_guard":
+        if not has_local:
+            issues.append("missing_local_hooks")
+        if not req_markers:
+            issues.append("missing_expected_local_markers")
+        elif missing_markers:
+            issues.append(f"missing_local_markers:{','.join(missing_markers)}")
+        if not global_send_msg_ok:
+            issues.append("missing_global_send_message_hook")
+        emitter_ready = global_send_msg_ok
+    else:
+        if not has_local:
+            issues.append("missing_local_hooks")
+        if not req_markers:
+            issues.append("missing_expected_local_markers")
+        elif missing_markers:
+            issues.append(f"missing_local_markers:{','.join(missing_markers)}")
+        emitter_ready = bool(local_send_msg_ok or global_send_msg_ok)
+        if not emitter_ready:
+            issues.append("missing_send_message_emitter")
+
+    return {
+        "ok": len(issues) == 0 and emitter_ready,
+        "role_profile": role,
+        "global_hooks_ok": global_hooks_ok,
+        "global_send_message_hook": global_send_msg_ok,
+        "has_local_hooks": has_local,
+        "local_schema_ok": local_schema_ok,
+        "local_send_message_emitter": local_send_msg_ok,
+        "send_message_emitter_ready": emitter_ready,
+        "issues": issues,
+    }
