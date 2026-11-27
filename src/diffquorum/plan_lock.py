@@ -1490,3 +1490,252 @@ def audit_seat_hook_contract(
         "send_message_emitter_ready": emitter_ready,
         "issues": issues,
     }
+
+
+STRICT_SEAT_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+DEFAULT_FORBIDDEN_BIND_IDENTITIES: tuple[str, ...] = ("guest-lab", "system-watcher", "unmapped")
+DEFAULT_ONE_WAY_GUEST_SENDERS: tuple[str, ...] = ("guest-lab",)
+
+
+def evaluate_unmapped_workspace_write_policy(
+    *,
+    seat: str,
+    session_cwd: str,
+    target_path: str,
+    cwd_owner_seat: str,
+    target_owner_seat: str,
+    is_subagent: bool = False,
+    sealed_seats: tuple[str, ...] | frozenset[str] = (),
+    is_sensitive_cred: bool = False,
+    is_bus_path: bool = False,
+    is_sealed_path: bool = False,
+) -> dict[str, Any]:
+    """
+    Single-UUID Guard Anti-Lockout Policy for unmapped sessions:
+    Downgrades hard `deny` to explicit human `ask` (NEVER `allow`) ONLY when a top-level
+    `unmapped` session carrying an explicit non-empty `session_cwd` inside a non-sealed
+    workspace writes strictly inside that exact same workspace without touching credentials,
+    shared-bus state, sealed vaults, or cross-seat directories.
+    """
+    if is_sealed_path or is_sensitive_cred or is_bus_path:
+        return {
+            "decision": "deny",
+            "code": "protected_boundary_denied",
+            "reason": "Blocked: sealed vault, host credential, or shared-bus write is strictly forbidden.",
+        }
+    clean_seat = str(seat or "").strip()
+    c_own = str(cwd_owner_seat or "").strip()
+    t_own = str(target_owner_seat or "").strip()
+    if not clean_seat:
+        return {
+            "decision": "deny",
+            "code": "missing_seat_identity",
+            "reason": "Blocked: missing seat identity cannot use anti-lockout ask.",
+        }
+    if clean_seat != "unmapped":
+        if t_own and t_own != clean_seat:
+            return {
+                "decision": "deny",
+                "code": "cross_seat_write_denied",
+                "reason": f"Blocked: mapped seat '{clean_seat}' cannot write inside '{t_own}'.",
+            }
+        return {"decision": "allow", "code": "mapped_own_workspace_allow", "reason": ""}
+    if is_subagent:
+        return {
+            "decision": "deny",
+            "code": "subagent_anti_lockout_denied",
+            "reason": "Blocked: unmapped subagent cannot escalate write access via anti-lockout ask.",
+        }
+    if not str(session_cwd or "").strip() or not str(target_path or "").strip() or not c_own or not t_own:
+        return {
+            "decision": "deny",
+            "code": "missing_explicit_workspace_ownership",
+            "reason": "Blocked: unmapped session missing explicit workspace ownership cannot write.",
+        }
+    sealed_set = {str(s).strip().lower() for s in (sealed_seats or ()) if str(s).strip()}
+    if c_own.lower() in sealed_set or t_own.lower() in sealed_set:
+        return {
+            "decision": "deny",
+            "code": "sealed_workspace_denied",
+            "reason": f"Blocked: sealed seat '{t_own}' is never eligible for unmapped anti-lockout ask.",
+        }
+    if c_own != t_own:
+        return {
+            "decision": "deny",
+            "code": "cross_seat_write_denied",
+            "reason": f"Blocked: unmapped session in '{c_own}' cannot write cross-seat into '{t_own}'.",
+        }
+    return {
+        "decision": "ask",
+        "code": "unmapped_own_workspace_ask",
+        "reason": f"Anti-Lockout: unmapped top-level session inside '{c_own}' writing same workspace; requiring human confirmation.",
+    }
+
+
+def plan_atomic_seat_uuid_rebind(
+    *,
+    env_text: str,
+    seat: str,
+    new_uuid: str,
+    seat_keys: tuple[str, ...] | list[str],
+    key_to_seat: dict[str, str],
+    forbidden_identities: tuple[str, ...] | frozenset[str] = DEFAULT_FORBIDDEN_BIND_IDENTITIES,
+    force_reassign: bool = False,
+) -> dict[str, Any]:
+    """
+    Pure atomic planner for rebinding a seat's primary and legacy compatibility UUID keys in an
+    `.env` registry while preserving comments, sibling keys, and cross-seat uniqueness.
+    Fails closed on guest/system identities, malformed UUIDs, or duplicate cross-seat UUIDs
+    (unless `force_reassign=True`, which atomically clears conflicting keys on the previous seat).
+    """
+    clean_seat = str(seat or "").strip().lower()
+    clean_uuid = str(new_uuid or "").strip().lower()
+    forbidden = {str(x).strip().lower() for x in (forbidden_identities or ()) if str(x).strip()}
+    if not clean_seat or clean_seat in forbidden:
+        return {"ok": False, "error": f"forbidden_or_empty_seat:{clean_seat}"}
+    if not STRICT_SEAT_UUID_RE.fullmatch(clean_uuid):
+        return {"ok": False, "error": f"invalid_uuid:{new_uuid!r}"}
+    ordered_keys = tuple(dict.fromkeys(str(k).strip() for k in (seat_keys or ()) if str(k).strip()))
+    if not ordered_keys:
+        return {"ok": False, "error": f"missing_seat_keys:{clean_seat}"}
+
+    parsed: dict[str, str] = {}
+    lines = str(env_text or "").splitlines()
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        k_s = k.strip()
+        if k_s.startswith("export "):
+            k_s = k_s[7:].strip()
+        v_s = v.strip().strip('"').strip("'")
+        if k_s:
+            parsed[k_s] = v_s
+
+    conflicts: list[dict[str, str]] = []
+    conflict_key_set: set[str] = set()
+    for k, v in parsed.items():
+        if v.lower() != clean_uuid:
+            continue
+        owner = str(key_to_seat.get(k, "")).strip().lower()
+        if owner and owner != clean_seat:
+            conflicts.append({"seat": owner, "key": k, "uuid": v})
+            conflict_key_set.add(k)
+    if conflicts and not force_reassign:
+        return {"ok": False, "error": "duplicate_cross_seat_uuid", "conflicts": conflicts}
+
+    key_set = set(ordered_keys)
+    clear_set = conflict_key_set - key_set if force_reassign else set()
+    old_values = {k: parsed.get(k, "") for k in ordered_keys}
+    seen_target: set[str] = set()
+    seen_clear: set[str] = set()
+    out_lines: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            raw_k = s.split("=", 1)[0].strip()
+            k = raw_k[7:].strip() if raw_k.startswith("export ") else raw_k
+            if k in key_set:
+                if k not in seen_target:
+                    out_lines.append(f"{k}={clean_uuid}")
+                    seen_target.add(k)
+                continue
+            if k in clear_set:
+                if k not in seen_clear:
+                    out_lines.append(f"{k}=")
+                    seen_clear.add(k)
+                continue
+        out_lines.append(line)
+    for k in ordered_keys:
+        if k not in seen_target:
+            out_lines.append(f"{k}={clean_uuid}")
+            seen_target.add(k)
+    rendered = "\n".join(out_lines).rstrip("\n") + "\n"
+    return {
+        "ok": True,
+        "seat": clean_seat,
+        "new_uuid": clean_uuid,
+        "updated_keys": list(ordered_keys),
+        "cleared_conflict_keys": sorted(clear_set),
+        "old_values": old_values,
+        "conflicts_overridden": conflicts,
+        "rendered_env": rendered,
+    }
+
+
+def evaluate_one_way_guest_dispatch(
+    *,
+    sender: str,
+    priority: str,
+    recent_dispatch_epochs: list[float] | tuple[float, ...],
+    now_ts: float,
+    has_approval_anchor: bool = False,
+    allowed_guests: tuple[str, ...] | frozenset[str] = DEFAULT_ONE_WAY_GUEST_SENDERS,
+    max_per_window: int = 3,
+    window_sec: float = 300.0,
+) -> dict[str, Any]:
+    """
+    Fail-closed policy gate for temporary one-way guest dispatchers:
+      - Allowed strictly for non-P0 (`P1` / `P2`) dispatches without V2.3 approval anchors;
+      - Enforces an atomic sliding-window anti-loop cap (`max_per_window` per `window_sec`);
+      - Tags accepted dispatches `one_way_guest=True`, `from_conv_id=""`, `receipt_notified_to_sender=True`
+        so the host watcher never bounces wakeups back to an unregistered guest terminal.
+    """
+    import math
+
+    if (
+        isinstance(now_ts, bool)
+        or not isinstance(now_ts, (int, float))
+        or not math.isfinite(float(now_ts))
+        or isinstance(window_sec, bool)
+        or not isinstance(window_sec, (int, float))
+        or not math.isfinite(float(window_sec))
+        or float(window_sec) <= 0.0
+        or isinstance(max_per_window, bool)
+        or not isinstance(max_per_window, int)
+        or max_per_window < 1
+    ):
+        raise ValueError("Invalid numeric parameters for evaluate_one_way_guest_dispatch")
+
+    clean_sender = str(sender or "").strip()
+    guests = {str(g).strip() for g in (allowed_guests or ()) if str(g).strip()}
+    if clean_sender not in guests:
+        return {"ok": False, "code": "unrecognized_guest_sender", "reason": f"Sender {clean_sender!r} is not an allowed one-way guest."}
+    if has_approval_anchor:
+        return {"ok": False, "code": "guest_approval_anchor_forbidden", "reason": "One-way guest sender cannot attach V2.3 approval anchors."}
+    prio = str(priority or "").strip().upper()
+    if prio not in ("P1", "P2"):
+        return {"ok": False, "code": "guest_priority_forbidden", "reason": f"One-way guest sender is restricted to P1/P2 (got {prio!r})."}
+
+    now_f = float(now_ts)
+    win_f = float(window_sec)
+    recent = [
+        float(ts)
+        for ts in (recent_dispatch_epochs or ())
+        if not isinstance(ts, bool)
+        and isinstance(ts, (int, float))
+        and math.isfinite(float(ts))
+        and (now_f - float(ts)) <= win_f
+        and float(ts) <= now_f + 5.0
+    ]
+    if len(recent) >= max_per_window:
+        return {
+            "ok": False,
+            "code": "GUEST_DISPATCH_RATE_LIMITED",
+            "recent_count": len(recent),
+            "max_per_window": max_per_window,
+            "window_sec": win_f,
+            "reason": f"Guest sender '{clean_sender}' hit rate limit ({len(recent)}/{max_per_window} within {int(win_f)}s).",
+        }
+    return {
+        "ok": True,
+        "code": "GUEST_DISPATCH_ALLOWED",
+        "sender": clean_sender,
+        "priority": prio,
+        "recent_count": len(recent),
+        "remaining_in_window": max_per_window - len(recent) - 1,
+        "one_way_guest": True,
+        "from_conv_id": "",
+        "receipt_notified_to_sender": True,
+    }

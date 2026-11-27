@@ -1,6 +1,6 @@
 # Production Pitfalls & Engineering Fixes (`DiffQuorum` Lessons Learned)
 
-Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **24 major pitfalls** and the deterministic fixes built into this toolkit.
+Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **25 major pitfalls** and the deterministic fixes built into this toolkit.
 
 ---
 
@@ -227,3 +227,14 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
   - **Strict `send_message`-Only Global `PreToolUse` Redline**: `has_send_message_pretool_hook` verifies an enabled global `PreToolUse` entry matches `send_message` while failing closed if ANY enabled global `PreToolUse` matcher intercepts `write_file`, `edit_file`, or `run_command`.
   - **Cross-Hook `2.0s` Atomic Dedup**: `should_dedup_native_message_event` deduplicates `(from_conv_id, recipient, msg_sha256_12, msg_len)` within `2.0s` under the shared event lock so dual-hook seats emit exactly one zero-prose `#seq` record (`is_silent` / `is_report_no_reply` from `classify_native_message_flags`).
   - **Role-Aware Contract Auditing**: `audit_seat_hook_contract` validates each seat against its actual role profile (`platform_hub`, `isolated_guard`, `multidir_global_hook`, `cleanroom_line`) and guarantees `send_message_emitter_ready` across 100% of the fleet.
+
+## 25. Single-UUID Guard Lockout, Stale Seat Bindings & Guest Dispatch Loops (`plan_lock.py`)
+
+- **What broke**:
+  1. **Single-UUID Guard Self-Lockout**: When an operator opened a fresh CLI session inside an existing workspace (or resumed a rotated conversation UUID) before updating the central `.env` registry, `PreToolUse` guards classified the session as `unmapped` and returned a hard `deny` even on writes strictly inside the session's own workspace — trapping operators during cold starts or incident recovery.
+  2. **Manual `.env` Drift on UUID Rotation**: Manually editing multi-key `.env` files to swap a rotated session UUID frequently missed legacy alias keys or accidentally left duplicate UUIDs assigned across two seats.
+  3. **Uncontrolled Ad-Hoc Guest Dispatches**: Allowing a temporary exploratory terminal to dispatch tickets into a managed fleet without priority/approval restrictions or sliding-window rate limits risked `P0` privilege escalation, forged approval anchors, or wakeup bounce loops back to an unregistered guest.
+- **Root-cause fix (`evaluate_unmapped_workspace_write_policy` + `plan_atomic_seat_uuid_rebind` + `evaluate_one_way_guest_dispatch`)**:
+  - **Anti-Lockout Same-Workspace `ask` Downgrade**: `evaluate_unmapped_workspace_write_policy` downgrades hard `deny` to explicit human `ask` (never silent `allow`) **only** for top-level `unmapped` sessions carrying an explicit non-empty `session_cwd` strictly inside a non-sealed workspace writing to that exact same workspace; subagents, missing `cwd`, cross-seat writes, host credentials, shared-bus state, and sealed vaults stay 100% hard `deny`.
+  - **Atomic Multi-Key Seat UUID Rebind Planner**: `plan_atomic_seat_uuid_rebind` validates lowercase 36-char UUID format, blocks reserved guest/system identities, rejects duplicate cross-seat UUIDs unless `force_reassign=True` (which atomically clears conflicting keys on the prior seat), and syncs primary + alias keys while preserving comments and sibling entries.
+  - **Fail-Closed One-Way Guest Dispatch Gate**: `evaluate_one_way_guest_dispatch` restricts temporary guest senders strictly to `P1`/`P2`, blocks approval-anchor forgery, enforces an atomic sliding-window cap (`3` dispatches per `300s`), and marks accepted dispatches `one_way_guest=True`, `from_conv_id=""`, `receipt_notified_to_sender=True` so watchers never bounce wakeups to an unregistered terminal.

@@ -2862,6 +2862,178 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
             )["ok"]
         )
 
+    def test_unmapped_anti_lockout_atomic_rebind_and_one_way_guest_dispatch(self) -> None:
+        from diffquorum.plan_lock import (
+            evaluate_one_way_guest_dispatch,
+            evaluate_unmapped_workspace_write_policy,
+            plan_atomic_seat_uuid_rebind,
+        )
+
+        # 1) Unmapped top-level session with explicit own cwd downgrades hard deny -> ask (NEVER allow)
+        r_ask = evaluate_unmapped_workspace_write_policy(
+            seat="unmapped",
+            session_cwd="/work/line-a",
+            target_path="/work/line-a/notes.md",
+            cwd_owner_seat="line-a",
+            target_owner_seat="line-a",
+            sealed_seats=("vault-seat",),
+        )
+        self.assertEqual(r_ask["decision"], "ask")
+        self.assertEqual(r_ask["code"], "unmapped_own_workspace_ask")
+
+        # Mapped own-workspace allows; mapped cross-seat denies
+        self.assertEqual(
+            evaluate_unmapped_workspace_write_policy(
+                seat="line-a",
+                session_cwd="/work/line-a",
+                target_path="/work/line-a/notes.md",
+                cwd_owner_seat="line-a",
+                target_owner_seat="line-a",
+            )["decision"],
+            "allow",
+        )
+        self.assertEqual(
+            evaluate_unmapped_workspace_write_policy(
+                seat="line-a",
+                session_cwd="/work/line-a",
+                target_path="/work/line-b/notes.md",
+                cwd_owner_seat="line-a",
+                target_owner_seat="line-b",
+            )["decision"],
+            "deny",
+        )
+
+        # Fail-closed hard deny: empty seat, subagent, missing cwd, cross-seat, sealed seat, cred, bus, sealed path
+        for bad_kw in (
+            {"seat": "", "session_cwd": "/work/line-a", "target_path": "/work/line-a/a.md", "cwd_owner_seat": "line-a", "target_owner_seat": "line-a"},
+            {"seat": "unmapped", "session_cwd": "/work/line-a", "target_path": "/work/line-a/a.md", "cwd_owner_seat": "line-a", "target_owner_seat": "line-a", "is_subagent": True},
+            {"seat": "unmapped", "session_cwd": "", "target_path": "/work/line-a/a.md", "cwd_owner_seat": "line-a", "target_owner_seat": "line-a"},
+            {"seat": "unmapped", "session_cwd": "/work/line-a", "target_path": "/work/line-b/a.md", "cwd_owner_seat": "line-a", "target_owner_seat": "line-b"},
+            {"seat": "unmapped", "session_cwd": "/work/vault-seat", "target_path": "/work/vault-seat/a.md", "cwd_owner_seat": "vault-seat", "target_owner_seat": "vault-seat", "sealed_seats": ("vault-seat",)},
+            {"seat": "unmapped", "session_cwd": "/work/line-a", "target_path": "/work/creds/key.pem", "cwd_owner_seat": "line-a", "target_owner_seat": "line-a", "is_sensitive_cred": True},
+            {"seat": "unmapped", "session_cwd": "/work/line-a", "target_path": "/work/.bus/env", "cwd_owner_seat": "line-a", "target_owner_seat": "line-a", "is_bus_path": True},
+            {"seat": "unmapped", "session_cwd": "/work/line-a", "target_path": "/work/sealed/x", "cwd_owner_seat": "line-a", "target_owner_seat": "line-a", "is_sealed_path": True},
+        ):
+            self.assertEqual(evaluate_unmapped_workspace_write_policy(**bad_kw)["decision"], "deny", f"Must hard-deny {bad_kw}")
+
+        # 2) Atomic seat UUID rebind planner (validates UUID, blocks guest/system seats & duplicate cross-seat UUIDs, clears on force_reassign)
+        uid_a = "-".join(("11111111", "1111", "4111", "8111", "111111111111"))
+        uid_b = "-".join(("22222222", "2222", "4222", "8222", "222222222222"))
+        uid_c = "-".join(("33333333", "3333", "4333", "8333", "333333333333"))
+        sample_env = (
+            "# Fleet UUID registry\n"
+            f"SEAT_A_CONV_ID={uid_a}\n"
+            f"SEAT_A_LEGACY_ID={uid_a}\n"
+            f"export SEAT_B_CONV_ID={uid_b}\n"
+        )
+        key_map = {
+            "SEAT_A_CONV_ID": "seat-a",
+            "SEAT_A_LEGACY_ID": "seat-a",
+            "SEAT_B_CONV_ID": "seat-b",
+        }
+        for bad_seat in ("guest-lab", "Guest-Lab", "UNMAPPED", "SYSTEM-WATCHER"):
+            self.assertFalse(
+                plan_atomic_seat_uuid_rebind(
+                    env_text=sample_env,
+                    seat=bad_seat,
+                    new_uuid=uid_c,
+                    seat_keys=("SEAT_A_CONV_ID",),
+                    key_to_seat=key_map,
+                )["ok"],
+                f"Must reject reserved identity regardless of case: {bad_seat!r}",
+            )
+        self.assertFalse(
+            plan_atomic_seat_uuid_rebind(
+                env_text=sample_env,
+                seat="seat-a",
+                new_uuid="not-a-uuid",
+                seat_keys=("SEAT_A_CONV_ID",),
+                key_to_seat=key_map,
+            )["ok"]
+        )
+        self.assertFalse(
+            plan_atomic_seat_uuid_rebind(
+                env_text=sample_env,
+                seat="seat-a",
+                new_uuid=uid_c,
+                seat_keys=(),
+                key_to_seat=key_map,
+            )["ok"]
+        )
+        dup_blocked = plan_atomic_seat_uuid_rebind(
+            env_text=sample_env,
+            seat="seat-a",
+            new_uuid=uid_b,
+            seat_keys=("SEAT_A_CONV_ID", "SEAT_A_LEGACY_ID"),
+            key_to_seat=key_map,
+        )
+        self.assertFalse(dup_blocked["ok"])
+        self.assertEqual(dup_blocked["error"], "duplicate_cross_seat_uuid")
+
+        # Rebind seat-a cleanly to fresh UUID + inserts missing alias key while preserving comment & seat-b
+        ok_plan = plan_atomic_seat_uuid_rebind(
+            env_text=sample_env,
+            seat="seat-a",
+            new_uuid=uid_c,
+            seat_keys=("SEAT_A_CONV_ID", "SEAT_A_LEGACY_ID", "SEAT_A_EXTRA_ID"),
+            key_to_seat=key_map,
+        )
+        self.assertTrue(ok_plan["ok"], ok_plan)
+        self.assertIn("# Fleet UUID registry", ok_plan["rendered_env"])
+        self.assertIn(f"SEAT_A_CONV_ID={uid_c}", ok_plan["rendered_env"])
+        self.assertIn(f"SEAT_A_LEGACY_ID={uid_c}", ok_plan["rendered_env"])
+        self.assertIn(f"SEAT_A_EXTRA_ID={uid_c}", ok_plan["rendered_env"])
+        self.assertIn(f"export SEAT_B_CONV_ID={uid_b}", ok_plan["rendered_env"])
+
+        # force_reassign clears old conflicting seat key atomically so zero duplicate UUID remains
+        force_plan = plan_atomic_seat_uuid_rebind(
+            env_text=sample_env,
+            seat="seat-a",
+            new_uuid=uid_b,
+            seat_keys=("SEAT_A_CONV_ID", "SEAT_A_LEGACY_ID"),
+            key_to_seat=key_map,
+            force_reassign=True,
+        )
+        self.assertTrue(force_plan["ok"], force_plan)
+        self.assertEqual(force_plan["cleared_conflict_keys"], ["SEAT_B_CONV_ID"])
+        self.assertIn("SEAT_B_CONV_ID=\n", force_plan["rendered_env"])
+
+        # 3) One-way guest dispatch gate (blocks P0, blocks approval anchor, enforces 3/300s sliding window)
+        with self.assertRaises(ValueError):
+            evaluate_one_way_guest_dispatch(sender="guest-lab", priority="P1", recent_dispatch_epochs=[], now_ts=float("nan"))
+        with self.assertRaises(ValueError):
+            evaluate_one_way_guest_dispatch(sender="guest-lab", priority="P1", recent_dispatch_epochs=[], now_ts=1000.0, max_per_window=0)
+
+        self.assertEqual(
+            evaluate_one_way_guest_dispatch(sender="unknown-guest", priority="P1", recent_dispatch_epochs=[], now_ts=1000.0)["code"],
+            "unrecognized_guest_sender",
+        )
+        self.assertEqual(
+            evaluate_one_way_guest_dispatch(
+                sender="guest-lab", priority="P1", recent_dispatch_epochs=[], now_ts=1000.0, has_approval_anchor=True
+            )["code"],
+            "guest_approval_anchor_forbidden",
+        )
+        self.assertEqual(
+            evaluate_one_way_guest_dispatch(sender="guest-lab", priority="P0", recent_dispatch_epochs=[], now_ts=1000.0)["code"],
+            "guest_priority_forbidden",
+        )
+        g_ok = evaluate_one_way_guest_dispatch(
+            sender="guest-lab", priority="P2", recent_dispatch_epochs=[500.0, 900.0, 950.0], now_ts=1000.0
+        )
+        self.assertTrue(g_ok["ok"], g_ok)
+        self.assertTrue(g_ok["one_way_guest"])
+        self.assertEqual(g_ok["from_conv_id"], "")
+        self.assertTrue(g_ok["receipt_notified_to_sender"])
+        self.assertEqual(g_ok["recent_count"], 2)
+        self.assertEqual(g_ok["remaining_in_window"], 0)
+
+        g_lim = evaluate_one_way_guest_dispatch(
+            sender="guest-lab", priority="P1", recent_dispatch_epochs=[800.0, 900.0, 950.0], now_ts=1000.0
+        )
+        self.assertFalse(g_lim["ok"])
+        self.assertEqual(g_lim["code"], "GUEST_DISPATCH_RATE_LIMITED")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1043,6 +1043,38 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     except ValueError:
         pass
 
+    # Single-UUID anti-lockout, atomic seat UUID rebind & one-way guest dispatch coverage
+    assert _pl.evaluate_unmapped_workspace_write_policy(seat="", session_cwd="/w/a", target_path="/w/a/f", cwd_owner_seat="a", target_owner_seat="a")["decision"] == "deny"
+    assert _pl.evaluate_unmapped_workspace_write_policy(seat="unmapped", session_cwd="/w/a", target_path="/w/a/f", cwd_owner_seat="a", target_owner_seat="a")["decision"] == "ask"
+    assert _pl.evaluate_unmapped_workspace_write_policy(seat="a", session_cwd="/w/a", target_path="/w/a/f", cwd_owner_seat="a", target_owner_seat="a")["decision"] == "allow"
+    assert _pl.evaluate_unmapped_workspace_write_policy(seat="a", session_cwd="/w/a", target_path="/w/b/f", cwd_owner_seat="a", target_owner_seat="b")["decision"] == "deny"
+    assert _pl.evaluate_unmapped_workspace_write_policy(seat="unmapped", session_cwd="/w/a", target_path="/w/a/f", cwd_owner_seat="a", target_owner_seat="a", is_subagent=True)["decision"] == "deny"
+    assert _pl.evaluate_unmapped_workspace_write_policy(seat="unmapped", session_cwd="", target_path="/w/a/f", cwd_owner_seat="a", target_owner_seat="a")["decision"] == "deny"
+    assert _pl.evaluate_unmapped_workspace_write_policy(seat="unmapped", session_cwd="/w/v", target_path="/w/v/f", cwd_owner_seat="v", target_owner_seat="v", sealed_seats=("v",))["decision"] == "deny"
+    assert _pl.evaluate_unmapped_workspace_write_policy(seat="unmapped", session_cwd="/w/a", target_path="/w/b/f", cwd_owner_seat="a", target_owner_seat="b")["decision"] == "deny"
+    assert _pl.evaluate_unmapped_workspace_write_policy(seat="unmapped", session_cwd="/w/a", target_path="/w/a/f", cwd_owner_seat="a", target_owner_seat="a", is_sensitive_cred=True)["decision"] == "deny"
+
+    u_a = "-".join(("11111111", "1111", "4111", "8111", "111111111111"))
+    u_b = "-".join(("22222222", "2222", "4222", "8222", "222222222222"))
+    u_c = "-".join(("33333333", "3333", "4333", "8333", "333333333333"))
+    rb_env = f"# hdr\nSEAT_A={u_a}\nexport SEAT_B={u_b}\n"
+    rb_map = {"SEAT_A": "sa", "SEAT_B": "sb"}
+    assert _pl.plan_atomic_seat_uuid_rebind(env_text=rb_env, seat="guest-lab", new_uuid=u_c, seat_keys=("SEAT_A",), key_to_seat=rb_map)["ok"] is False
+    assert _pl.plan_atomic_seat_uuid_rebind(env_text=rb_env, seat="sa", new_uuid="bad", seat_keys=("SEAT_A",), key_to_seat=rb_map)["ok"] is False
+    assert _pl.plan_atomic_seat_uuid_rebind(env_text=rb_env, seat="sa", new_uuid=u_c, seat_keys=(), key_to_seat=rb_map)["ok"] is False
+    assert _pl.plan_atomic_seat_uuid_rebind(env_text=rb_env, seat="sa", new_uuid=u_b, seat_keys=("SEAT_A",), key_to_seat=rb_map)["ok"] is False
+    assert _pl.plan_atomic_seat_uuid_rebind(env_text=rb_env, seat="sa", new_uuid=u_b, seat_keys=("SEAT_A", "SEAT_A2"), key_to_seat=rb_map, force_reassign=True)["ok"] is True
+
+    assert _pl.evaluate_one_way_guest_dispatch(sender="nope", priority="P1", recent_dispatch_epochs=[], now_ts=100.0)["ok"] is False
+    assert _pl.evaluate_one_way_guest_dispatch(sender="guest-lab", priority="P1", recent_dispatch_epochs=[], now_ts=100.0, has_approval_anchor=True)["ok"] is False
+    assert _pl.evaluate_one_way_guest_dispatch(sender="guest-lab", priority="P0", recent_dispatch_epochs=[], now_ts=100.0)["ok"] is False
+    assert _pl.evaluate_one_way_guest_dispatch(sender="guest-lab", priority="P1", recent_dispatch_epochs=[90.0], now_ts=100.0)["ok"] is True
+    assert _pl.evaluate_one_way_guest_dispatch(sender="guest-lab", priority="P1", recent_dispatch_epochs=[80.0, 90.0, 95.0], now_ts=100.0)["ok"] is False
+    try:
+        _pl.evaluate_one_way_guest_dispatch(sender="guest-lab", priority="P1", recent_dispatch_epochs=[], now_ts=float("nan"))
+    except ValueError:
+        pass
+
     shutil.rmtree(ws, ignore_errors=True)
 
 
