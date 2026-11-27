@@ -1191,3 +1191,110 @@ def validate_hooks_json_schema(doc: Any) -> dict[str, Any]:
                         if not isinstance(h, dict) or not str(h.get("command") or "").strip():
                             issues.append(f"{hook_name}.{ev_name}[{idx}].hooks[{h_i}]: missing non-empty command")
     return {"ok": len(issues) == 0, "issue_count": len(issues), "issues": issues}
+
+
+_HOOK_MANIFEST_REL_PATHS: tuple[tuple[str, ...], ...] = (
+    (".agents", "hooks.json"),
+    (".agents", "hooks", "hooks.json"),
+    (".gemini", "hooks.json"),
+    (".claude", "settings.json"),
+)
+
+
+def _paths_overlap(path_a: str, path_b: str) -> bool:
+    a = os.path.normpath(path_a)
+    b = os.path.normpath(path_b)
+    if a == b:
+        return True
+    try:
+        common = os.path.commonpath([a, b])
+    except ValueError:
+        return False
+    return common == a or common == b
+
+
+def audit_launch_args_for_hook_bleed(
+    launch_argv: list[str] | tuple[str, ...],
+    *,
+    own_workspace: str | pathlib.Path,
+    peer_workspaces: list[str | pathlib.Path] | tuple[str | pathlib.Path, ...] = (),
+) -> dict[str, Any]:
+    """
+    Fails closed when a seat's CLI launch arguments mount a sibling workspace or external
+    hook-bearing directory via `--add-dir` / `--additional-dir`, preventing cross-workspace
+    `PreToolUse` hook bleed across independent agent seats.
+    """
+    real_own = os.path.realpath(os.path.expanduser(str(own_workspace)))
+    real_peers = [
+        os.path.realpath(os.path.expanduser(str(p)))
+        for p in (peer_workspaces or ())
+        if str(p or "").strip()
+    ]
+    real_peers = [p for p in real_peers if p != real_own]
+
+    argv_list = [str(tok) for tok in (launch_argv or ())]
+    mounted_dirs: list[str] = []
+    violations: list[dict[str, str]] = []
+
+    i = 0
+    while i < len(argv_list):
+        tok = argv_list[i]
+        raw_val: str | None = None
+        if tok in ("--add-dir", "--additional-dir"):
+            if i + 1 >= len(argv_list) or not argv_list[i + 1].strip() or argv_list[i + 1].startswith("-"):
+                violations.append({"code": "missing_add_dir_value", "path": "", "detail": f"{tok} missing directory value"})
+                i += 1
+                continue
+            raw_val = argv_list[i + 1]
+            i += 2
+        elif tok.startswith("--add-dir=") or tok.startswith("--additional-dir="):
+            raw_val = tok.split("=", 1)[1]
+            if not raw_val.strip():
+                violations.append({"code": "missing_add_dir_value", "path": "", "detail": f"{tok} empty directory value"})
+                i += 1
+                continue
+            i += 1
+        else:
+            i += 1
+            continue
+
+        real_dir = os.path.realpath(os.path.expanduser(raw_val))
+        mounted_dirs.append(real_dir)
+        if real_dir == real_own:
+            continue
+
+        matched_peer = False
+        for peer in real_peers:
+            if _paths_overlap(real_dir, peer):
+                violations.append(
+                    {
+                        "code": "cross_workspace_peer_mount",
+                        "path": real_dir,
+                        "detail": f"mounts peer workspace {peer}",
+                    }
+                )
+                matched_peer = True
+                break
+        if matched_peer:
+            continue
+
+        dir_path = pathlib.Path(real_dir)
+        for rel_parts in _HOOK_MANIFEST_REL_PATHS:
+            manifest = dir_path.joinpath(*rel_parts)
+            if manifest.exists():
+                violations.append(
+                    {
+                        "code": "external_hook_bearing_dir",
+                        "path": real_dir,
+                        "detail": f"external directory carries {'/'.join(rel_parts)}",
+                    }
+                )
+                break
+
+    return {
+        "ok": len(violations) == 0,
+        "own_workspace": real_own,
+        "mounted_dirs": mounted_dirs,
+        "violation_count": len(violations),
+        "violations": violations,
+    }

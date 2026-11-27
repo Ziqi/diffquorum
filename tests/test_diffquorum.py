@@ -2509,6 +2509,146 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
                 self.assertEqual(n_res["decision"], "allow", f"False-positive on {narrative_txt!r}: {n_res}")
                 self.assertEqual(n_res["action"], "allow", f"Phantom auto_register on {narrative_txt!r}: {n_res}")
 
+    def test_native_message_cursor_bridge_and_hook_bleed_audit(self) -> None:
+        from diffquorum.plan_lock import audit_launch_args_for_hook_bleed
+        from diffquorum.wake_gates import (
+            MAX_NATIVE_EVENT_WAKE_AGE_SECONDS,
+            NATIVE_EVENT_DEBOUNCE_SECONDS,
+            scan_native_message_events_cursor,
+        )
+
+        self.assertEqual(NATIVE_EVENT_DEBOUNCE_SECONDS, 5.5)
+        self.assertEqual(MAX_NATIVE_EVENT_WAKE_AGE_SECONDS, 86400.0)
+        seats = {"lead", "worker_a", "worker_b"}
+
+        # 1) Invalid numeric parameters fail closed
+        with self.assertRaises(ValueError):
+            scan_native_message_events_cursor([], seat_registry=seats, debounce_sec=-1.0)
+        with self.assertRaises(ValueError):
+            scan_native_message_events_cursor([], seat_registry=seats, max_age_sec=0.0)
+
+        # 2) Mixed stream: non-target event, silent event, self-send, unknown seat, expired (>24h),
+        #    consumed by newer turn, orthogonal report-no-reply (survives 6.3h modal block!), and burst debounce
+        now_ep = 100000.0
+        events = [
+            {"seq": 10, "event": "TICKET_CREATED", "ts_epoch": now_ep - 500},
+            {"seq": 11, "event": "NATIVE_SEND_MESSAGE", "from_seat": "worker_a", "to_seat": "lead", "is_silent": True, "ts_epoch": now_ep - 400},
+            {"seq": 12, "event": "NATIVE_SEND_MESSAGE", "from_seat": "lead", "to_seat": "lead", "is_silent": False, "ts_epoch": now_ep - 300},
+            {"seq": 13, "event": "NATIVE_SEND_MESSAGE", "from_seat": "worker_a", "to_seat": "ghost_seat", "is_silent": False, "ts_epoch": now_ep - 250},
+            {"seq": 14, "event": "NATIVE_SEND_MESSAGE", "from_seat": "worker_a", "to_seat": "lead", "is_silent": False, "ts_epoch": now_ep - 90000},
+            {"seq": 15, "event": "NATIVE_SEND_MESSAGE", "from_seat": "worker_a", "to_seat": "worker_b", "is_silent": False, "ts_epoch": now_ep - 200},
+            # Overnight 6.3h report-no-reply event (overrides is_silent=True and survives 24h window!)
+            {"seq": 16, "event": "NATIVE_SEND_MESSAGE", "from_seat": "worker_b", "to_seat": "lead", "is_silent": True, "is_report_no_reply": True, "ts_epoch": now_ep - 22680},
+            # Fresh event still within 5.5s debounce window for worker_a
+            {"seq": 17, "event": "NATIVE_SEND_MESSAGE", "from_seat": "lead", "to_seat": "worker_a", "is_silent": False, "ts_epoch": now_ep - 2.0},
+        ]
+        res1 = scan_native_message_events_cursor(
+            events,
+            seat_registry=seats,
+            cursor_seq=9,
+            now_ts=now_ep,
+            recipient_last_active_ts={"worker_b": now_ep - 50.0},
+        )
+        # seq 10..15 all resolved (10 non-target, 11 silent, 12 self, 13 unknown, 14 expired, 15 consumed); cursor stops before 16
+        self.assertEqual(res1["next_cursor_seq"], 15)
+        self.assertEqual(res1["consumed_seqs"], [15])
+        self.assertEqual(res1["skipped_seqs"], [11, 12, 13, 14])
+        self.assertIn("lead", res1["ready_by_seat"])
+        self.assertEqual([e["seq"] for e in res1["ready_by_seat"]["lead"]], [16])
+        self.assertTrue(res1["ready_by_seat"]["lead"][0]["is_report_no_reply"])
+        self.assertEqual(res1["pending_debounce_seats"], ["worker_a"])
+
+        # After lead wakes seq 16 and 6 seconds pass so seq 17 settles, worker_a becomes ready and cursor advances to 16
+        res2 = scan_native_message_events_cursor(
+            events,
+            seat_registry=seats,
+            cursor_seq=res1["next_cursor_seq"],
+            woken_seqs={"16": now_ep},
+            now_ts=now_ep + 6.0,
+        )
+        self.assertEqual(res2["next_cursor_seq"], 16)
+        self.assertEqual([e["seq"] for e in res2["ready_by_seat"]["worker_a"]], [17])
+        self.assertEqual(res2["pending_debounce_seats"], [])
+
+        # Once seq 17 is woken too, cursor reaches 17 and nothing remains pending
+        res3 = scan_native_message_events_cursor(
+            events,
+            seat_registry=seats,
+            cursor_seq=res2["next_cursor_seq"],
+            woken_seqs={16, 17},
+            now_ts=now_ep + 7.0,
+        )
+        self.assertEqual(res3["next_cursor_seq"], 17)
+        self.assertEqual(res3["ready_by_seat"], {})
+
+        # Far-future corrupted timestamp (>300s ahead) is skipped cleanly instead of pinning next_cursor_seq
+        res_fut = scan_native_message_events_cursor(
+            [{"seq": 18, "event": "NATIVE_SEND_MESSAGE", "from_seat": "lead", "to_seat": "worker_a", "ts_epoch": now_ep + 9999.0}],
+            seat_registry=seats,
+            cursor_seq=17,
+            now_ts=now_ep,
+        )
+        self.assertEqual(res_fut["next_cursor_seq"], 18)
+        self.assertEqual(res_fut["skipped_seqs"], [18])
+        self.assertEqual(res_fut["pending_debounce_seats"], [])
+
+        # Unread sender override prevents false consumption even if recipient had activity after ev_ts
+        from datetime import datetime, timezone
+
+        ev_iso = "2026-11-27T01:00:00Z"
+        ev_ep = datetime(2026, 11, 27, 1, 0, 0, tzinfo=timezone.utc).timestamp()
+        res_unread = scan_native_message_events_cursor(
+            [{"seq": 20, "event": "NATIVE_SEND_MESSAGE", "from_seat": "worker_a", "to_seat": "worker_b", "ts": ev_iso}],
+            seat_registry={"worker_b": {}},
+            cursor_seq=0,
+            now_ts=ev_ep + 120.0,
+            recipient_last_active_ts={"worker_b": ev_ep + 60.0},
+            recipient_unread_senders={"worker_b": {"worker_a"}},
+        )
+        self.assertIn("worker_b", res_unread["ready_by_seat"])
+
+        # 3) Cross-workspace --add-dir hook-bleed auditor
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            own_ws = troot / "seat-alpha"
+            peer_ws = troot / "seat-beta"
+            ext_hook_dir = troot / "shared-tools"
+            clean_data_dir = troot / "clean-data"
+            for d in (own_ws, peer_ws, ext_hook_dir / ".agents", clean_data_dir):
+                d.mkdir(parents=True, exist_ok=True)
+            (ext_hook_dir / ".agents" / "hooks.json").write_text('{"g":{"enabled":true}}', encoding="utf-8")
+
+            ok_res = audit_launch_args_for_hook_bleed(
+                ["agent-cli", "--add-dir", str(own_ws), f"--add-dir={clean_data_dir}"],
+                own_workspace=own_ws,
+                peer_workspaces=[peer_ws],
+            )
+            self.assertTrue(ok_res["ok"], ok_res)
+
+            peer_res = audit_launch_args_for_hook_bleed(
+                ["agent-cli", "--add-dir", str(peer_ws)],
+                own_workspace=own_ws,
+                peer_workspaces=[peer_ws],
+            )
+            self.assertFalse(peer_res["ok"])
+            self.assertEqual(peer_res["violations"][0]["code"], "cross_workspace_peer_mount")
+
+            ext_res = audit_launch_args_for_hook_bleed(
+                ["agent-cli", f"--additional-dir={ext_hook_dir}"],
+                own_workspace=own_ws,
+                peer_workspaces=[peer_ws],
+            )
+            self.assertFalse(ext_res["ok"])
+            self.assertEqual(ext_res["violations"][0]["code"], "external_hook_bearing_dir")
+
+            bad_flag = audit_launch_args_for_hook_bleed(
+                ["agent-cli", "--add-dir", "--other-flag", "--add-dir="],
+                own_workspace=own_ws,
+                peer_workspaces=[peer_ws],
+            )
+            self.assertFalse(bad_flag["ok"])
+            self.assertEqual(bad_flag["violation_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

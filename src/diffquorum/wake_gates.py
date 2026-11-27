@@ -745,3 +745,162 @@ def verify_cached_host_approval(
         if cache_doc.get(field) != anchor.get(field):
             return False, f"ANCHOR_MISMATCH_{field.upper()}"
     return True, "VERIFIED_HOST_CACHE"
+
+
+NATIVE_EVENT_DEBOUNCE_SECONDS = 5.5
+MAX_NATIVE_EVENT_WAKE_AGE_SECONDS = 86400.0
+_MAX_NATIVE_BURST_COALESCE_SECONDS = 30.0
+
+
+def _parse_event_epoch(ev: dict[str, Any]) -> float | None:
+    raw_ep = ev.get("ts_epoch")
+    if isinstance(raw_ep, (int, float)) and not isinstance(raw_ep, bool) and math.isfinite(float(raw_ep)):
+        return float(raw_ep)
+    raw_ts = str(ev.get("ts") or "").strip()
+    if not raw_ts:
+        return None
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def scan_native_message_events_cursor(
+    events: list[dict[str, Any]],
+    *,
+    seat_registry: set[str] | frozenset[str] | dict[str, Any],
+    cursor_seq: int = 0,
+    woken_seqs: set[int] | frozenset[int] | dict[str, Any] = frozenset(),
+    now_ts: float | None = None,
+    debounce_sec: float = NATIVE_EVENT_DEBOUNCE_SECONDS,
+    max_age_sec: float = MAX_NATIVE_EVENT_WAKE_AGE_SECONDS,
+    recipient_last_active_ts: dict[str, float] | None = None,
+    recipient_unread_senders: dict[str, set[str] | frozenset[str]] | None = None,
+) -> dict[str, Any]:
+    """
+    Persistent-cursor debounced bridge for native peer `send_message` events (`NATIVE_SEND_MESSAGE`).
+
+    Solves top-level CLI agent dormancy when independent tmux processes do not receive parent/child
+    reactive wakeups or when peer messages exceed the 2h plain-chat TTL while blocked by a modal:
+      - Skips `is_silent == True` (unless orthogonal `is_report_no_reply == True`), self-sends,
+        unknown recipients, already-woken seqs, expired (`> max_age_sec`, default 24h) events,
+        and events already consumed by a newer recipient turn without unread mail from `from_seat`;
+      - Coalesces bursts to the same seat until `debounce_sec` (default 5.5s) elapses after the
+        newest actionable event (bounded by 30s so continuous bursts cannot starve a seat);
+      - Advances `next_cursor_seq` strictly across contiguous resolved sequence numbers so blocked
+        or debouncing events are never silently dropped on restart.
+    """
+    if isinstance(debounce_sec, bool) or not isinstance(debounce_sec, (int, float)) or not math.isfinite(float(debounce_sec)) or float(debounce_sec) < 0.0:
+        raise ValueError("debounce_sec must be a finite non-negative number")
+    if isinstance(max_age_sec, bool) or not isinstance(max_age_sec, (int, float)) or not math.isfinite(float(max_age_sec)) or float(max_age_sec) <= 0.0:
+        raise ValueError("max_age_sec must be a finite positive number")
+
+    now_ep = time.time() if now_ts is None else float(now_ts)
+    base_cursor = max(0, int(cursor_seq))
+    known_seats = set(seat_registry.keys()) if isinstance(seat_registry, dict) else {str(s) for s in seat_registry}
+    woken_set: set[int] = set()
+    if isinstance(woken_seqs, dict):
+        for k in woken_seqs:
+            try:
+                woken_set.add(int(k))
+            except (TypeError, ValueError):
+                continue
+    else:
+        for item in woken_seqs:
+            if isinstance(item, int) and not isinstance(item, bool):
+                woken_set.add(item)
+
+    active_map = recipient_last_active_ts or {}
+    unread_map = recipient_unread_senders or {}
+
+    ordered: list[tuple[int, dict[str, Any]]] = []
+    for ev in events or ():
+        if not isinstance(ev, dict):
+            continue
+        raw_seq = ev.get("seq")
+        if not isinstance(raw_seq, int) or isinstance(raw_seq, bool) or raw_seq <= base_cursor:
+            continue
+        ordered.append((raw_seq, ev))
+    ordered.sort(key=lambda pair: pair[0])
+
+    resolved_seqs: set[int] = set()
+    consumed_seqs: list[int] = []
+    skipped_seqs: list[int] = []
+    actionable_by_seat: dict[str, list[dict[str, Any]]] = {}
+
+    for seq, ev in ordered:
+        if str(ev.get("event") or "").strip().upper() != "NATIVE_SEND_MESSAGE":
+            resolved_seqs.add(seq)
+            continue
+        if seq in woken_set:
+            resolved_seqs.add(seq)
+            skipped_seqs.append(seq)
+            continue
+
+        from_seat = str(ev.get("from_seat") or "").strip()
+        to_seat = str(ev.get("to_seat") or "").strip()
+        is_report = bool(ev.get("is_report_no_reply"))
+        is_silent = bool(ev.get("is_silent")) and not is_report
+
+        if is_silent or not to_seat or to_seat not in known_seats or (from_seat and from_seat == to_seat):
+            resolved_seqs.add(seq)
+            skipped_seqs.append(seq)
+            continue
+
+        ev_ts = _parse_event_epoch(ev)
+        if ev_ts is None:
+            resolved_seqs.add(seq)
+            skipped_seqs.append(seq)
+            continue
+
+        age = now_ep - ev_ts
+        if age < -300.0 or age > float(max_age_sec):
+            resolved_seqs.add(seq)
+            skipped_seqs.append(seq)
+            continue
+
+        last_act = active_map.get(to_seat)
+        unread_senders = unread_map.get(to_seat)
+        still_unread = bool(unread_senders and from_seat and from_seat in unread_senders)
+        if last_act is not None and float(last_act) > ev_ts and not still_unread:
+            resolved_seqs.add(seq)
+            consumed_seqs.append(seq)
+            continue
+
+        actionable_by_seat.setdefault(to_seat, []).append(
+            {
+                "seq": seq,
+                "from_seat": from_seat,
+                "to_seat": to_seat,
+                "ts_epoch": ev_ts,
+                "is_report_no_reply": is_report,
+            }
+        )
+
+    ready_by_seat: dict[str, list[dict[str, Any]]] = {}
+    pending_debounce_seats: list[str] = []
+    coalesce_cap = max(float(debounce_sec) * 5.0, _MAX_NATIVE_BURST_COALESCE_SECONDS)
+    for seat, items in sorted(actionable_by_seat.items()):
+        newest_ts = max(float(it["ts_epoch"]) for it in items)
+        oldest_ts = min(float(it["ts_epoch"]) for it in items)
+        if (now_ep - newest_ts) < float(debounce_sec) and (now_ep - oldest_ts) < coalesce_cap:
+            pending_debounce_seats.append(seat)
+        else:
+            ready_by_seat[seat] = items
+
+    next_cursor = base_cursor
+    for seq, _ev in ordered:
+        if seq in resolved_seqs:
+            next_cursor = seq
+        else:
+            break
+
+    return {
+        "ready_by_seat": ready_by_seat,
+        "pending_debounce_seats": pending_debounce_seats,
+        "consumed_seqs": consumed_seqs,
+        "skipped_seqs": skipped_seqs,
+        "next_cursor_seq": next_cursor,
+    }

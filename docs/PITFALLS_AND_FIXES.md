@@ -1,6 +1,6 @@
 # Production Pitfalls & Engineering Fixes (`DiffQuorum` Lessons Learned)
 
-Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **20 major pitfalls** and the deterministic fixes built into this toolkit.
+Every guardrail in `diffquorum` came from a real failure mode hit while running multi-agent clusters across laptops, headless workstations, and external LLM reviewers. Below are the **23 major pitfalls** and the deterministic fixes built into this toolkit.
 
 ---
 
@@ -111,7 +111,7 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
 - **Pending-Plan Collision Lock (`diffquorum plan`)**: Prevents competing approval drafts on the same logical `scope` via an atomic `0600` + `flock` ledger (`WAITING_APPROVE` -> `APPROVED | SUPERSEDED | CANCELLED`).
 - **Leading-Prefix Silent Tags & Orthogonal `REPORT-NO-REPLY`**: Matches `TERMINAL-ACK` / `INFO-SYNC` strictly at the start of the first non-empty line (never mid-sentence), exempts `P0` emergencies from silence, and caps `REPORT-NO-REPLY` handoffs at a single wakeup while guaranteeing terminal ticket (`WAITING_REVIEW | DONE | BLOCKED`) receipt delivery.
 - **Anti-Stall Mobile & Daemon Hardening**: Recognizes ultra-narrow mobile status footers (`⏵⏵ auto mode`, `? for short…`), string/bool `isDaemon` tasks, bounded `P0/P1` ticket backoff `(30s, 60s, 180s)`, stale `copy-mode` auto-exit (`>=180s` idle on unprotected sessions), and multi-sentence trailing approvals.
-- **Zero-Token Pre-Invocation Pending-Plan Injection & Own/Peer Split**: Pure read-only `O_NOFOLLOW` (`<=16KB`) `rev`-reconciled reader (`build_pre_invocation_pending_banner` & `format_pending_plans_bar`) emits `0` bytes when idle and injects a single `own:X | peers:Y | total:Z` summary with optional seat-level title redaction when active, eliminating stale-memory '0 pending items' omissions across seats.
+- **Zero-Token Pre-Invocation Pending-Plan Injection & Own/Peer Split**: Pure read-only `O_NOFOLLOW` (`<=512KB`) `rev`-reconciled reader (`build_pre_invocation_pending_banner` & `format_pending_plans_bar`) emits `0` bytes when idle and injects a single `own:X | peers:Y | total:Z` summary with optional seat-level title redaction when active, eliminating stale-memory '0 pending items' omissions across seats.
 
 ## 13. Asymmetric Multi-Seat Hook Allowlists & Headless Blind-Review Tool Deadlocks
 
@@ -191,3 +191,28 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
   - **Coexistence by default + explicit `--supersede`**: Removed automatic same-seat `SUPERSEDED` overwriting in `plan open` and `plan reopen`. Colliding same-seat scopes automatically receive bounded suffixes (`<scope>-2`, `<scope>-3`, <= 120 chars) so multiple open items coexist safely; replacing an earlier item requires explicit `--supersede PLN-YYYYMMDD-NNN` validated atomically (format, existence, `WAITING_APPROVE` state, and seat/governance authorization) before any mutation occurs.
   - **Exact `live_footer_markdown` on every `plan` command**: `plan open | list | reopen | close` now compute and return a ready-to-paste role-scoped `live_footer_markdown` (`fleet` / `line` / `self`, honoring sensitive-seat redaction) directly from the post-write state, eliminating half-turn footer drift.
   - **Expanded colloquial `Stop` decision cues**: Extended `_STOP_WAIT_DECISION_RE` to catch everyday Chinese decision-pause phrasing while still stripping fenced/inline code blocks first so technical explanations never false-trigger.
+
+## 21. Cross-Workspace `--add-dir` Hook Bleed & Multi-Line Onboarding Drift (`plan_lock.py`)
+
+- **What broke**: When onboarding a new business-line cluster, mounting a sibling seat's workspace via `--add-dir <sibling-workspace>` caused the CLI runtime to inherit the sibling directory's local `PreToolUse` hooks — unexpectedly denying legitimate shell commands inside the new seat's own workspace. Meanwhile, ad-hoc manual setup across new seats easily drifted on symlink conventions, flat vs grouped `hooks.json` schemas, or missing shared helper binaries.
+- **Root-cause fix (`audit_launch_args_for_hook_bleed` + `validate_hooks_json_schema`)**:
+  - Added deterministic `audit_launch_args_for_hook_bleed(launch_argv, own_workspace=..., peer_workspaces=...)` to inspect `--add-dir` / `--additional-dir` arguments, failing closed on missing values, mounts overlapping any peer workspace, or external directories carrying local hook manifests (`.agents/hooks.json`, `.gemini/hooks.json`, `.claude/settings.json`).
+  - Pair launch-arg auditing with `validate_hooks_json_schema` in a single-command read-only onboarding verifier so new business lines launch clean-room without cross-seat hook contamination.
+
+## 22. Top-Level CLI Agent `send_message` Dormancy & Overnight 2h Modal Expiry (`wake_gates.py`)
+
+- **What broke**:
+  1. Native reactive wakeup inside an AI CLI runtime only wakes parent/child subagents sharing one process tree; independent top-level `tmux` CLI sessions communicating via `send_message` stayed dormant unless a host watcher injected `[BUS-WAKE]`.
+  2. When a passive post-turn CLI survey modal (matched conservatively by `WAITING_MODAL_RE` to avoid corrupting unknown TUI prompts) stayed on screen overnight, peer completion notices (`【REPORT-NO-REPLY】` / `【交卷免回】`) aged past the 2-hour plain-chat wakeup TTL (`7200s`) and were silently dropped once the operator cleared the modal the next morning.
+- **Root-cause fix (`scan_native_message_events_cursor`)**:
+  - Added a persistent-cursor, 5.5s-debounced bridge (`scan_native_message_events_cursor`) over structured `NATIVE_SEND_MESSAGE` audit events carrying strictly boolean `is_silent` and orthogonal `is_report_no_reply` flags (zero message prose stored or echoed).
+  - Grants actionable native peer events a `24h` (`86400s`) survival window (`MAX_NATIVE_EVENT_WAKE_AGE_SECONDS`) without relaxing the 2-hour plain-chat TTL, coalesces bursts (`<= 30s` cap), skips silent/self/unknown/already-woken/already-consumed events, and advances `next_cursor_seq` strictly across contiguous resolved sequence numbers so modal-blocked events wake cleanly the moment all 6 safety gates clear.
+
+## 23. macOS Multi-Desktop Terminal Orchestration & `tmux` Window-Name Desync
+
+- **What broke**:
+  1. With macOS Mission Control's `"Automatically rearrange Spaces based on most recent use"` (`mru-spaces`) enabled, switching terminal desktops dynamically reshuffled Space indices and broke spatial muscle memory across multi-seat windows.
+  2. Placing a terminal in native macOS Full-Screen mode skipped Desktop slots during Mission Control jumps, and running `tmux rename-session` without pairing `tmux rename-window` left retired legacy window names (`#W`) visible in terminal tabs and HUD headers.
+- **Root-cause fix (Deterministic Multi-Desktop & Session Rename Hygiene)**:
+  - Keep `com.apple.dock mru-spaces` disabled (`false`) and use maximized non-fullscreen windows per logical business line so Desktop indices remain strictly pinned.
+  - Whenever renaming a live `tmux` seat session, always pair `tmux rename-session` with `tmux rename-window -t "=<session>:0" <short-name>` and keep the logical seat symlink path as the primary `cwd` on future spawns while preserving the underlying physical directory (`PF-001`) so active session transcripts never lose continuity.

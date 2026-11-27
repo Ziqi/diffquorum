@@ -938,6 +938,51 @@ def exercise_suite(temp_root: pathlib.Path) -> None:
     assert "vault(1 pending)" in _pl.render_live_pending_footer_markdown("vault", cx_doc2, redacted_seats={"vault"}, allow_self_view=False, report_scope="self")
     assert _pl.evaluate_stop_consistency_gate(response_text="怎么来定这个目录？", own_waiting_count=0, peer_waiting_count=0, report_scope="self")["decision"] == "continue"
 
+    # Native send_message cursor bridge & cross-workspace --add-dir hook-bleed coverage
+    for bad_kw in ({"debounce_sec": -1.0}, {"max_age_sec": 0.0}):
+        try:
+            wg.scan_native_message_events_cursor([], seat_registry={"s1"}, **bad_kw)
+        except ValueError:
+            pass
+    nc_events = [
+        "not_a_dict",
+        {"seq": "bad", "event": "NATIVE_SEND_MESSAGE"},
+        {"seq": 1, "event": "OTHER"},
+        {"seq": 2, "event": "NATIVE_SEND_MESSAGE", "from_seat": "s2", "to_seat": "s1", "ts_epoch": 990.0},
+        {"seq": 3, "event": "NATIVE_SEND_MESSAGE", "from_seat": "s2", "to_seat": "s1", "is_silent": True, "ts_epoch": 991.0},
+        {"seq": 4, "event": "NATIVE_SEND_MESSAGE", "from_seat": "s2", "to_seat": "s1", "ts": "invalid-iso"},
+        {"seq": 5, "event": "NATIVE_SEND_MESSAGE", "from_seat": "s2", "to_seat": "s1", "ts_epoch": 1.0},
+        {"seq": 6, "event": "NATIVE_SEND_MESSAGE", "from_seat": "s2", "to_seat": "s1", "ts_epoch": 950.0},
+        {"seq": 7, "event": "NATIVE_SEND_MESSAGE", "from_seat": "s2", "to_seat": "s1", "ts": "1970-01-01T00:16:30Z", "is_report_no_reply": True},
+        {"seq": 8, "event": "NATIVE_SEND_MESSAGE", "from_seat": "s1", "to_seat": "s2", "ts_epoch": 999.0},
+    ]
+    nc_res = wg.scan_native_message_events_cursor(
+        nc_events,
+        seat_registry={"s1": {}, "s2": {}},
+        cursor_seq=0,
+        woken_seqs={"2": 995.0, "bad": 0},
+        now_ts=1000.0,
+        recipient_last_active_ts={"s1": 960.0},
+    )
+    assert nc_res["next_cursor_seq"] == 6 and "s1" in nc_res["ready_by_seat"] and "s2" in nc_res["pending_debounce_seats"]
+    assert wg.scan_native_message_events_cursor(
+        [{"seq": 9, "event": "NATIVE_SEND_MESSAGE", "from_seat": "s2", "to_seat": "s1", "ts_epoch": 980.0}],
+        seat_registry={"s1"},
+        woken_seqs={9},
+        now_ts=1000.0,
+    )["next_cursor_seq"] == 9
+    assert wg._parse_event_epoch({}) is None
+
+    hb_own = ws / "hb_own"
+    hb_peer = ws / "hb_peer"
+    hb_ext = ws / "hb_ext"
+    hb_clean = ws / "hb_clean"
+    for d in (hb_own, hb_peer, hb_ext / ".agents", hb_clean):
+        d.mkdir(parents=True, exist_ok=True)
+    (hb_ext / ".agents" / "hooks.json").write_text("{}", encoding="utf-8")
+    assert _pl.audit_launch_args_for_hook_bleed(["cli", "--add-dir", str(hb_own), f"--add-dir={hb_clean}"], own_workspace=hb_own, peer_workspaces=[hb_peer])["ok"] is True
+    assert _pl.audit_launch_args_for_hook_bleed(["cli", "--add-dir", str(hb_peer), f"--additional-dir={hb_ext}", "--add-dir", "--add-dir="], own_workspace=hb_own, peer_workspaces=[hb_peer])["ok"] is False
+
     shutil.rmtree(ws, ignore_errors=True)
 
 
