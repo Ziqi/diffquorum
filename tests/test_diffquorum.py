@@ -3034,6 +3034,39 @@ class DiffQuorumCleanRoomTests(unittest.TestCase):
         self.assertFalse(g_lim["ok"])
         self.assertEqual(g_lim["code"], "GUEST_DISPATCH_RATE_LIMITED")
 
+    def test_40_sentence0_approval_critique_and_doc_sync_gate(self) -> None:
+        from diffquorum.governance import evaluate_doc_sync_gate
+        from diffquorum.wake_gates import is_explicit_approval_text
+
+        # 1) Leading standalone Approve. with trailing constructive critique passes; revocations & partial scope fail closed
+        self.assertTrue(
+            is_explicit_approval_text("Approve. 但是这里还有一个部署漂移问题需要一并补齐。")
+        )
+        self.assertTrue(is_explicit_approval_text("approve 。完了以后再核对两个巡检状态"))
+        self.assertFalse(is_explicit_approval_text("Approve. 但是先别做。"))
+        self.assertFalse(is_explicit_approval_text("Approve. 只批第1项。"))
+        self.assertFalse(is_explicit_approval_text("Approve. However, pause deployment until tomorrow."))
+
+        # 2) Anti-doc-drift gate catches missing doc updates and undocumented pitfall IDs
+        drift = evaluate_doc_sync_gate(["src/diffquorum/wake_gates.py"])
+        self.assertFalse(drift["ok"], drift)
+        self.assertTrue(any("doc_drift" in i for i in drift["issues"]))
+
+        missing_pf = evaluate_doc_sync_gate(
+            ["src/diffquorum/wake_gates.py", "docs/PITFALLS_AND_FIXES.md"],
+            added_pitfall_ids={"PF-999"},
+            pitfall_ledger_text="## 33. Doc Sync Gate\n",
+        )
+        self.assertFalse(missing_pf["ok"], missing_pf)
+        self.assertIn("PF-999", missing_pf["missing_pitfall_ids"])
+
+        synced = evaluate_doc_sync_gate(
+            ["src/diffquorum/wake_gates.py", "docs/PITFALLS_AND_FIXES.md", "README.md", "CHANGELOG.md"],
+            added_pitfall_ids={"PF-055"},
+            pitfall_ledger_text="PF-055 documented\n",
+        )
+        self.assertTrue(synced["ok"], synced)
+
 
 if __name__ == "__main__":
     unittest.main()

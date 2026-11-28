@@ -1315,3 +1315,55 @@ def validate_headless_review_spec(
             issues.append(f"timeout_exceeds_deadline: timeout_sec={timeout_sec} >= max_timeout_sec={max_timeout_sec}")
 
     return {"ok": len(issues) == 0, "issue_count": len(issues), "issues": issues}
+
+
+DOC_SYNC_CODE_PREFIXES: tuple[str, ...] = ("src/", "scripts/", "config/", ".agents/hooks/")
+DOC_SYNC_DOC_EXACT: frozenset[str] = frozenset(
+    {"README.md", "README.zh-CN.md", "CHANGELOG.md", "PITFALLS.md", "AGENTS.md"}
+)
+
+
+def evaluate_doc_sync_gate(
+    changed_files: list[str] | tuple[str, ...],
+    *,
+    added_pitfall_ids: set[str] | list[str] | tuple[str, ...] = (),
+    pitfall_ledger_text: str = "",
+) -> dict[str, Any]:
+    """
+    Deterministic anti-doc-drift gate for repository doctor checks and git pre-push hooks.
+    Fails closed when core code/script/config files change without matching README/CHANGELOG/docs
+    updates, or when newly introduced pitfall IDs are missing from the pitfall ledger.
+    """
+    code_changed: list[str] = []
+    doc_changed: list[str] = []
+    for raw in changed_files:
+        rel = str(raw or "").strip().lstrip("./")
+        if not rel or "__pycache__" in rel:
+            continue
+        if any(rel.startswith(p) for p in DOC_SYNC_CODE_PREFIXES) or rel.endswith("_REGISTRY.json"):
+            code_changed.append(rel)
+        if rel in DOC_SYNC_DOC_EXACT or (rel.startswith("docs/") and rel.endswith(".md")):
+            doc_changed.append(rel)
+
+    issues: list[str] = []
+    if code_changed and not doc_changed:
+        issues.append(
+            f"doc_drift: core code/scripts changed without matching README/CHANGELOG/docs update ({code_changed[:6]})"
+        )
+
+    missing_pfs: list[str] = []
+    if added_pitfall_ids:
+        ledger = str(pitfall_ledger_text or "")
+        for pid in sorted({str(x).strip() for x in added_pitfall_ids if str(x).strip()}):
+            if pid not in ledger:
+                missing_pfs.append(pid)
+        if missing_pfs:
+            issues.append(f"undocumented_pitfall_ids: {missing_pfs} missing from pitfall ledger")
+
+    return {
+        "ok": len(issues) == 0,
+        "code_changed": sorted(set(code_changed)),
+        "doc_changed": sorted(set(doc_changed)),
+        "missing_pitfall_ids": missing_pfs,
+        "issues": issues,
+    }

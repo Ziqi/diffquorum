@@ -80,9 +80,15 @@ NEGATED_OR_QUESTION_APPROVAL_RE = re.compile(
     r"|不(?:同意|批准|准|予批准|通过|要|行|可以|能)|暂不(?:同意|批准|通过|执行)?|先不(?:批|同意|通过|执行)|拒绝|驳回|但是|但|不过|除非|除了|只改|只做|[?？])",
     re.IGNORECASE,
 )
+HARD_FOLLOWUP_RESTRICTION_RE = re.compile(
+    r"(?:\b(?:not|no|never|don'?t|do\s+not|no\s+need|disapprov\w*|unapprov\w*|cancel\w*|abort\w*|revoke\w*|except|unless|only|wait|hold|stop|pause|instead|skip|exclude)\b"
+    r"|不(?:同意|批准|准|予批准|(?:要|用|必|需)(?:再)?(?:执行|改|动|做|跑|继续|推进|弄|搞|了))|别|勿|免了|暂不|先不|暂缓|等等|等一下|慢着|算了|除非|除了|只改|只做|只批|只允许|只执行|仅批|仅限|仅做|先改|先做|跳过|拒绝|驳回)",
+    re.IGNORECASE,
+)
+BARE_CONTRAST_RE = re.compile(r"(?:\b(?:but|however)\b|但是|但|不过)", re.IGNORECASE)
 FOLLOWUP_RESTRICTION_RE = re.compile(
     r"(?:\b(?:not|no|never|don'?t|do\s+not|no\s+need|disapprov\w*|unapprov\w*|cancel\w*|abort\w*|revoke\w*|but|however|except|unless|only|wait|hold|stop|pause|instead|skip|exclude)\b"
-    r"|不(?:同意|批准|准|予批准|(?:要|用|必|需)(?:再)?(?:执行|改|动|做|跑|继续|推进|弄|搞|了))|别|勿|免了|暂不|先不|暂缓|等等|等一下|慢着|算了|但是|不过|除非|除了|只改|只做|先改|先做|跳过|拒绝|驳回)",
+    r"|不(?:同意|批准|准|予批准|(?:要|用|必|需)(?:再)?(?:执行|改|动|做|跑|继续|推进|弄|搞|了))|别|勿|免了|暂不|先不|暂缓|等等|等一下|慢着|算了|但是|不过|除非|除了|只改|只做|只批|只允许|只执行|仅批|仅限|仅做|先改|先做|跳过|拒绝|驳回)",
     re.IGNORECASE,
 )
 REVOCATION_RE = re.compile(
@@ -244,9 +250,9 @@ def classify_seat_state(
 
 
 def is_explicit_approval_text(text: str) -> bool:
-    """Fail-closed check supporting leading, trailing, and space-separated `<selection> 其他/其余 approve` (PF-023/031/047)."""
+    """Fail-closed check supporting leading, trailing, sentence-0 critique, and `<selection> 其他/其余 approve`."""
     cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip().strip("\"'“”‘’`").strip()
-    if not cleaned or len(cleaned) > 600:
+    if not cleaned or len(cleaned) > 900:
         return False
     if REVOCATION_RE.search(cleaned):
         return False
@@ -282,10 +288,21 @@ def is_explicit_approval_text(text: str) -> bool:
     first_idx = approval_indices[0]
     has_remainder_app = any(REMAINDER_APPROVAL_PREFIX_RE.match(sentences[i]) for i in approval_indices)
     app_set = set(approval_indices)
+    standalone_s0 = first_idx == 0 and bool(
+        re.fullmatch(
+            r"(?:approve(?:d)?|批准(?:执行)?|同意(?:执行)?|审批通过|审核通过|确认执行)",
+            sentences[0],
+            re.IGNORECASE,
+        )
+    )
     for idx, sent in enumerate(sentences):
         if idx in app_set:
             continue
-        if FOLLOWUP_RESTRICTION_RE.search(sent):
+        if HARD_FOLLOWUP_RESTRICTION_RE.search(sent):
+            return False
+        is_post_confirm_q = idx > first_idx and bool(POST_APPROVAL_CONFIRM_Q_RE.search(sent))
+        is_post_standalone_critique = standalone_s0 and idx > 0
+        if BARE_CONTRAST_RE.search(sent) and not (is_post_confirm_q or is_post_standalone_critique):
             return False
         if idx < first_idx and NEGATED_OR_QUESTION_APPROVAL_RE.search(sent):
             return False

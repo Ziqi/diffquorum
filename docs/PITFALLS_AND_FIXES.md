@@ -238,3 +238,63 @@ Every guardrail in `diffquorum` came from a real failure mode hit while running 
   - **Anti-Lockout Same-Workspace `ask` Downgrade**: `evaluate_unmapped_workspace_write_policy` downgrades hard `deny` to explicit human `ask` (never silent `allow`) **only** for top-level `unmapped` sessions carrying an explicit non-empty `session_cwd` strictly inside a non-sealed workspace writing to that exact same workspace; subagents, missing `cwd`, cross-seat writes, host credentials, shared-bus state, and sealed vaults stay 100% hard `deny`.
   - **Atomic Multi-Key Seat UUID Rebind Planner**: `plan_atomic_seat_uuid_rebind` validates lowercase 36-char UUID format, blocks reserved guest/system identities, rejects duplicate cross-seat UUIDs unless `force_reassign=True` (which atomically clears conflicting keys on the prior seat), and syncs primary + alias keys while preserving comments and sibling entries.
   - **Fail-Closed One-Way Guest Dispatch Gate**: `evaluate_one_way_guest_dispatch` restricts temporary guest senders strictly to `P1`/`P2`, blocks approval-anchor forgery, enforces an atomic sliding-window cap (`3` dispatches per `300s`), and marks accepted dispatches `one_way_guest=True`, `from_conv_id=""`, `receipt_notified_to_sender=True` so watchers never bounce wakeups to an unregistered terminal.
+
+## 26. Multi-Host Partial Deployment Drift & Missing Cross-Host Parity Audit
+
+- **What broke**: Hand-copying partial wrappers onto companion workstations left them running incomplete 2-event `hooks.json` files (missing `PreToolUse(send_message)` and `Stop` consistency checks), missing standard CLI symlinks, and missing per-workspace read-only auto-allow hooks — causing interactive `WAIT_PRM` permission modals to stall routine read-only commands.
+- **Root-cause fix (Idempotent 1-Command Deployer + Cross-Host Audit)**:
+  - Deploy the identical clean-room runtime package via a single idempotent host deployer that links all standard CLIs, writes declarative host `fleet.json` + canonical cross-host registry manifests, upgrades global `hooks.json` while preserving host-native keys, and installs per-workspace finite read-only `PreToolUse(run_command)` allowlists (keeping global `hooks.json` strictly free of `run_command`/`write_file` matchers).
+  - Run a unified read-only cross-host parity audit (`audit --host all`) across every workstation before declaring deployment complete.
+
+## 27. Leading Standalone `"Approve."` Rejected by Trailing Constructive Critique (`wake_gates.py`)
+
+- **What broke**: When an operator began a message with an unambiguous standalone approval (`"Approve."`) followed by a second sentence flagging an engineering gap using contrast words (`but`/`however`/`但是`/`不过`), a flat whole-message contrast filter rejected the approval and forced redundant re-approval loops.
+- **Root-cause fix (`is_explicit_approval_text` Sentence-0 Split)**:
+  - Separated `HARD_FOLLOWUP_RESTRICTION_RE` (partial-scope limits such as `只批`/`仅限`/`only`/`skip`/`pause` and negations) from `BARE_CONTRAST_RE` (`but`/`however`/`但是`/`但`/`不过`), and raised the message ceiling to `900` chars.
+  - When sentence `0` is a standalone approval, trailing constructive critique with bare contrast words passes cleanly while explicit revocations and hard scope limits remain 100% fail-closed.
+
+## 28. Clamshell Zero-Polling Screen-Off Keepalive & Stationary vs Portable Lock Policy
+
+- **What broke**: Timer-based polling scripts either burned idle CPU or accidentally allowed lid-closed companion hosts to enter full system sleep and sever mesh tunnels; conversely, applying a single screen-lock setting across stationary control hubs and portable laptops either blocked local automation or left travel hardware unlocked.
+- **Root-cause fix (Event-Driven `IOKit`/`pmset` + Role-Split Screen-Lock Policy)**:
+  - Use event-driven power assertions (`sleep 0` on AC / lid-lock assertion) so displays blank cleanly without suspending networking or background `tmux` agents.
+  - Separate stationary control-hub policy (display sleep without screen lock for uninterrupted desktop verification) from portable workstation policy (immediate lock on display sleep / lid close for physical security while staying awake on AC).
+
+## 29. Zero-Sudo Heterogeneous P/E Core Telemetry & False Calibration Thermal Sensors (`tcal`)
+
+- **What broke**: Querying hardware telemetry via `powermetrics` demanded passwordless `sudo`, whereas naively averaging every `IOHIDEventSystem` temperature sensor included synthetic calibration pseudo-sensors (`tcal`) reporting artificially high values and triggering false thermal alerts.
+- **Root-cause fix (Zero-Sudo Native Probe + Calibration Filtering)**:
+  - Collect per-core heterogeneous Performance/Efficiency (`P`/`E`) CPU ticks via `host_processor_info` and GPU utilization via `IOAccelerator` with zero `sudo`.
+  - Explicitly exclude calibration channels (`tcal`) and out-of-band readings (`<10°C` or `>115°C`) before computing real SoC max/average temperatures.
+
+## 30. Multi-Desktop Window Layout, `app-bindings` Protection & Lock-Screen Fail-Closed
+
+- **What broke**: Executing GUI window-tiling scripts directly over headless SSH lost WindowServer/Accessibility ownership, collided with pinned desktop `app-bindings`, or scrambled terminal windows silently while the display was locked.
+- **Root-cause fix (Interactive Delegation + Lock-Screen Fail-Closed)**:
+  - Keep GUI layout scripts bound to interactive local terminal sessions rather than headless SSH shells, preserve pinned top-level desktop `app-bindings`, and query session lock state (`CGSSessionScreenIsLocked`) to fail closed immediately whenever the screen is locked.
+
+## 31. Small-RAM Hub Heap Bloat, Unified Decade Taxonomy & On-Demand Warm Hibernation
+
+- **What broke**: Long-lived interactive agent sessions accumulated `1.5–2.5 GB` RSS each on `24 GB` control hubs, driving heavy swap pressure alongside fragmented periodic daemons and duplicate seat IDs across hosts.
+- **Root-cause fix (Canonical Registry + Lossless Warm Hibernation + Unified Scheduler)**:
+  - Standardize every host on `00-<host>-dispatcher` + `10/11/12` (+ `20/21/22`) + `svc-*` / `*-hud` inside one canonical multi-host registry enforcing zero duplicate active UUIDs across hosts.
+  - Add lossless warm hibernation (`hibernate` / `wake`) and `IDLE` `>1.5 GB` RSS respawn reusing each seat's exact `--conversation <UUID>`, consolidate scattered periodic background timers into a single lightweight zero-token scheduler, and decouple external CLI advisors from cold-archive hosts.
+
+## 32. Post-Firewall Hardening: OpenSSH `restrict` Forced-Command Gatekeeper Isolation
+
+- **What broke**: Relaxing a one-way network firewall to allow bidirectional mesh collaboration between workstations widens blast radius if an unrestricted shell key is reachable from a peer node.
+- **Root-cause fix (Three-Layer Mesh Boundary)**:
+  - Pair bidirectional mesh routing with a dedicated restricted SSH identity pinned in `authorized_keys` via `restrict,command="<gatekeeper>"` (`no-pty`, `no-port-forwarding`, `no-agent-forwarding`, `no-X11-forwarding`), permitting only schema-validated `ping` / `ticket` / `drop <subdir>/<file>` payloads inside a sandboxed dropzone.
+
+## 33. Documentation Drift Prevention (`doc-sync-gate` Hard Gate, `governance.py`)
+
+- **What broke**: Rapid script, hook, and fleet-registry iterations repeatedly shipped without updating `README.md`, `PITFALLS_AND_FIXES.md`, or `CHANGELOG.md`, causing new sessions and external readers to follow stale instructions.
+- **Root-cause fix (`evaluate_doc_sync_gate` + `scripts/doc_sync_gate.py`)**:
+  - Added pure zero-dependency `evaluate_doc_sync_gate(changed_files, added_pitfall_ids=..., pitfall_ledger_text=...)` in `src/diffquorum/governance.py` paired with `scripts/doc_sync_gate.py` (`--mode doctor|pre-push`, `--install-hook`).
+  - Any commit range modifying core code/scripts/config/registries without updating matching documentation — or adding a new `PF-NNN` ID missing from the pitfall ledger — is hard-blocked (`exit 1`) before push.
+
+## 34. Lossless Cross-Host Conversation Migration Requires SQLite Checkpoint + Annotations
+
+- **What broke**: Syncing only a seat's workspace directory and `brain/<UUID>/` folder onto a new workstation caused resumed sessions to lose state or open blank if the SQLite conversation store was omitted or copied mid-WAL-write.
+- **Root-cause fix (Four-Artifact Atomic Cutover Checklist)**:
+  - Always (1) cleanly stop the source agent session, (2) verify the SQLite write-ahead log (`conversations/<UUID>.db-wal`) is `0` bytes (checkpoint complete), (3) sync all four trees (`workspace` preserving original birth path/symlink per `PF-001`, `brain/<UUID>/`, `conversations/<UUID>.db*`, and `annotations/<UUID>.pbtxt`), (4) register the UUID on the destination host, and (5) verify restored history via read-only `capture-pane` after relaunch.
